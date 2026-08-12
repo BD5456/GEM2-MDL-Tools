@@ -1,0 +1,12 @@
+# 本机用户配置（含个人路径，勿上传）
+.gem2_paths.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+Thumbs.db
