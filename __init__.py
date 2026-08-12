@@ -1,6 +1,6 @@
 bl_info = {
     "name": "GEM2 Engine Tools",
-    "author": "AI Assistant",
+    "author": "BD5456",
     "version": (1, 5, 0),
     "blender": (4, 3, 0),
     "location": "File > Import/Export > GEM2 PLY",
