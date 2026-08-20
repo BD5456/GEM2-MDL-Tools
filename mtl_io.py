@@ -9,6 +9,11 @@ from .i18n import _
 TEXTURE_EXTENSIONS = ['.dds', '.DDS', '.tga', '.TGA', '.png', '.PNG',
                       '.jpg', '.JPG', '.jpeg', '.JPEG', '.bmp', '.BMP',
                       '.ctm', '.ebm', '.tex', '.tif', '.TIF']
+TOON_SHADER_WORKSHOP_ID = '3565678181'
+TOON_SHADER_ROOT_CANDIDATES = (
+    r'D:\SteamLibrary\steamapps\workshop\content\400750\3565678181',
+    r'C:\Program Files (x86)\Steam\steamapps\workshop\content\400750\3565678181',
+)
 
 
 def _find_texture_root(start_dir):
@@ -43,6 +48,45 @@ def _find_game_texture_root():
     except Exception:
         pass
     return None, None
+
+
+def _find_toon_texture_root():
+    """查找可选 Toon Shader Workshop 的 $/dummyTex 与 $/envmap 根。"""
+    candidates = []
+    env_root = os.environ.get('GOH_TOON_SHADER_ROOT')
+    if env_root:
+        candidates.append(env_root)
+    candidates.extend(TOON_SHADER_ROOT_CANDIDATES)
+    try:
+        from .core import get_paths
+        configured = [get_paths().get(key) or '' for key in ('import', 'export')]
+    except Exception:
+        configured = []
+    for start in configured:
+        current = os.path.abspath(start) if start else ''
+        for _ in range(15):
+            if os.path.basename(current).casefold() == 'steamapps':
+                candidates.append(os.path.join(
+                    current, 'workshop', 'content', '400750',
+                    TOON_SHADER_WORKSHOP_ID))
+                break
+            parent = os.path.dirname(current)
+            if not current or parent == current:
+                break
+            current = parent
+    seen = set()
+    for candidate in candidates:
+        common = os.path.join(os.path.abspath(candidate),
+                              'resource', 'texture', 'common')
+        key = os.path.normcase(common)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (os.path.isfile(os.path.join(common, 'dummyTex', 'normal.dds')) and
+                os.path.isfile(os.path.join(common, 'dummyTex', 'black.dds')) and
+                os.path.isfile(os.path.join(common, 'envmap', 'env.dds'))):
+            return common
+    return None
 
 
 def _search_texture_file(tex_name, search_dirs, prefer_dirs=None):
@@ -112,6 +156,10 @@ def _collect_search_dirs(mtl_path, base_dir):
     if tex_root2:
         _add(tex_root2)
         _add(common2)
+    # Optional external dependency used by the Toon Shader material contract.
+    toon_common = _find_toon_texture_root()
+    if toon_common:
+        _add(toon_common)
     return dirs
 
 
@@ -154,6 +202,13 @@ def import_mtl(mtl_path, mat, base_dir):
     diffuse = _extract_tex('diffuse')
     bump = _extract_tex('bump')
     specular = _extract_tex('specular')
+    blend_match = re.search(r'{blend\s+([^}\s]+)}', block, re.IGNORECASE)
+    blend_mode = blend_match.group(1).lower() if blend_match else 'none'
+    alpha_match = re.search(
+        r'{alpharef\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+))}',
+        block, re.IGNORECASE)
+    alpha_ref = float(alpha_match.group(1)) if alpha_match else 127.0
+    alpha_ref = max(0.0, min(255.0, alpha_ref))
 
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
@@ -167,7 +222,7 @@ def import_mtl(mtl_path, mat, base_dir):
 
     def _load_image(texture_name, socket_name, is_normal=False):
         if not texture_name:
-            return
+            return None
         search_dirs = _collect_search_dirs(mtl_path, base_dir)
         img_path = _search_texture_file(texture_name, search_dirs)
         if not img_path:
@@ -178,29 +233,68 @@ def import_mtl(mtl_path, mat, base_dir):
                 img_path = direct
         if not img_path:
             print(_("mtl.texture_not_found", name=texture_name, dir="; ".join(search_dirs) or base_dir))
-            return
+            return None
         try:
-            img = bpy.data.images.load(img_path)
+            img = bpy.data.images.load(img_path, check_existing=True)
         except Exception as e:
             print(_("mtl.load_failed", path=img_path, error=e))
-            return
+            return None
         tex_node = nodes.new(type='ShaderNodeTexImage')
         tex_node.image = img
         tex_node.location = (-200, -200 * len(nodes))
         if is_normal:
+            try:
+                img.colorspace_settings.name = 'Non-Color'
+            except (TypeError, ValueError):
+                pass
             nm = nodes.new(type='ShaderNodeNormalMap')
             nm.location = (-50, -200 * len(nodes))
             links.new(tex_node.outputs['Color'], nm.inputs['Color'])
             links.new(nm.outputs['Normal'], principled.inputs[socket_name])
         else:
             links.new(tex_node.outputs['Color'], principled.inputs[socket_name])
+        return tex_node
 
-    if diffuse:
-        _load_image(diffuse, 'Base Color')
+    diffuse_node = _load_image(diffuse, 'Base Color') if diffuse else None
     if bump:
         _load_image(bump, 'Normal', is_normal=True)
     if specular:
         _load_image(specular, 'Specular IOR Level')
+
+    # GEM ``blend test`` and ``blend blend`` both use the diffuse texture's
+    # alpha. Without this link Blender renders transparent RGB (usually black)
+    # as opaque geometry when a game-exported model is imported again.
+    if blend_mode == 'test' and diffuse_node is not None:
+        alpha_test = nodes.new(type='ShaderNodeMath')
+        alpha_test.name = 'GEM2 Alpha Test'
+        alpha_test.label = 'GEM2 alpharef %g' % alpha_ref
+        alpha_test.operation = 'GREATER_THAN'
+        alpha_test.inputs[1].default_value = alpha_ref / 255.0
+        alpha_test.location = (-20, -300)
+        links.new(diffuse_node.outputs['Alpha'], alpha_test.inputs[0])
+        links.new(alpha_test.outputs[0], principled.inputs['Alpha'])
+    elif blend_mode == 'blend' and diffuse_node is not None:
+        links.new(diffuse_node.outputs['Alpha'], principled.inputs['Alpha'])
+    else:
+        principled.inputs['Alpha'].default_value = 1.0
+
+    if blend_mode == 'blend':
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+        if hasattr(mat, 'blend_method'):
+            mat.blend_method = 'BLEND'
+    elif blend_mode == 'test':
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'DITHERED'
+        if hasattr(mat, 'blend_method'):
+            mat.blend_method = 'CLIP'
+        if hasattr(mat, 'alpha_threshold'):
+            mat.alpha_threshold = alpha_ref / 255.0
+    elif hasattr(mat, 'blend_method'):
+        mat.blend_method = 'OPAQUE'
+
+    mat['gem2_blend_mode'] = blend_mode
+    mat['gem2_alpha_ref'] = alpha_ref
 
 
 def export_mtl(filepath, mat, mode='SIMPLE'):

@@ -401,8 +401,11 @@ GFA_TO_GEM2_TARGET = {
     "KneeD_L":       [("foot2l", 1.0)],
     "Ankle_L":       [("foot2l", 0.5), ("foot3l", 0.5)],
     "AnkleD_L":      [("foot2l", 0.5), ("foot3l", 0.5)],
-    "AnkleTip_L":    [("foot3l", 1.0)],
-    "LegTipEX_L":    [("foot3l", 1.0)],
+    # v14 (2026-08-19): AnkleTip/LegTipEX 按 GFA 参考版 Step3 注释掉 ——
+    # 参考版不映射这两个骨, bone_casting 会把其权重上卷到最近已映射祖先
+    # (Ankle → foot2/foot3), 与 GFA Step3 参考版行为一致。
+    # "AnkleTip_L":    [("foot3l", 1.0)],
+    # "LegTipEX_L":    [("foot3l", 1.0)],
 
     # ── Right Leg ──
     "WaistCancel_R": [("foot1r", 1.0)],
@@ -412,8 +415,9 @@ GFA_TO_GEM2_TARGET = {
     "KneeD_R":       [("foot2r", 1.0)],
     "Ankle_R":       [("foot2r", 0.5), ("foot3r", 0.5)],
     "AnkleD_R":      [("foot2r", 0.5), ("foot3r", 0.5)],
-    "AnkleTip_R":    [("foot3r", 1.0)],
-    "LegTipEX_R":    [("foot3r", 1.0)],
+    # v14 (2026-08-19): 同 L 侧, 按参考版注释掉
+    # "AnkleTip_R":    [("foot3r", 1.0)],
+    # "LegTipEX_R":    [("foot3r", 1.0)],
 
     # ── Spine ──
     "UpperBody":  [("ik_leftright", 1.0)],
@@ -451,44 +455,52 @@ GFA_TO_GEM2_TARGET = {
     "Elbow_R":      [("hand2r", 1.0)],
     "HandTwist_R":  [("hand2r", 0.9), ("palm1r", 0.1)],
 
-    # ── Left Wrist / Hand ── (merged, was [("palm1l", 0.975), ("palm1l", 0.025)])
+    # ── Left Wrist / Hand ── (GOH 版 2026-08-18: 恢复 GFA 分指)
+    # MOWAS2 版因 medicgirl 原版皮肤手部 = palm1 单骨而强制单骨化; 但 GOH
+    # 原版皮肤 (agit_yelan/agf_feitusa 实测) 手部是 palm1/palm2/palm3 分指
+    # 混合 (palm1 0.53/palm2 0.47, 93% 顶点多骨), 与 GFA 权重表
+    # Step3_TransferWeightFinal 一致。分指让手指跟随 palm2/palm3 → 手部
+    # IK/FK (palm_ik_holder/ik_chain/hand3 驱动 palm 骨) 才对得上。
+    # 本表 = GFA bone_merging_list 手部条目逐条移植 (GFA_MWT_SKE_ 前缀去除);
+    # Thumb0/1 严格按 GFA 原表 (两项都 Palm1 → 拇指 100% palm1)。
     "Wrist_L":           [("palm1l", 1.0)],
     "Thumb0_L":          [("palm1l", 1.0)],
     "Thumb1_L":          [("palm1l", 1.0)],
-    "Thumb2_L":          [("palm1l", 0.9),  ("palm2l", 0.1)],
-    # Finger knuckle 1: mostly palm1, some palm2, trace palm3
+    "Thumb2_L":          [("palm1l", 0.9), ("palm2l", 0.1)],
     "IndexFinger1_L":    [("palm1l", 0.50), ("palm2l", 0.425), ("palm3l", 0.075)],
     "MiddleFinger1_L":   [("palm1l", 0.50), ("palm2l", 0.425), ("palm3l", 0.075)],
     "RingFinger1_L":     [("palm1l", 0.50), ("palm2l", 0.425), ("palm3l", 0.075)],
     "LittleFinger1_L":   [("palm1l", 0.50), ("palm2l", 0.425), ("palm3l", 0.075)],
-    # Finger knuckle 2: shifting toward palm2/palm3
-    "IndexFinger2_L":    [("palm1l", 0.50), ("palm2l", 0.35),  ("palm3l", 0.15)],
-    "MiddleFinger2_L":   [("palm1l", 0.50), ("palm2l", 0.35),  ("palm3l", 0.15)],
-    "RingFinger2_L":     [("palm1l", 0.50), ("palm2l", 0.35),  ("palm3l", 0.15)],
-    "LittleFinger2_L":   [("palm1l", 0.50), ("palm2l", 0.35),  ("palm3l", 0.15)],
-    # Finger tips: progressive shift toward palm3
-    "IndexFinger3_L":    [("palm1l", 0.50), ("palm2l", 0.36),  ("palm3l", 0.14)],
-    "MiddleFinger3_L":   [("palm1l", 0.50), ("palm2l", 0.37),  ("palm3l", 0.13)],
-    "RingFinger3_L":     [("palm1l", 0.50), ("palm2l", 0.38),  ("palm3l", 0.12)],
-    "LittleFinger3_L":   [("palm1l", 0.50), ("palm2l", 0.39),  ("palm3l", 0.11)],
+    "IndexFinger2_L":    [("palm1l", 0.50), ("palm2l", 0.35), ("palm3l", 0.15)],
+    "MiddleFinger2_L":   [("palm1l", 0.50), ("palm2l", 0.35), ("palm3l", 0.15)],
+    "RingFinger2_L":     [("palm1l", 0.50), ("palm2l", 0.35), ("palm3l", 0.15)],
+    "LittleFinger2_L":   [("palm1l", 0.50), ("palm2l", 0.35), ("palm3l", 0.15)],
+    "IndexFinger3_L":    [("palm1l", 0.50), ("palm2l", 0.36), ("palm3l", 0.14)],
+    "MiddleFinger3_L":   [("palm1l", 0.50), ("palm2l", 0.37), ("palm3l", 0.13)],
+    "RingFinger3_L":     [("palm1l", 0.50), ("palm2l", 0.38), ("palm3l", 0.12)],
+    "LittleFinger3_L":   [("palm1l", 0.50), ("palm2l", 0.39), ("palm3l", 0.11)],
 
-    # ── Right Wrist / Hand ── (merged duplicates)
+    # ── Right Wrist / Hand ── (GFA 表 R 侧; Thumb0_R/Thumb1_R 严格按 GFA
+    #   原表 (两项都 Palm1 → 拇指 100% palm1))
+    #   v14 (2026-08-19): Finger1_R 还原 GFA 原表 (L89-92 第三项为 Palm2R
+    #   0.075, 是 GFA 原表笔误 → 与 palm2r 0.425 合并为 palm2r 0.50;
+    #   按"一分不差复刻 GFA"铁律改回, R 侧手指无 palm3 权重)。
     "Wrist_R":           [("palm1r", 1.0)],
     "Thumb0_R":          [("palm1r", 1.0)],
     "Thumb1_R":          [("palm1r", 1.0)],
-    "Thumb2_R":          [("palm1r", 0.9),  ("palm2r", 0.1)],
-    "IndexFinger1_R":    [("palm1r", 0.50), ("palm2r", 0.425), ("palm3r", 0.075)],
-    "MiddleFinger1_R":   [("palm1r", 0.50), ("palm2r", 0.425), ("palm3r", 0.075)],
-    "RingFinger1_R":     [("palm1r", 0.50), ("palm2r", 0.425), ("palm3r", 0.075)],
-    "LittleFinger1_R":   [("palm1r", 0.50), ("palm2r", 0.425), ("palm3r", 0.075)],
-    "IndexFinger2_R":    [("palm1r", 0.50), ("palm2r", 0.35),  ("palm3r", 0.15)],
-    "MiddleFinger2_R":   [("palm1r", 0.50), ("palm2r", 0.35),  ("palm3r", 0.15)],
-    "RingFinger2_R":     [("palm1r", 0.50), ("palm2r", 0.35),  ("palm3r", 0.15)],
-    "LittleFinger2_R":   [("palm1r", 0.50), ("palm2r", 0.35),  ("palm3r", 0.15)],
-    "IndexFinger3_R":    [("palm1r", 0.50), ("palm2r", 0.36),  ("palm3r", 0.14)],
-    "MiddleFinger3_R":   [("palm1r", 0.50), ("palm2r", 0.37),  ("palm3r", 0.13)],
-    "RingFinger3_R":     [("palm1r", 0.50), ("palm2r", 0.38),  ("palm3r", 0.12)],
-    "LittleFinger3_R":   [("palm1r", 0.50), ("palm2r", 0.39),  ("palm3r", 0.11)],
+    "Thumb2_R":          [("palm1r", 0.9), ("palm2r", 0.1)],
+    "IndexFinger1_R":    [("palm1r", 0.50), ("palm2r", 0.50)],
+    "MiddleFinger1_R":   [("palm1r", 0.50), ("palm2r", 0.50)],
+    "RingFinger1_R":     [("palm1r", 0.50), ("palm2r", 0.50)],
+    "LittleFinger1_R":   [("palm1r", 0.50), ("palm2r", 0.50)],
+    "IndexFinger2_R":    [("palm1r", 0.50), ("palm2r", 0.35), ("palm3r", 0.15)],
+    "MiddleFinger2_R":   [("palm1r", 0.50), ("palm2r", 0.35), ("palm3r", 0.15)],
+    "RingFinger2_R":     [("palm1r", 0.50), ("palm2r", 0.35), ("palm3r", 0.15)],
+    "LittleFinger2_R":   [("palm1r", 0.50), ("palm2r", 0.35), ("palm3r", 0.15)],
+    "IndexFinger3_R":    [("palm1r", 0.50), ("palm2r", 0.36), ("palm3r", 0.14)],
+    "MiddleFinger3_R":   [("palm1r", 0.50), ("palm2r", 0.37), ("palm3r", 0.13)],
+    "RingFinger3_R":     [("palm1r", 0.50), ("palm2r", 0.38), ("palm3r", 0.12)],
+    "LittleFinger3_R":   [("palm1r", 0.50), ("palm2r", 0.39), ("palm3r", 0.11)],
 }
 
 
