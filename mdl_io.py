@@ -23,10 +23,15 @@ def parse_mdl(content):
         if inner.startswith('{'): inner = inner[1:].strip()
         if inner.endswith('}'): inner = inner[:-1].strip()
 
-        nm = re.search(r'bone\s+(?:revolute\s+)?"([^"]+)"', inner)
-        if not nm: return None
-        name = nm.group(1)
-        is_revolute = 'revolute' in inner.split('\n')[0]
+        nm = re.search(
+            r'\bbone\s+(?:(revolute|prizmatic|prismatic)\s+)?"([^"]+)"',
+            inner, re.IGNORECASE)
+        if not nm:
+            return None
+        bone_kind = (nm.group(1) or '').lower()
+        name = nm.group(2)
+        is_revolute = bone_kind == 'revolute'
+        is_prizmatic = bone_kind in {'prizmatic', 'prismatic'}
 
         children = []
         remaining = inner
@@ -83,6 +88,7 @@ def parse_mdl(content):
             'name': name, 'matrix': matrix, 'position': position,
             'orientation': orientation, 'children': children,
             'has_volumeview': has_volumeview, 'is_revolute': is_revolute,
+            'is_prizmatic': is_prizmatic,
             'params': params, 'limits': limits, 'speed': speed,
         }
 
@@ -129,6 +135,7 @@ def flatten_bones(root_bones):
             'orientation': node['orientation'],
             'parent': parent_name,
             'is_revolute': node.get('is_revolute', False),
+            'is_prizmatic': node.get('is_prizmatic', False),
             'params': node.get('params'),
             'limits': node.get('limits'),
             'speed': node.get('speed'),
@@ -166,20 +173,30 @@ def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path):
             local_mat = Matrix.Translation(Vector(info['position']))
         local_mats[name] = local_mat
 
-    # 计算世界矩阵
+    # 计算世界矩阵；坏 MDL 必须明确报循环，不能递归到 Python 栈溢出。
     world_mats = {}
+    visiting = set()
+
     def _compute_world(name):
         if name in world_mats:
             return world_mats[name]
-        info = flat[name]
-        parent = info.get('parent')
-        local = local_mats[name]
-        if parent and parent in flat:
-            world = _compute_world(parent) @ local
-        else:
-            world = local.copy()
-        world_mats[name] = world
-        return world
+        if name in visiting:
+            raise ValueError('MDL bone parent cycle detected at %r' % name)
+        visiting.add(name)
+        try:
+            info = flat[name]
+            parent = info.get('parent')
+            local = local_mats[name]
+            if parent == name:
+                raise ValueError('MDL bone %r cannot parent itself' % name)
+            if parent and parent in flat:
+                world = _compute_world(parent) @ local
+            else:
+                world = local.copy()
+            world_mats[name] = world
+            return world
+        finally:
+            visiting.discard(name)
 
     for name in flat:
         _compute_world(name)
@@ -220,6 +237,7 @@ def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path):
     for name, info in flat.items():
         m = {}
         if info.get('is_revolute'): m['r'] = True
+        if info.get('is_prizmatic'): m['z'] = True
         if info.get('params'): m['p'] = info['params']
         if info.get('limits'): m['l'] = list(info['limits'])
         if info.get('speed') is not None: m['s'] = info['speed']

@@ -132,40 +132,118 @@ def find_matching_brace(text, start):
                 return i
     return -1
 
-# ── Path persistence ───────────────────────────────────────────
+# ── User settings persistence ──────────────────────────────────
 
-def _get_paths_file():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), '.gem2_paths.json')
+_SETTINGS_VERSION = 1
 
-def _load_paths():
-    pf = _get_paths_file()
-    if os.path.isfile(pf):
-        try:
-            with open(pf, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {'import': '', 'export': ''}
 
-def _save_paths(data):
+def _get_legacy_paths_file():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        '.gem2_paths.json')
+
+
+def _get_settings_file():
+    """Store personal paths/options outside .blend files and the add-on tree."""
     try:
-        with open(_get_paths_file(), 'w') as f:
-            json.dump(data, f)
-    except:
-        pass
+        config_dir = bpy.utils.user_resource(
+            'CONFIG', path='gem2_goh_tools', create=True)
+    except Exception:
+        config_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(config_dir, 'settings.json')
 
-_paths = _load_paths()
+
+def _load_json_mapping(path):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _load_settings():
+    data = _load_json_mapping(_get_settings_file()) or {}
+    paths = data.get('paths')
+    if not isinstance(paths, dict):
+        # One-time migration from the original add-on-local path file.
+        legacy = _load_json_mapping(_get_legacy_paths_file()) or {}
+        paths = {
+            'import': legacy.get('import', ''),
+            'export': legacy.get('export', ''),
+        }
+    data['version'] = _SETTINGS_VERSION
+    data['paths'] = {
+        'import': str(paths.get('import') or ''),
+        'export': str(paths.get('export') or ''),
+    }
+    if not isinstance(data.get('panels'), dict):
+        data['panels'] = {}
+    return data
+
+
+def _save_settings():
+    path = _get_settings_file()
+    temp_path = path + '.tmp'
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temp_path, 'w', encoding='utf-8', newline='\n') as fh:
+            json.dump(_settings, fh, ensure_ascii=False, indent=2,
+                      sort_keys=True)
+            fh.write('\n')
+        os.replace(temp_path, path)
+    except OSError as exc:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        print('[GEM2] user settings save failed: %s' % exc)
+
+
+_settings = _load_settings()
+_paths = _settings['paths']
+
 
 def get_paths():
     return _paths
 
-def set_import_dir(dirpath):
-    _paths['import'] = dirpath
-    _save_paths(_paths)
 
-def set_export_dir(dirpath):
-    _paths['export'] = dirpath
-    _save_paths(_paths)
+def set_import_dir(dirpath, save=True):
+    _paths['import'] = str(dirpath or '')
+    if save:
+        _save_settings()
+
+
+def set_export_dir(dirpath, save=True):
+    _paths['export'] = str(dirpath or '')
+    if save:
+        _save_settings()
+
+
+def get_panel_settings(panel_id):
+    """Return a detached copy of one panel's persisted primitive values."""
+    panel = _settings['panels'].get(str(panel_id), {})
+    return dict(panel) if isinstance(panel, dict) else {}
+
+
+def set_panel_settings(panel_id, values):
+    """Atomically replace one panel's persisted settings."""
+    if not isinstance(values, dict):
+        raise TypeError('panel settings must be a mapping')
+    clean = {}
+    for key, value in values.items():
+        if isinstance(key, str) and isinstance(
+                value, (str, bool, int, float, type(None))):
+            clean[key] = value
+    _settings['panels'][str(panel_id)] = clean
+    _save_settings()
+
+
+def clear_panel_settings(panel_id):
+    _settings['panels'].pop(str(panel_id), None)
+    _save_settings()
 
 # ── Template armature loading ──────────────────────────────────
 

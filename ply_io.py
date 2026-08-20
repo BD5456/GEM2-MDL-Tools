@@ -62,10 +62,15 @@ def _parse_bones_flat(content):
         inner = text.strip()
         if inner.startswith('{'): inner = inner[1:].strip()
         if inner.endswith('}'): inner = inner[:-1].strip()
-        nm = re.search(r'bone\s+(?:revolute\s+)?"([^"]+)"', inner)
-        if not nm: return None
-        name = nm.group(1)
-        is_revolute = 'revolute' in inner.split('\n')[0]
+        nm = re.search(
+            r'\bbone\s+(?:(revolute|prizmatic|prismatic)\s+)?"([^"]+)"',
+            inner, re.IGNORECASE)
+        if not nm:
+            return None
+        bone_kind = (nm.group(1) or '').lower()
+        name = nm.group(2)
+        is_revolute = bone_kind == 'revolute'
+        is_prizmatic = bone_kind in {'prizmatic', 'prismatic'}
         children = []
         remaining = inner
         pre_text = ""
@@ -119,6 +124,7 @@ def _parse_bones_flat(content):
             'name': name, 'matrix': matrix, 'position': position,
             'orientation': orientation, 'children': children,
             'has_volumeview': has_volumeview, 'is_revolute': is_revolute,
+            'is_prizmatic': is_prizmatic,
             'params': params, 'limits': limits, 'speed': speed,
         }
 
@@ -154,6 +160,7 @@ def _parse_bones_flat(content):
             'orientation': node['orientation'],
             'parent': parent_name,
             'is_revolute': node.get('is_revolute', False),
+            'is_prizmatic': node.get('is_prizmatic', False),
             'params': node.get('params'),
             'limits': node.get('limits'),
             'speed': node.get('speed'),
@@ -184,18 +191,28 @@ def _precompute_bone_world_mats(mdl_bones):
         local_mats[name] = local_mat
 
     world_mats = {}
+    visiting = set()
+
     def compute_world(name):
         if name in world_mats:
             return world_mats[name]
-        info = mdl_bones[name]
-        parent = info.get('parent')
-        local = local_mats[name]
-        if parent and parent in mdl_bones:
-            world = compute_world(parent) @ local
-        else:
-            world = local.copy()
-        world_mats[name] = world
-        return world
+        if name in visiting:
+            raise ValueError('MDL bone parent cycle detected at %r' % name)
+        visiting.add(name)
+        try:
+            info = mdl_bones[name]
+            parent = info.get('parent')
+            local = local_mats[name]
+            if parent == name:
+                raise ValueError('MDL bone %r cannot parent itself' % name)
+            if parent and parent in mdl_bones:
+                world = compute_world(parent) @ local
+            else:
+                world = local.copy()
+            world_mats[name] = world
+            return world
+        finally:
+            visiting.discard(name)
 
     for name in mdl_bones:
         compute_world(name)
@@ -240,14 +257,22 @@ def _try_mtl_at(file_bytes, p):
     return None
 
 
-def import_ply(filepath):
+def import_ply(filepath, skip_mdl_transform=False, skip_armature=False,
+               create_helpers=True):
     """主 PLY 导入函数。返回 (mesh_obj, arm_obj, root_empty)
+
+    ``skip_armature``/``create_helpers=False`` 供载具文件夹导入：载具只创建一套
+    MDL 主骨架，每个部件 PLY 不再额外扫描同目录 MDL、创建重复骨架和空节点。
 
     自适应解析多种二进制变体：
       - 插件导出的原生格式：EPLY+BNDS / SKIN(长度前缀) / MESH / VERT(带头) / INDX(count+u16)
       - 游戏原版格式（如 qbz-95_viwer.ply）：MESH 头多 4 字节 unk
       - GOH 提取器格式（如 KKS model.ply）：EPLYBNDSA(31B) / BSKIN / MESH /
         VERT(无头直连 32B) / INDX(无 count 头,u32) / WEIGHTS(尾部)
+
+    skip_mdl_transform=True 时跳过「用 mdl mesh_parent 骨世界矩阵变换顶点」——
+    载具按文件夹导入用：部件坐标由调用方按各自骨矩阵摆位，不能叠加 import_ply 的
+    LOCAL→WORLD 自动变换（body.ply 是纯世界坐标，叠加会爆成天文数字）。
     """
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -289,6 +314,7 @@ def import_ply(filepath):
     # ── MESH 块 ──
     materials_info = []
     mesh_pos = pos
+    last_mesh_end = pos
     while True:
         mesh_pos = file_bytes.find(b'MESH', mesh_pos)
         if mesh_pos == -1 or mesh_pos + 20 > total:
@@ -318,12 +344,16 @@ def import_ply(filepath):
             p += bm_count
         materials_info.append({
             'mat_name': mat_name, 'tri_count': tri_count,
-            'fvf': fvf_flags, 'palette': palette,
+            'fvf': fvf_flags, 'mesh_flags': mesh_flags, 'palette': palette,
         })
+        last_mesh_end = p
         mesh_pos = p
 
     if not materials_info:
         raise Exception(_("ply.no_mesh_blocks"))
+    # 用最后成功解析的 MESH 块末尾作为 VERT 探测起点 —— 否则 VERT 探测会命中
+    # MESH 块材质名里的 "VERT" 子串 (如 material_#25.mtl), 顶点错位成天文数字
+    pos = last_mesh_end
 
     # ── VERT / INDX 块: 探测带头(原生) vs 无头直连(GOH) ──
     vert_pos = file_bytes.find(b'VERT', pos)
@@ -332,6 +362,7 @@ def import_ply(filepath):
     indx_pos = file_bytes.find(b'INDX', vert_pos)
 
     native_vert = False
+    vert_flags = 0
     if vert_pos + 12 <= total:
         loops_probe = unpack_I(file_bytes[vert_pos+4:vert_pos+8])[0]
         stride_probe = unpack_H(file_bytes[vert_pos+8:vert_pos+10])[0]
@@ -343,14 +374,17 @@ def import_ply(filepath):
     if native_vert:
         loops_count = loops_probe
         stride = stride_probe
-        vertex_data = file_bytes[vert_pos+12:vert_pos+12+loops_count*stride]
+        vert_flags = (unpack_H(file_bytes[vert_pos+10:vert_pos+12])[0]
+                      if vert_pos + 12 <= total else 0)
+        vertex_data_offset = vert_pos + 12
+        vertex_data = file_bytes[vertex_data_offset:vertex_data_offset+loops_count*stride]
         if indx_pos != -1 and indx_pos + 8 <= total:
             index_count = unpack_I(file_bytes[indx_pos+4:indx_pos+8])[0]
             index_data = file_bytes[indx_pos+8:indx_pos+8+index_count*2]
         else:
             raise Exception(_("ply.missing_indx"))
         fvf_global = materials_info[0]['fvf']
-        layout, has_skin_actual, _unused = parse_fvf_layout(fvf_global)
+        layout, has_skin_actual, fvf_size = parse_fvf_layout(fvf_global)
         has_normal = 'NORMAL' in layout
         has_tex = 'TEX' in layout
         has_skin_actual = 'SKIN' in layout
@@ -362,6 +396,7 @@ def import_ply(filepath):
     else:
         # GOH 变体: VERT 无头直连 [pos12+norm12+uv8]*N; INDX 无 count 头, u32
         vp = vert_pos + 4
+        vertex_data_offset = vp
         if indx_pos != -1 and indx_pos > vp:
             loops_count = (indx_pos - vp) // 32
         else:
@@ -383,6 +418,7 @@ def import_ply(filepath):
         pos_offset = 0; pos_size = 12
         norm_offset = 0; norm_size = 12
         tex_offset = 0; tex_size = 8
+        fvf_size = 32
         # 尾部 WEIGHTS 块: [count(4) + (bone_idx(4)+weight(4))*count] * N
         goh_weights = []
         wp = indx_pos + 4 + index_count * 4 if indx_pos != -1 else total
@@ -408,6 +444,7 @@ def import_ply(filepath):
     verts_norm = []
     verts_uv = []
     verts_weights = []
+    verts_tail = []  # E6.19: FVF 之外的多余字节 (原版载具 = tangent float3 + w=1.0)
 
     if goh_weights is not None:
         verts_weights = goh_weights
@@ -417,6 +454,11 @@ def import_ply(filepath):
         x, y, z = unpack_fff(vertex_data[off:off+12])
         verts_co.append((x, y, z))
         off += 12
+        # FVF 之外的尾载荷（通常 tangent float4）按实际 FVF 长度截取。
+        # 不能硬编码 32：skinned stride56 的 FVF 本体是 40 字节。
+        verts_tail.append(
+            vertex_data[i * stride + fvf_size:i * stride + stride]
+            if stride > fvf_size else b'')
 
         if has_skin_actual and goh_weights is None:
             w1 = unpack_f(vertex_data[off:off+4])[0]
@@ -473,18 +515,51 @@ def import_ply(filepath):
     while len(triangle_materials) < len(triangles):
         triangle_materials.append(0)
 
+    source_vertex_count = len(verts_co)
+    source_vertex_indices = list(range(source_vertex_count))
+
+    # ── 修剪不被面引用的顶点 (E6.19) ──────────────────────────────
+    # 一些导出文件 (如 m61a5 载具 body.ply) 在 VERT 里多写 1 个"填充/padding"
+    # 顶点 (vertex_count = 28994, 但 INDX 只引用 0..28992)。该顶点字节是垃圾,
+    # 按 float 读出来是天文数字 (x=1.06e21, z=1.05e21) —— 既撑爆整体顶点包围盒,
+    # 又破坏载具"质心 vs 骨位置"摆位判据。策略: 丢掉任何不被三角形引用的顶点,
+    # 并把 triangles 的索引重映射到连续新索引 (保 co/normal/UV/权重数组对齐)。
+    if verts_co:
+        referenced = set()
+        for tri in triangles:
+            referenced.update(tri)
+        if len(referenced) < len(verts_co):
+            old_idx = sorted(referenced)
+            source_vertex_indices = old_idx
+            remap = {old: new for new, old in enumerate(old_idx)}
+            n_orig = len(verts_co)
+            verts_co = [verts_co[old] for old in old_idx]
+            if verts_norm:
+                verts_norm = [verts_norm[old] for old in old_idx]
+            if verts_uv:
+                verts_uv = [verts_uv[old] for old in old_idx]
+            if len(verts_weights) == n_orig:
+                verts_weights = [verts_weights[old] for old in old_idx]
+            if len(verts_tail) == n_orig:
+                verts_tail = [verts_tail[old] for old in old_idx]
+            triangles = [tuple(remap[i] for i in tri) for tri in triangles]
+            print('[ply] pruned %d unreferenced padding vertices (%d -> %d)'
+                  % (n_orig - len(referenced), n_orig, len(referenced)))
+
     # ── 构建网格 (保持原始顶点数, 不去重) ──
     mesh_name = os.path.splitext(os.path.basename(filepath))[0]
     mesh = bpy.data.meshes.new(mesh_name)
     obj = bpy.data.objects.new(mesh_name, mesh)
     bpy.context.collection.objects.link(obj)
 
-    root_empty = bpy.data.objects.new(mesh_name + "_Root", None)
-    bpy.context.collection.objects.link(root_empty)
-    root_empty.empty_display_type = 'PLAIN_AXES'
-    root_empty.empty_display_size = 0.5
-    root_empty.location = (0, 0, 0)
-    obj.parent = root_empty
+    root_empty = None
+    if create_helpers:
+        root_empty = bpy.data.objects.new(mesh_name + "_Root", None)
+        bpy.context.collection.objects.link(root_empty)
+        root_empty.empty_display_type = 'PLAIN_AXES'
+        root_empty.empty_display_size = 0.5
+        root_empty.location = (0, 0, 0)
+        obj.parent = root_empty
 
     mesh.vertices.add(len(verts_co))
     flat_co = [c for v in verts_co for c in v]
@@ -501,16 +576,66 @@ def import_ply(filepath):
 
     mesh.update()
 
+    # ── E6.19: 保存格式元数据 (载具往返导出用) ──
+    # fvf / mesh_flags / stride 是原文件的字节级事实; tangent 尾 (stride 超出
+    # pos+normal+uv 的部分, 原版载具 = tangent float3 + w=1.0 共 16B) 存进
+    # 顶点属性 gem2_tail, 导出时原样写回 → bump/tangent 数据不丢。
+    try:
+        obj['gem2_ply_fvf'] = materials_info[0]['fvf'] if materials_info else 0
+        obj['gem2_ply_mesh_flags'] = (materials_info[0].get('mesh_flags', 0)
+                                      if materials_info else 0)
+        obj['gem2_vertex_stride'] = int(stride)
+        obj['gem2_ply_mat_name'] = (materials_info[0].get('mat_name', '')
+                                    if materials_info else '')
+        obj['gem2_vert_flags'] = int(vert_flags)
+        obj['gem2_has_skin'] = bool(has_skin)
+        obj['gem2_ply_source'] = os.path.abspath(filepath)
+        obj['gem2_ply_native_vert'] = bool(native_vert)
+        obj['gem2_vertex_data_offset'] = int(vertex_data_offset)
+        obj['gem2_source_vertex_count'] = int(source_vertex_count)
+        obj['gem2_source_vertex_indices'] = json.dumps(source_vertex_indices)
+        obj['gem2_source_triangle_count'] = int(len(triangles))
+    except Exception:
+        pass
+    # 原文件逐顶点 normal 字节 (Blender 平滑法线≠文件法线, 必须原样保存;
+    # FLOAT_VECTOR 无色彩空间, 负分量不被 clamp)
+    if verts_norm and len(verts_norm) == len(mesh.vertices):
+        try:
+            nrm_attr = mesh.attributes.new('gem2_nrm', 'FLOAT_VECTOR', 'POINT')
+            for i, nv in enumerate(verts_norm):
+                nrm_attr.data[i].vector = nv
+        except Exception:
+            pass
+    # tangent 尾: xyz 存 FLOAT_VECTOR + w 存 FLOAT —— FLOAT_COLOR 会走色彩空间
+    # 转换把负分量 clamp 成 0 (实测 x=-0.85 被吃), 必须用无色彩空间类型。
+    if verts_tail and any(verts_tail) and len(verts_tail) == len(mesh.vertices):
+        try:
+            t_attr = mesh.attributes.new('gem2_tail', 'FLOAT_VECTOR', 'POINT')
+            w_attr = mesh.attributes.new('gem2_tail_w', 'FLOAT', 'POINT')
+            for i, t in enumerate(verts_tail):
+                tb = t[:16].ljust(16, b'\x00')
+                x, y, z, w = struct.unpack('<ffff', tb)
+                t_attr.data[i].vector = (x, y, z)
+                w_attr.data[i].value = w
+        except Exception:
+            pass
+
     # ── 材质 ──
     base_dir = os.path.dirname(filepath)
     for info in materials_info:
         mat_name = info['mat_name'].replace('.mtl', '')
         if not mat_name:
             mat_name = 'default'
-        mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
         mtl_path = os.path.join(base_dir, mat_name + '.mtl')
-        if os.path.isfile(mtl_path):
+        mtl_source = os.path.normcase(os.path.abspath(mtl_path))
+        mat = bpy.data.materials.get(mat_name)
+        if mat is not None and mat.get('gem2_mtl_source') != mtl_source:
+            mat = None
+        if mat is None:
+            mat = bpy.data.materials.new(name=mat_name)
+        if os.path.isfile(mtl_path) and mat.get('gem2_mtl_source') != mtl_source:
             _parse_and_apply_mtl(mtl_path, mat, base_dir)
+            mat['gem2_mtl_source'] = mtl_source
         mesh.materials.append(mat)
 
     # ── UV ──
@@ -555,14 +680,14 @@ def import_ply(filepath):
     mesh.update()
 
     # ── MDL 骨骼 ──
-    mdl_path = _find_mdl_path(filepath)
+    mdl_path = None if skip_armature else _find_mdl_path(filepath)
     mdl_bones = None
     mesh_parent_name = None
     if mdl_path and os.path.isfile(mdl_path):
         print(_("ply.mdl_found", path=mdl_path))
         with open(mdl_path, 'r', encoding='utf-8', errors='ignore') as f:
             mdl_bones, mesh_parent_name = _parse_bones_flat(f.read())
-    else:
+    elif not skip_armature:
         print(_("ply.mdl_not_found"))
 
     # ── 骨架创建 ──
@@ -572,7 +697,7 @@ def import_ply(filepath):
         arm_obj = _build_armature_from_mdl(
             mesh_name, mdl_bones, mesh_parent_name, mdl_path)
         world_mats = _precompute_bone_world_mats(mdl_bones)
-    elif has_skin and bone_names:
+    elif not skip_armature and has_skin and bone_names:
         arm_data = bpy.data.armatures.new(mesh_name + "_Arm")
         arm_obj = bpy.data.objects.new(mesh_name + "_Armature", arm_data)
         bpy.context.collection.objects.link(arm_obj)
@@ -587,23 +712,50 @@ def import_ply(filepath):
         arm_obj.show_in_front = True
         world_mats = None
 
-    if arm_obj:
+    if arm_obj and root_empty:
         arm_obj.parent = root_empty
 
-    # ── 原点居中 ──
-    if arm_obj and 'body' in arm_obj.data.bones:
+    # ── 原点居中 (skip_mdl_transform 模式跳过: 载具按骨摆位不居中) ──
+    if (not skip_mdl_transform and root_empty and arm_obj
+            and 'body' in arm_obj.data.bones):
         body_bone = arm_obj.data.bones['body']
         body_world = arm_obj.matrix_world @ body_bone.head_local
         root_empty.location = -body_world
 
-    # ── 顶点空间变换：LOCAL → WORLD ──
-    if mesh_parent_name and world_mats and mesh_parent_name in world_mats:
+    # ── 顶点空间变换：PLY → Blender ──
+    # Skinned PLY coordinates exclude only the VolumeView node's local matrix.
+    # Its ancestor basis/body transforms act on skeleton and mesh together in
+    # GEM2 and must not be applied a second time here (doing so mirrors L/R in
+    # GFA characters). Static/rigid PLY keeps the ordinary parent-world rule;
+    # vehicle folder import skips this block and applies its own bone world.
+    if not skip_mdl_transform and mesh_parent_name and world_mats \
+            and mesh_parent_name in world_mats:
         mesh_world = world_mats[mesh_parent_name]
+        if has_skin and mdl_bones and mesh_parent_name in mdl_bones:
+            ancestor_name = mdl_bones[mesh_parent_name].get('parent')
+            if ancestor_name and ancestor_name in world_mats:
+                mesh_world = (world_mats[ancestor_name].inverted()
+                              @ world_mats[mesh_parent_name])
         for v in mesh.vertices:
             v.co = mesh_world @ v.co
         mesh.update()
 
     mesh.validate(clean_customdata=True)
+
+    # ``validate`` may remove duplicate/invalid source triangles (for example
+    # t-90m/turret.ply contains one byte-identical duplicate face). Vehicle
+    # safe-export must compare against the topology Blender actually retained,
+    # while the raw source triangle count remains available for diagnostics.
+    try:
+        import hashlib
+        mesh.calc_loop_triangles()
+        topo = bytearray()
+        for tri in mesh.loop_triangles:
+            topo.extend(struct.pack('<III', *tri.vertices))
+        obj['gem2_topology_hash'] = hashlib.sha256(topo).hexdigest()
+        obj['gem2_imported_triangle_count'] = len(mesh.loop_triangles)
+    except Exception:
+        pass
 
     # ── 顶点权重 ──
     if has_skin and arm_obj and verts_weights:
@@ -660,21 +812,22 @@ def import_ply(filepath):
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
 
-    # ── 根节点归零 ──
-    _apply_root_transform(obj, arm_obj, root_empty)
+    # ── 根节点归零 (skip_mdl_transform 模式: 载具按骨摆位, 保留坐标不归零) ──
+    if not skip_mdl_transform and root_empty:
+        _apply_root_transform(obj, arm_obj, root_empty)
 
     # ── 群组节点 ──
-    group_empty = bpy.data.objects.new(mesh_name + "_Model", None)
-    bpy.context.collection.objects.link(group_empty)
-    group_empty.empty_display_type = 'PLAIN_AXES'
-    group_empty.empty_display_size = 0.5
-    group_empty.location = (0, 0, 0)
-    obj.parent = group_empty
-    if arm_obj:
-        arm_obj.parent = group_empty
-
-    # ── 视口修复 ──
-    _fix_viewport()
+    group_empty = None
+    if create_helpers:
+        group_empty = bpy.data.objects.new(mesh_name + "_Model", None)
+        bpy.context.collection.objects.link(group_empty)
+        group_empty.empty_display_type = 'PLAIN_AXES'
+        group_empty.empty_display_size = 0.5
+        group_empty.location = (0, 0, 0)
+        obj.parent = group_empty
+        if arm_obj:
+            arm_obj.parent = group_empty
+        _fix_viewport()
 
     print(_("ply.import_success", name=mesh_name, verts=len(verts_co), tris=len(triangles)))
     return obj, arm_obj, group_empty
@@ -704,18 +857,28 @@ def _build_armature_from_mdl(mesh_name, mdl_bones, mesh_parent_name, mdl_path):
         local_mats[name] = local_mat
 
     world_mats = {}
+    visiting = set()
+
     def compute_world(name):
         if name in world_mats:
             return world_mats[name]
-        info = mdl_bones[name]
-        parent = info.get('parent')
-        local = local_mats[name]
-        if parent and parent in mdl_bones:
-            world = compute_world(parent) @ local
-        else:
-            world = local.copy()
-        world_mats[name] = world
-        return world
+        if name in visiting:
+            raise ValueError('MDL bone parent cycle detected at %r' % name)
+        visiting.add(name)
+        try:
+            info = mdl_bones[name]
+            parent = info.get('parent')
+            local = local_mats[name]
+            if parent == name:
+                raise ValueError('MDL bone %r cannot parent itself' % name)
+            if parent and parent in mdl_bones:
+                world = compute_world(parent) @ local
+            else:
+                world = local.copy()
+            world_mats[name] = world
+            return world
+        finally:
+            visiting.discard(name)
 
     for name in mdl_bones:
         compute_world(name)
@@ -757,6 +920,7 @@ def _build_armature_from_mdl(mesh_name, mdl_bones, mesh_parent_name, mdl_path):
     for name, info in mdl_bones.items():
         m = {}
         if info.get('is_revolute'): m['r'] = True
+        if info.get('is_prizmatic'): m['z'] = True
         if info.get('params'): m['p'] = info['params']
         if info.get('limits'): m['l'] = list(info['limits'])
         if info.get('speed') is not None: m['s'] = info['speed']
@@ -812,7 +976,7 @@ def _fix_viewport():
 # ═══════════════════════════════════════════════════════════════
 
 def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
-    """导出二进制 PLY 文件"""
+    """导出二进制 PLY 文件，并按最终属性共享可复用的顶点。"""
     mesh = mesh_obj.data
     depsgraph = bpy.context.evaluated_depsgraph_get()
     eval_obj = mesh_obj.evaluated_get(depsgraph)
@@ -823,8 +987,8 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
         raise Exception("Mesh has no materials")
 
     mesh.update()
+    mesh.calc_loop_triangles()
     loop_tris = mesh.loop_triangles
-    index_count = len(loop_tris) * 3
 
     has_skin = bool(arm_obj and mesh_obj.vertex_groups)
     bones_count = len(mesh_obj.vertex_groups) if has_skin else 0
@@ -832,6 +996,61 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
     skin_world_inv = Matrix.Identity(4)
     if has_skin and skin_world is not None:
         skin_world_inv = skin_world.inverted()
+
+    uvs = [uv.uv for uv in mesh.uv_layers.active.data]
+    if has_skin:
+        from heapq import nlargest
+        vertex_weights = [
+            [(g.weight, g.group) for g in nlargest(2, v.groups, key=lambda g: g.weight)]
+            for v in mesh.vertices
+        ]
+
+    # Group triangles by material, then deduplicate the exact bytes that will
+    # be written for each output vertex. This preserves UV/normal/weight seams.
+    tris_by_mat = [[] for _i in mesh.materials]
+    for tri in loop_tris:
+        if 0 <= tri.material_index < len(tris_by_mat):
+            tris_by_mat[tri.material_index].append(tri)
+
+    vertex_records = []
+    vertex_lookup = {}
+
+    def record_for_loop(loop):
+        v_idx = loop.vertex_index
+        v = mesh.vertices[v_idx]
+        pos = skin_world_inv @ v.co
+        record = bytearray()
+        record.extend(pack_fff(pos.x * unit_scale, pos.y * unit_scale,
+                               pos.z * unit_scale))
+        if has_skin:
+            wl = vertex_weights[v_idx] + [(0, 0)] * (4 - len(vertex_weights[v_idx]))
+            weight_sum = wl[0][0] + wl[1][0]
+            inv = 1.0 / weight_sum if weight_sum > 0 else 1.0
+            record.extend(pack_f(wl[0][0] * inv))
+            record.extend(pack_BBBB(*(w[1] for w in wl)))
+        record.extend(pack_fff(*loop.normal))
+        record.extend(pack_I(0xFFFFFFFF))
+        record.extend(pack_ff(uvs[loop.index][0], 1.0 - uvs[loop.index][1]))
+        key = bytes(record)
+        idx = vertex_lookup.get(key)
+        if idx is None:
+            idx = len(vertex_records)
+            vertex_lookup[key] = idx
+            vertex_records.append(key)
+        return idx
+
+    tri_indices_by_mat = []
+    for mat_tris in tris_by_mat:
+        out_tris = []
+        for tri in mat_tris:
+            out_tris.append((record_for_loop(mesh.loops[tri.loops[0]]),
+                             record_for_loop(mesh.loops[tri.loops[2]]),
+                             record_for_loop(mesh.loops[tri.loops[1]])))
+        tri_indices_by_mat.append(out_tris)
+
+    vertex_count = len(vertex_records)
+    if vertex_count > 0xffff:
+        raise Exception(_("ply.export.unique_vertex_limit", vertices=vertex_count))
 
     with open(filepath, "wb") as f:
         f.write(b"EPLY")
@@ -854,11 +1073,7 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
                 f.write(name_bytes)
 
         tri_start = 0
-        tris_by_mat = [[] for _i in mesh.materials]
-        for tri in loop_tris:
-            tris_by_mat[tri.material_index].append(tri)
-
-        for i, mat_tris in enumerate(tris_by_mat):
+        for i, mat_tris in enumerate(tri_indices_by_mat):
             f.write(b"MESH")
             fvf = D3DFVF_NORMAL | D3DFVF_TEX1 | D3DFVF_DIFFUSE
             if has_skin:
@@ -888,54 +1103,21 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
                 f.write(pack_B(bones_count))
                 f.write(struct.pack("B" * bones_count, *(i + 1 for i in range(bones_count))))
 
-        loops_count = len(mesh.loops)
-        if loops_count > 0xffff:
-            raise Exception(
-                f"面数 {loops_count//3} 超过 GEM2 引擎上限 21845 三角面。\n"
-                "请用 Blender Decimate 修改器或手动减面后再导出。\n"
-                "参考: 样板4=6788面, 样板6=14451面"
-            )
-
-        stride = 36 + 8 * has_skin
+        stride = len(vertex_records[0]) if vertex_records else (44 if has_skin else 36)
         f.write(b"VERT")
-        f.write(pack_I(loops_count))
+        f.write(pack_I(vertex_count))
         f.write(pack_H(stride))
         f.write(b"\x07\x00")
 
-        uvs = [uv.uv for uv in mesh.uv_layers.active.data]
-
-        if has_skin:
-            from heapq import nlargest
-            vertex_weights = [
-                [(g.weight, g.group) for g in nlargest(2, v.groups, key=lambda g: g.weight)]
-                for v in mesh.vertices
-            ]
-
-        for loop in mesh.loops:
-            v_idx = loop.vertex_index
-            v = mesh.vertices[v_idx]
-            pos = skin_world_inv @ v.co
-            f.write(pack_fff(pos.x * unit_scale, pos.y * unit_scale, pos.z * unit_scale))
-
-            if has_skin:
-                wl = vertex_weights[v_idx]
-                wl = wl + [(0, 0)] * (4 - len(wl))
-                try:
-                    inv = 1.0 / (wl[0][0] + wl[1][0]) if (wl[0][0] + wl[1][0]) > 0 else 1.0
-                except:
-                    inv = 1.0
-                f.write(pack_f(wl[0][0] * inv))
-                f.write(pack_BBBB(*(w[1] for w in wl)))
-
-            f.write(pack_fff(*loop.normal))
-            f.write(pack_I(0xFFFFFFFF))
-            f.write(pack_ff(uvs[loop.index][0], 1.0 - uvs[loop.index][1]))
+        for record in vertex_records:
+            f.write(record)
 
         f.write(b"INDX")
+        index_count = sum(len(x) for x in tri_indices_by_mat) * 3
         f.write(pack_I(index_count))
-        for mat_tris in tris_by_mat:
+        for mat_tris in tri_indices_by_mat:
             for tri in mat_tris:
-                f.write(pack_HHH(tri.loops[0], tri.loops[2], tri.loops[1]))
+                f.write(pack_HHH(*tri))
 
 
 def export_vol(filepath, mesh_obj, unit_scale=1.0):
@@ -963,7 +1145,9 @@ def export_vol(filepath, mesh_obj, unit_scale=1.0):
         f.write(b"INDX")
         f.write(pack_I(edges_count))
         for tri in loop_tris:
-            f.write(pack_HHH(*tri.vertices))
+            # E6.19: import_vol 导入时绕序翻转 (i0,i2,i1) → 导出翻回 (i0,i1,i2),
+            # 与原文件字节一致 (否则碰撞面法线方向反)。
+            f.write(pack_HHH(tri.vertices[0], tri.vertices[2], tri.vertices[1]))
 
         f.write(b"SIDE")
         f.write(pack_I(edges_count // 3))
@@ -984,6 +1168,7 @@ def import_vol(filepath):
         raise Exception(_("ply.vol_missing_vert"))
     p = vert_pos + 4
     vertex_count = unpack_I(file_bytes[p:p+4])[0]; p += 4
+    vertex_data_offset = p
     verts = [unpack_fff(file_bytes[p+i*12:p+(i+1)*12]) for i in range(vertex_count)]
     p += vertex_count * 12
 
@@ -1012,6 +1197,10 @@ def import_vol(filepath):
 
     mesh.from_pydata(verts, [], triangles)
     mesh.update()
+    obj['gem2_vol_source'] = os.path.abspath(filepath)
+    obj['gem2_vol_vertex_data_offset'] = int(vertex_data_offset)
+    obj['gem2_vol_vertex_count'] = int(vertex_count)
+    obj['gem2_vol_index_count'] = int(index_count)
 
     if material_ids:
         for mat_id in sorted(set(material_ids)):

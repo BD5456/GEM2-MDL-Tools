@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 i18n — Internationalization module for GEM2 Engine Tools.
-Provides _() translation function for three languages: en, zh, ru.
+Provides _() translation function for four languages: en, zh, ru, uk.
 
 Language detection order:
   1. Blender translation locale (bpy.app.translations.locale)
@@ -36,21 +36,30 @@ def _detect_language():
             if locale:
                 if isinstance(locale, bytes):
                     locale = locale.decode("utf-8", errors="replace")
-                lang = str(locale).split("_")[0].lower()
-                if lang in ("zh", "zh_CN", "zh_CN.UTF-8", "zh_CN.utf8"):
+                lang = str(locale).replace('-', '_').split('_')[0].lower()
+                if lang == "zh":
                     return "zh"
-                if lang in ("ru", "ru_RU"):
+                if lang == "ru":
                     return "ru"
+                if lang == "uk":
+                    return "uk"
+                if lang == "en":
+                    return "en"
         except Exception:
             pass
         # Try Blender UI language preference
         try:
             prefs = bpy.context.preferences.view
             lang_code = prefs.language
-            if lang_code == "zh_CN" or lang_code == "zh_HANS":
+            normalized = str(lang_code).replace('-', '_').lower()
+            if normalized in ("zh_cn", "zh_hans"):
                 return "zh"
-            if lang_code == "ru" or lang_code == "ru_RU":
+            if normalized in ("ru", "ru_ru"):
                 return "ru"
+            if normalized in ("uk", "uk_ua"):
+                return "uk"
+            if normalized in ("en", "en_gb", "en_us"):
+                return "en"
         except Exception:
             pass
     except ImportError:
@@ -60,8 +69,12 @@ def _detect_language():
     env_lang = os.environ.get("GEM2_LANG", "").lower()
     if env_lang in ("zh", "zh_cn", "chinese"):
         return "zh"
-    if env_lang in ("ru", "russian"):
+    if env_lang in ("ru", "ru_ru", "russian"):
         return "ru"
+    if env_lang in ("uk", "uk_ua", "ua", "ukrainian"):
+        return "uk"
+    if env_lang in ("en", "en_us", "en_gb", "english"):
+        return "en"
 
     return _FALLBACK_LANG
 
@@ -86,10 +99,14 @@ def _load_locale(lang):
 
 def _(key, **kwargs):
     """Get localized string by key.
-    
+
     Supports str.format() style parameters.
     Example: _("export.success", dir="/path/to/export")
     """
+    global LANG
+    detected = _detect_language()
+    if detected != LANG:
+        LANG = detected
     lang = LANG
     strings = _load_locale(lang)
 
