@@ -385,6 +385,117 @@ def _kw_hit(base, kws):
     return any(kw.casefold() in base for kw in kws)
 
 
+_PUPIL_LAYER_KW = (
+    'hitomi', 'pupil', 'iris', 'eyered', 'eye_red', 'tongkong',
+    '瞳孔', '瞳',
+)
+_SCLERA_LAYER_KW = (
+    'sirome', 'sclera', 'eyewhite', 'eye_white', 'eye white',
+    '白目', '眼白',
+)
+_EYE_SHADOW_LAYER_KW = (
+    'eyeshadow', 'eye_shadow', 'eye shadow', '瞳影', '眼影',
+)
+_EYE_LID_LAYER_KW = (
+    'eyeslid', 'eye_lid', 'eye lid', 'eyelid', '眼睑', '眼皮',
+)
+_PUPIL_LAYER_EXACT = {
+    'eye', 'eyes', 'eyes+', 'eyes_', 'eyeleft', 'eyeright', '眼', '目',
+}
+_NECK_ACCESSORY_KW = (
+    'neck', 'kubi', 'collar', 'choker', 'necklace', 'neckchain',
+    'neck_chain', 'scarf', 'cravat', '领', '颈', '项圈',
+)
+
+
+def _is_sclera_layer(name):
+    return _kw_hit(name, _SCLERA_LAYER_KW)
+
+
+def _is_eye_shadow_layer(name):
+    return _kw_hit(name, _EYE_SHADOW_LAYER_KW)
+
+
+def _is_eye_lid_layer(name):
+    return _kw_hit(name, _EYE_LID_LAYER_KW)
+
+
+def _is_gfa_pupil_overlay(material_name, diffuse_name):
+    """Match the Eyes+/eyeblend soft-alpha iris overlay."""
+    diffuse = os.path.splitext(os.path.basename(diffuse_name or ''))[0]
+    return (_is_pupil_layer(material_name)
+            and _kw_hit(diffuse, ('eyeblend', 'eye_blend')))
+
+
+def _is_pupil_layer(name):
+    value = (name or '').casefold()
+    if _is_sclera_layer(value):
+        return False
+    if any(key in value for key in ('shadow', 'eyeline', 'eyelash',
+                                    'lash', 'brow')):
+        return False
+    return value in _PUPIL_LAYER_EXACT or _kw_hit(value, _PUPIL_LAYER_KW)
+
+
+def _material_alpha_mode(material_name, diffuse_name, texture_mode,
+                         has_alpha=False):
+    """Refine a texture-level alpha plan with material semantics.
+
+    Textures are converted once and can be shared by several materials. Sclera
+    stays opaque, while a pupil layer uses the image's actual alpha fact rather
+    than inheriting filename-based opaque/test classification.
+    """
+    semantic = material_name or ''
+    if _is_sclera_layer(semantic):
+        return 'none'
+    if _is_eye_shadow_layer(semantic):
+        return 'blend'
+    if _is_pupil_layer(semantic):
+        return 'blend' if has_alpha else 'none'
+    diffuse_base = os.path.splitext(os.path.basename(diffuse_name or ''))[0]
+    if diffuse_base in EXCLUDE_TRANSPARENT:
+        return 'none'
+    if (_is_force_opaque_hard(semantic)
+            or _is_force_opaque_hard(diffuse_name)):
+        return 'none'
+    if (_is_force_opaque_alpha(semantic)
+            or _is_force_opaque_alpha(diffuse_name)):
+        tight = (_kw_hit(semantic, ('tight', 'bodytights'))
+                 or _kw_hit(diffuse_name, ('tight', 'bodytights')))
+        if tight and _goh_alpha_test_mode() and has_alpha:
+            return 'test'
+        return 'none'
+    return texture_mode
+
+
+def _material_static_alpha(mat):
+    """Return and persist the source material's constant alpha when available."""
+    if not mat:
+        return None
+    if bool(mat.get('gem2_force_export', False)):
+        return 1.0
+    if bool(mat.get('gem2_skip_export', False)):
+        return 0.0
+    persisted = mat.get('mowas2_material_static_alpha')
+    if persisted is not None:
+        try:
+            return float(persisted)
+        except (TypeError, ValueError):
+            pass
+    mmd = getattr(mat, 'mmd_material', None)
+    if mmd is not None and hasattr(mmd, 'alpha'):
+        try:
+            alpha = float(mmd.alpha)
+            mat['mowas2_material_static_alpha'] = alpha
+            return alpha
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(mat.diffuse_color[3])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
 def detect_source_mode(tgt=None, src=None):
     """判定源骨架类型: ``kk`` (KK/KKS) 或 ``mmd`` (标准 MMD)。
 
@@ -411,19 +522,41 @@ def detect_source_mode(tgt=None, src=None):
 
 
 def _classify_mode(diffuse, has_alpha, exclude=EXCLUDE_TRANSPARENT,
-                   mode='kk', alpha_profile=None, alpha_test=None):
+                   mode='kk', alpha_profile=None, alpha_test=None,
+                   material_names=None):
     """统一判定一个 diffuse 贴图的最终 mtl blend 模式。
 
     默认采用 GOH 原生 akq_youwu 的 alpha-test 写法：
     ``alpharef 127 + blend test + alphatocoverage``，不设置 PLY 0x0002。
     面板关闭 ``透明材质使用 Alpha Test`` 后，保留旧的 blend/test 分类，
     便于对照验证；none 仍优先保护身体、鞋和盔甲实体材质。
+
+    材质语义优先于 diffuse 文件名。软 alpha 瞳孔必须保留 blend；尤其
+    Eyes+/eyeblend 的透明背景不能丢弃，否则共面的眼睛底图会被黑色 RGB
+    覆盖。默认不可见的 MMD 材质会在 export_all 中按常量 alpha 单独剔除。
     """
     if alpha_test is None:
         alpha_test = _goh_alpha_test_mode()
     alpha_test = bool(alpha_test)
     base = os.path.splitext(os.path.basename(diffuse or ''))[0]
+    if isinstance(material_names, str):
+        material_names = (material_names,)
+    else:
+        material_names = tuple(material_names or ())
+    has_pupil_semantic = (_is_pupil_layer(base)
+                          or any(_is_pupil_layer(name)
+                                 for name in material_names))
+    has_sclera_semantic = (_is_sclera_layer(base)
+                           or any(_is_sclera_layer(name)
+                                  for name in material_names))
+    # Preserve pupil overlay alpha even when a shared-atlas filename otherwise
+    # looks opaque. The black RGB outside the visible highlights is not a valid
+    # replacement for transparency.
+    if has_alpha and has_pupil_semantic:
+        return 'blend'
     if base in exclude:
+        return 'none'
+    if has_sclera_semantic and not has_pupil_semantic:
         return 'none'
     # 2026-08-18: 硬实体 (鞋/靴/护甲) 前置 —— MMD 表的 gloss/highlight/lens 等
     # 词会命中鞋子贴图名 (如 shoes_gloss), 导致鞋子误判 blend 半透明。
@@ -593,7 +726,8 @@ def _compress_tga_to_dds(input_path, output_path, blend, nvtt_path=None):
 
 def _convert_textures(out_sub, texture_format='TGA',
                       exclude=EXCLUDE_TRANSPARENT, mode='kk', nvtt_path=None,
-                      toon_shader=False):
+                      toon_shader=False, material_names_by_diffuse=None,
+                      alpha_by_diffuse=None):
     """按用户选择输出 TGA 或 DDS，并让 MTL/PLY 共用同一透明分类。"""
     texture_format = str(texture_format or 'TGA').upper()
     if texture_format not in {'TGA', 'DDS'}:
@@ -625,17 +759,27 @@ def _convert_textures(out_sub, texture_format='TGA',
         target_path = os.path.join(out_sub, base + target_ext)
         temp_tga = os.path.join(out_sub, base + '.__gem2_texture_input.tga')
         soften = _needs_soften(base)
+        semantic_names = ()
+        if material_names_by_diffuse:
+            semantic_names = (material_names_by_diffuse.get(base)
+                              or material_names_by_diffuse.get(base.casefold())
+                              or ())
+        pupil_consumer = (_is_pupil_layer(base)
+                          or any(_is_pupil_layer(name)
+                                 for name in semantic_names))
         hair_mat = _kw_hit(base, ('hair', 'toufa', '髪', '头发',
                                   '发', '髮', 'bang', 'forelock',
                                   'maegami', 'kami', 'liuhai'))
         test_named = _kw_hit(base, ('tight', 'bodytights'))
-        # Toon Shader's hair contract requires alpha-test. Do not pre-fill its
-        # transparent RGB or compress it as opaque BC1 before MTL conversion.
-        fill = ((hair_mat and not toon_shader)
+        # Toon Shader's hair contract requires alpha-test. Shared pupil atlases
+        # must retain their alpha/RGB even when the filename looks like hair,
+        # clothing, or another normally opaque category.
+        fill = (not pupil_consumer and (
+                (hair_mat and not toon_shader)
                 or (_is_force_opaque_alpha(base)
                     and not ((toon_shader and hair_mat)
                              or (_goh_alpha_test_mode() and test_named)))
-                or _is_force_opaque_hard(base))
+                or _is_force_opaque_hard(base)))
         try:
             retained_source = ext_lower == target_ext
             profile_path = temp_tga if retained_source or texture_format == 'DDS' else target_path
@@ -643,10 +787,13 @@ def _convert_textures(out_sub, texture_format='TGA',
                 source_path, profile_path, soften=soften,
                 fill_black=fill, return_profile=True)
             has_alpha = bool(profile.get('has_alpha'))
+            if alpha_by_diffuse is not None:
+                alpha_by_diffuse[base] = has_alpha
+                alpha_by_diffuse[base.casefold()] = has_alpha
             blend = _classify_mode(
                 base, has_alpha, exclude=exclude, mode=mode,
-                alpha_profile=profile)
-            if toon_shader and hair_mat:
+                alpha_profile=profile, material_names=semantic_names)
+            if toon_shader and hair_mat and not pupil_consumer:
                 blend = 'test'
             plan[base] = blend
             if retained_source:
@@ -719,19 +866,27 @@ def _convert_textures(out_sub, texture_format='TGA',
 
 
 def convert_textures_to_tga(out_sub, exclude=EXCLUDE_TRANSPARENT, mode='kk',
-                            toon_shader=False):
+                            toon_shader=False,
+                            material_names_by_diffuse=None,
+                            alpha_by_diffuse=None):
     """内置无依赖 TGA 工作流（默认，兼容既有导出）。"""
     return _convert_textures(
         out_sub, texture_format='TGA', exclude=exclude, mode=mode,
-        toon_shader=toon_shader)
+        toon_shader=toon_shader,
+        material_names_by_diffuse=material_names_by_diffuse,
+        alpha_by_diffuse=alpha_by_diffuse)
 
 
 def convert_textures_to_dds(out_sub, exclude=EXCLUDE_TRANSPARENT, mode='kk',
-                            nvtt_path=None, toon_shader=False):
+                            nvtt_path=None, toon_shader=False,
+                            material_names_by_diffuse=None,
+                            alpha_by_diffuse=None):
     """可选 DDS 工作流；使用用户安装的外部 NVTT，不随插件分发。"""
     return _convert_textures(
         out_sub, texture_format='DDS', exclude=exclude, mode=mode,
-        nvtt_path=nvtt_path, toon_shader=toon_shader)
+        nvtt_path=nvtt_path, toon_shader=toon_shader,
+        material_names_by_diffuse=material_names_by_diffuse,
+        alpha_by_diffuse=alpha_by_diffuse)
 
 
 # Material contract adapted from GFA_Model_Weight_Transfer/MaterialTools/
@@ -831,6 +986,15 @@ def apply_toon_shader_conversion(out_sub):
             r'\{diffuse\s+"([^"]+)"\}', content, re.IGNORECASE)
         if not diffuse_match:
             continue
+        material_name = os.path.splitext(filename)[0]
+        # GFA keeps the actual eye surfaces on material simple. Converting them
+        # to bump/full_specular changes their render path and, together with
+        # alpha flags, produces depth/sorting artifacts around the sclera.
+        if (_is_pupil_layer(material_name)
+                or _is_sclera_layer(material_name)
+                or _is_eye_shadow_layer(material_name)
+                or _is_eye_lid_layer(material_name)):
+            continue
         material_type = _toon_diffuse_type(diffuse_match.group(1))
         if material_type is None:
             continue
@@ -876,6 +1040,79 @@ def apply_toon_shader_conversion(out_sub):
           '| dependency:', dependency_root or ('Workshop ' + _TOON_SHADER_WORKSHOP_ID))
     return {'converted': converted, 'groups': counts,
             'dependency_root': dependency_root}
+
+
+def _validate_eye_material_contract(out_sub, material_semantics,
+                                    mat_diffuse, material_plan,
+                                    two_sided_mats, hidden_mats):
+    """Fail export when static-hidden or soft-alpha eye semantics regress."""
+    checked = []
+    for material_name in hidden_mats:
+        semantic = material_semantics.get(material_name, material_name)
+        if material_name in mat_diffuse:
+            raise RuntimeError(
+                'Static alpha=0 material entered the material plan: '
+                + material_name)
+        path = os.path.join(out_sub, material_name + '.mtl')
+        if os.path.exists(path):
+            raise RuntimeError(
+                'Static alpha=0 material produced an MTL: ' + path)
+        checked.append((material_name, 'skipped', 'alpha=0',
+                        'shadow' if _is_eye_shadow_layer(semantic)
+                        else 'hidden'))
+
+    for material_name, diffuse in mat_diffuse.items():
+        semantic = material_semantics.get(material_name, material_name)
+        probes = (semantic, material_name)
+        pupil = any(_is_pupil_layer(name) for name in probes)
+        sclera = any(_is_sclera_layer(name) for name in probes)
+        shadow = any(_is_eye_shadow_layer(name) for name in probes)
+        lid = any(_is_eye_lid_layer(name) for name in probes)
+        if not (pupil or sclera or shadow or lid):
+            continue
+        path = os.path.join(out_sub, material_name + '.mtl')
+        with open(path, 'r', encoding='utf-8') as handle:
+            content = handle.read()
+        header = re.search(r'\{material\s+([^\s{}]+)', content,
+                           re.IGNORECASE)
+        blend_match = re.search(r'\{blend\s+([^\s{}]+)', content,
+                                re.IGNORECASE)
+        shader = header.group(1).casefold() if header else ''
+        blend = blend_match.group(1).casefold() if blend_match else ''
+        expected = material_plan.get(material_name, 'none')
+        if shader != 'simple' or blend != expected:
+            raise RuntimeError(
+                'Eye material contract failed for %s: '
+                'shader=%s blend=%s expected=simple/%s'
+                % (material_name, shader or '<missing>',
+                   blend or '<missing>', expected))
+        if material_name in two_sided_mats:
+            raise RuntimeError(
+                'Eye material must remain single-sided: ' + material_name)
+        overlay = any(_is_gfa_pupil_overlay(name, diffuse)
+                      for name in probes)
+        if overlay and expected != 'blend':
+            raise RuntimeError(
+                'Eyes+/eyeblend must preserve soft-alpha blend: '
+                + material_name)
+        if pupil and expected == 'blend':
+            dds_path = os.path.join(out_sub, diffuse + '.dds')
+            if os.path.isfile(dds_path):
+                with open(dds_path, 'rb') as handle:
+                    header_bytes = handle.read(128)
+                if len(header_bytes) < 88 or header_bytes[84:88] != b'DXT5':
+                    raise RuntimeError(
+                        'Blended pupil texture must use DXT5: ' + dds_path)
+        if shadow and expected != 'blend':
+            raise RuntimeError(
+                'Visible EyeShadow must use blend blend: ' + material_name)
+        checked.append((material_name, shader, blend,
+                        'overlay' if overlay else
+                        ('shadow' if shadow else
+                         ('sclera' if sclera else
+                          ('lid' if lid else 'pupil')))))
+    print('[eye-contract] visible/hidden plan:', checked)
+    return checked
 
 # ═══════════════════════════════════════════════════════════════
 #  PLY 游戏原生 per-vertex 格式（经 medicgirl/skin.ply 字节级校准）
@@ -971,6 +1208,43 @@ def sanitize_materials():
             renamed[mat.name] = new
             mat.name = new
     return renamed
+
+
+def _material_diffuse_path(mat):
+    """Return the most likely diffuse image path instead of the first image node.
+
+    MMD materials commonly contain diffuse, sphere and toon image nodes. Node
+    iteration order is not a material contract, so score semantic node names and
+    actual color links before falling back to the first readable image.
+    """
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return None
+    candidates = []
+    for order, node in enumerate(mat.node_tree.nodes):
+        if node.type != 'TEX_IMAGE' or not node.image or not node.image.filepath:
+            continue
+        path = bpy.path.abspath(node.image.filepath)
+        if not path or not os.path.isfile(path):
+            continue
+        label = ('%s %s %s' % (node.name, node.label,
+                               node.image.name)).casefold()
+        score = 0
+        if any(key in label for key in ('mmd_base_tex', 'diffuse',
+                                        'albedo', 'base tex', 'base_tex')):
+            score += 100
+        if any(key in label for key in ('toon', 'sphere', 'sph', 'spa',
+                                        'normal', 'bump', 'specular')):
+            score -= 100
+        for link in mat.node_tree.links:
+            if link.from_node is not node:
+                continue
+            target = (link.to_socket.name or '').casefold()
+            if target == 'base color' or 'diffuse' in target:
+                score += 200
+            elif target in {'color', 'texture', 'base texture'}:
+                score += 20
+        candidates.append((score, -order, path))
+    return max(candidates)[2] if candidates else None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1075,6 +1349,19 @@ def _goh_head_scale():
     return 1.06
 
 
+def _goh_head_neck_follow():
+    """头部倍率对颈部和同网格颈饰的径向跟随比例。0=不跟随，1=完全跟随。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props,
+                                  'goh_head_neck_follow', 0.0))
+            return max(0.0, min(1.0, value))
+    except Exception:
+        pass
+    return 0.0
+
+
 def _goh_alpha_test_mode():
     """读取透明材质模式；True=GOH alpharef/blend test。"""
     try:
@@ -1086,6 +1373,31 @@ def _goh_alpha_test_mode():
     except Exception:
         pass
     return GOH_ALPHA_TEST_TRANSPARENT
+
+
+def _goh_fix_pupil_depth():
+    """是否自动把陷入眼白或与眼白近共面的瞳孔层推出。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            return bool(getattr(sc.mowas2_props,
+                                'goh_fix_pupil_depth', True))
+    except Exception:
+        pass
+    return True
+
+
+def _goh_pupil_clearance():
+    """瞳孔表面相对眼白的最小间距（GOH 模型空间单位）。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props,
+                                  'goh_pupil_clearance', 0.006))
+            return max(0.0, min(0.1, value))
+    except Exception:
+        pass
+    return 0.006
 
 
 def _goh_ik_updown_enabled():
@@ -1128,14 +1440,39 @@ def _goh_foot_scale():
 
 
 def _goh_shoulder_scale():
-    """读取肩宽倍率：1.0 = 目标 hand1 肩宽（当前行为）；
-    <1 时把 ShoulderC/肩线向中线收窄，匹配 GOH 原版 clavicle 肩宽。"""
+    """读取旧版视觉肩宽；v4 仅用于识别/迁移旧快照。"""
     try:
         sc = bpy.context.scene
         if sc and hasattr(sc, 'mowas2_props'):
             value = float(getattr(sc.mowas2_props,
                                   'goh_shoulder_scale', 1.0))
+            return max(0.5, min(1.3, value))
+    except Exception:
+        pass
+    return 1.0
+
+
+def _goh_foot1_spacing():
+    """读取 foot1 左右腿根的视觉间距倍率；目标 rest 始终不变。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props,
+                                  'goh_foot1_spacing', 1.0))
             return max(0.8, min(1.3, value))
+    except Exception:
+        pass
+    return 1.0
+
+
+def _goh_arm_span_scale():
+    """读取整臂横向间距倍率；小于 1 时左右整臂刚性向中心平移。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props,
+                                  'goh_arm_span_scale', 1.0))
+            return max(0.75, min(1.1, value))
     except Exception:
         pass
     return 1.0
@@ -1379,11 +1716,15 @@ def _mesh_parent_local_inverse(arm_obj):
     raise RuntimeError(_("mowas2.err.mesh_parent_matrix_missing"))
 
 
-def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
+def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
+                    two_sided_mats=None, skip_mats=None):
     """导出游戏原生 per-vertex ply。
 
     alpha_mats: 可选 set, 材质名 → 需要 MESH_FLAG_ALPHA(0x0002)。
-    传 None 时用旧关键字兜底 (_material_needs_alpha_flag)。
+    two_sided_mats: 显式需要 MESH_FLAG_TWO_SIDED(0x0001) 的材质名集合。
+    skip_mats: 默认完全不可见的源材质；其 MESH 块、三角形和孤立顶点均不写。
+    GFA 人皮默认均为单面；不能全局开启双面，否则眼白内侧背面也会写深度。
+    alpha_mats 传 None 时用旧关键字兜底 (_material_needs_alpha_flag)。
     0x0002 位语义经 MOWAS2 13533 个 ply + GOH humanskin 122 个 ply 扫描实证:
     - blend 半透明材质 → 带 0x0002 (2b/meihong/alice flags 0x0C16/0x0C17,
       GOH 66 例 0x0C16);
@@ -1393,7 +1734,24 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
     mesh = mesh_obj.data
     mesh.calc_loop_triangles()
     loop_tris = mesh.loop_triangles
-    game_normals = _build_game_normals(mesh, loop_tris)
+    invalid_slots = sorted({
+        int(tri.material_index) for tri in loop_tris
+        if (tri.material_index >= len(mesh.materials)
+            or mesh.materials[tri.material_index] is None)
+    })
+    if invalid_slots:
+        raise RuntimeError(
+            'PLY export has triangles assigned to null material slots: '
+            + ', '.join(map(str, invalid_slots)))
+    skip_mats = set(skip_mats or ())
+    skip_indices = {
+        i for i, mat in enumerate(mesh.materials)
+        if mat and mat.name in skip_mats
+    }
+    visible_loop_tris = [
+        tri for tri in loop_tris if tri.material_index not in skip_indices
+    ]
+    game_normals = _build_game_normals(mesh, visible_loop_tris)
     uv_layer = mesh.uv_layers.active
     if uv_layer is None:
         raise RuntimeError(_("mowas2.err.no_uv_layer"))
@@ -1418,7 +1776,7 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
     record_index = {}
     tris_by_mat = [[] for _ in mesh.materials]
     source_tris_by_mat = [[] for _ in mesh.materials]
-    for tri in loop_tris:
+    for tri in visible_loop_tris:
         out_indices = []
         for loop_index, vertex_index in zip(tri.loops, tri.vertices):
             uv = uv_layer.data[loop_index].uv.to_tuple()
@@ -1432,6 +1790,14 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
             out_indices.append(out_index)
         tris_by_mat[tri.material_index].append(tuple(out_indices))
         source_tris_by_mat[tri.material_index].append(tri)
+    active_material_indices = [
+        mi for mi, mat_tris in enumerate(tris_by_mat) if mat_tris
+    ]
+    if skip_indices:
+        skipped = [mesh.materials[i].name for i in sorted(skip_indices)]
+        print('[export] skipped invisible materials:', skipped)
+    if not active_material_indices:
+        raise RuntimeError('No visible material triangles remain for PLY export')
     if len(export_records) > 65535:
         raise RuntimeError(_(
             "mowas2.err.unique_vertex_limit",
@@ -1441,7 +1807,8 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
 
     with open(filepath, 'wb') as f:
         f.write(b'EPLY')
-        bounds = [mesh_to_ply @ Vector(corner) for corner in mesh_obj.bound_box]
+        bounds = [mesh_to_ply @ mesh.vertices[source_index].co
+                  for source_index, _uv in export_records]
         bb0 = Vector((min(v.x for v in bounds), min(v.y for v in bounds),
                       min(v.z for v in bounds)))
         bb1 = Vector((max(v.x for v in bounds), max(v.y for v in bounds),
@@ -1458,7 +1825,8 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
             f.write(nb)
 
         tri_start = 0
-        for mi, mat_tris in enumerate(tris_by_mat):
+        for mi in active_material_indices:
+            mat_tris = tris_by_mat[mi]
             f.write(b'MESH')
             f.write(pack_I(D3DFVF_XYZB2 | D3DFVF_NORMAL | D3DFVF_TEX1
                            | D3DFVF_LASTBETA_UBYTE4))
@@ -1466,9 +1834,10 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
             f.write(pack_I(len(mat_tris)))
             tri_start += len(mat_tris)
             mat_name = mesh.materials[mi].name if mesh.materials[mi] else 'mat%d' % mi
-            mesh_flags = (MESH_FLAG_TWO_SIDED | MESH_FLAG_LIGHT
-                          | MESH_FLAG_SKINNED | MESH_FLAG_MATERIAL
-                          | MESH_FLAG_SUBSKIN)
+            mesh_flags = (MESH_FLAG_LIGHT | MESH_FLAG_SKINNED
+                          | MESH_FLAG_MATERIAL | MESH_FLAG_SUBSKIN)
+            if two_sided_mats and mat_name in two_sided_mats:
+                mesh_flags |= MESH_FLAG_TWO_SIDED
             if alpha_mats is not None:
                 needs_alpha = mat_name in alpha_mats
             else:
@@ -1515,10 +1884,185 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None):
             f.write(pack_f(1.0 - vv))
 
         f.write(b'INDX')
-        f.write(pack_I(len(loop_tris) * 3))
-        for mat_tris in tris_by_mat:
-            for tri in mat_tris:
+        f.write(pack_I(sum(len(tris_by_mat[mi])
+                           for mi in active_material_indices) * 3))
+        for mi in active_material_indices:
+            for tri in tris_by_mat[mi]:
                 f.write(pack_HHH(tri[0], tri[2], tri[1]))
+
+    written_materials = [mesh.materials[mi].name
+                         for mi in active_material_indices]
+    written_triangles = sum(len(tris_by_mat[mi])
+                            for mi in active_material_indices)
+    return {'materials': written_materials,
+            'triangles': written_triangles,
+            'vertices': len(export_records),
+            'indices': written_triangles * 3}
+
+
+def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
+                                    alpha_mats, two_sided_mats,
+                                    material_semantics, mat_diffuse,
+                                    expected_written):
+    """Parse the written PLY and verify material, flag and index invariants."""
+    with open(filepath, 'rb') as handle:
+        data = handle.read()
+
+    def require(condition, message):
+        if not condition:
+            raise RuntimeError(message + ': ' + filepath)
+
+    p = 0
+    require(data[p:p + 4] == b'EPLY', 'Exported PLY has no EPLY header')
+    p += 4
+    require(data[p:p + 4] == b'BNDS' and p + 28 <= len(data),
+            'Exported PLY has no valid BNDS block')
+    p += 28
+    require(data[p:p + 4] == b'SKIN' and p + 8 <= len(data),
+            'Exported PLY has no valid SKIN block')
+    p += 4
+    bone_count = struct.unpack_from('<I', data, p)[0]
+    p += 4
+    require(bone_count < 4096, 'Exported PLY has an invalid SKIN count')
+    for _index in range(bone_count):
+        require(p < len(data), 'Exported PLY has a truncated SKIN name')
+        name_len = data[p]
+        p += 1
+        require(0 < name_len < 128 and p + name_len <= len(data),
+                'Exported PLY has an invalid SKIN name')
+        try:
+            data[p:p + name_len].decode('ascii')
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                'Exported PLY has a non-ASCII SKIN name: ' + filepath) from exc
+        p += name_len
+
+    rows = []
+    while data[p:p + 4] == b'MESH':
+        p += 4
+        require(p + 17 <= len(data), 'Exported PLY has a truncated MESH')
+        fvf, tri_start, tri_count, flags = struct.unpack_from('<IIII', data, p)
+        p += 16
+        name_len = data[p]
+        p += 1
+        require(0 < name_len < 128 and p + name_len <= len(data),
+                'Exported PLY has an invalid MESH material name')
+        try:
+            name = data[p:p + name_len].decode('ascii')
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                'Exported PLY has a non-ASCII MESH material: ' + filepath) from exc
+        p += name_len
+        require(name.endswith('.mtl'),
+                'Exported PLY MESH material lacks .mtl')
+        require(p < len(data), 'Exported PLY has no MESH palette count')
+        palette_count = data[p]
+        p += 1
+        require(p + palette_count <= len(data),
+                'Exported PLY has a truncated MESH palette')
+        p += palette_count
+        rows.append({
+            'name': name[:-4], 'fvf': fvf, 'tri_start': tri_start,
+            'tri_count': tri_count, 'flags': flags,
+        })
+
+    vert_pos = p
+    require(data[vert_pos:vert_pos + 4] == b'VERT'
+            and vert_pos + 12 <= len(data),
+            'Exported PLY has no valid VERT block')
+    vert_count = struct.unpack_from('<I', data, vert_pos + 4)[0]
+    stride = struct.unpack_from('<H', data, vert_pos + 8)[0]
+    require(stride == 40 and data[vert_pos + 10:vert_pos + 12] == b'\x07\x00',
+            'Exported PLY has an unexpected VERT layout')
+    index_pos = vert_pos + 12 + vert_count * stride
+    if index_pos + 8 > len(data) or data[index_pos:index_pos + 4] != b'INDX':
+        raise RuntimeError('Exported PLY has no valid INDX block: ' + filepath)
+    index_count = struct.unpack_from('<I', data, index_pos + 4)[0]
+    index_bytes = index_count * 2
+    if index_pos + 8 + index_bytes != len(data):
+        raise RuntimeError(
+            'Exported PLY INDX byte count does not reach EOF: ' + filepath)
+    indices = (struct.unpack_from('<%dH' % index_count, data, index_pos + 8)
+               if index_count else ())
+
+    parsed_materials = [row['name'] for row in rows]
+    expected_materials = list(expected_written.get('materials', ()))
+    if parsed_materials != expected_materials:
+        raise RuntimeError(
+            'Exported PLY MESH order differs from the writer result: %r != %r'
+            % (parsed_materials, expected_materials))
+
+    expected_start = 0
+    expected_fvf = (D3DFVF_XYZB2 | D3DFVF_NORMAL | D3DFVF_TEX1
+                    | D3DFVF_LASTBETA_UBYTE4)
+    expected_base = (MESH_FLAG_LIGHT | MESH_FLAG_SKINNED
+                     | MESH_FLAG_MATERIAL | MESH_FLAG_SUBSKIN)
+    hidden_folded = {name.casefold() for name in hidden_mats}
+    row_names_folded = set()
+    for row in rows:
+        name = row['name']
+        row_names_folded.add(name.casefold())
+        if row['fvf'] != expected_fvf:
+            raise RuntimeError(
+                'Exported PLY FVF mismatch for %s: 0x%04X != 0x%04X'
+                % (name, row['fvf'], expected_fvf))
+        if row['tri_start'] != expected_start:
+            raise RuntimeError(
+                'Exported PLY has a non-contiguous triangle span at ' + name)
+        expected_start += row['tri_count']
+        if name.casefold() in hidden_folded:
+            raise RuntimeError(
+                'Static alpha=0 material entered PLY MESH: ' + name)
+        mtl_path = os.path.join(out_sub, name + '.mtl')
+        if not os.path.isfile(mtl_path):
+            raise RuntimeError(
+                'Exported PLY references a missing local MTL: ' + mtl_path)
+        expected_flags = expected_base
+        if name in alpha_mats:
+            expected_flags |= MESH_FLAG_ALPHA
+        if name in two_sided_mats:
+            expected_flags |= MESH_FLAG_TWO_SIDED
+        if row['flags'] != expected_flags:
+            raise RuntimeError(
+                'Exported PLY flags mismatch for %s: 0x%04X != 0x%04X'
+                % (name, row['flags'], expected_flags))
+        semantic = material_semantics.get(name, name)
+        diffuse = mat_diffuse.get(name, '')
+        if (_is_gfa_pupil_overlay(semantic, diffuse)
+                and row['flags'] != (expected_base | MESH_FLAG_ALPHA)):
+            raise RuntimeError(
+                'Eyes+/eyeblend PLY MESH must be exactly 0x0C16: ' + name)
+        if ((_is_sclera_layer(semantic) or _is_eye_lid_layer(semantic))
+                and row['flags'] != expected_base):
+            raise RuntimeError(
+                'Opaque eye PLY MESH must be exactly 0x0C14: ' + name)
+
+    if expected_start != expected_written.get('triangles'):
+        raise RuntimeError(
+            'Exported PLY triangle total differs from the writer result')
+    if vert_count != expected_written.get('vertices'):
+        raise RuntimeError(
+            'Exported PLY VERT count differs from the writer result')
+    if index_count != expected_start * 3:
+        raise RuntimeError(
+            'Exported PLY INDX count does not match MESH triangles')
+    if index_count != expected_written.get('indices'):
+        raise RuntimeError(
+            'Exported PLY INDX count differs from the writer result')
+    if indices and max(indices) >= vert_count:
+        raise RuntimeError('Exported PLY contains an out-of-range vertex index')
+    if len(set(indices)) != vert_count:
+        raise RuntimeError(
+            'Exported PLY contains unreferenced VERT records: %d used / %d'
+            % (len(set(indices)), vert_count))
+    for hidden in hidden_mats:
+        if hidden.casefold() in row_names_folded:
+            raise RuntimeError(
+                'Static alpha=0 material survived PLY validation: ' + hidden)
+    print('[ply-contract] meshes=%d triangles=%d vertices=%d indices=%d'
+          % (len(rows), expected_start, vert_count, index_count))
+    return {'meshes': len(rows), 'triangles': expected_start,
+            'vertices': vert_count, 'indices': index_count}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2139,8 +2683,8 @@ def goh_gfa_bone_align(src, tgt, mesh=None, source_mode=None):
          goh_roll_hands + goh_align_bone_lengths 已实现其目标 (方向对齐
          + 长度对齐), 且 GOH_GFA_ARMS=False (v9 实证回滚让手臂弯 bug
          回来) → 不回滚, 该段对齐由现有精修流程承担;
-      h) Head Further Fixing L754-760: Neck 0.925³ 等比 + Head ×0.85
-         (v12.4 只做了 Head, 本次补 Neck);
+      h) Head Further Fixing L754-760: 交由紧随其后的 goh_normalize_head
+         与 Step0.5 合并执行一次，避免 Neck 0.925 / Head 0.85 重复应用;
       另补: L642-643 NormalizeScaleBreakLink (ShoulderC/Neck/上腿),
       L688-692 Normalize Foot (Ankle), L763-764 Normalize Hand (Wrist)。
     手指段 L766-898 (AlignBoneRotationOnPlane 各指节 + AutoRotateFinger)
@@ -2534,22 +3078,16 @@ def goh_gfa_bone_align(src, tgt, mesh=None, source_mode=None):
         print('[gfa] 上身缩放: H=%.3f W=%.3f Extra=%.3f PerStep=%.3f'
               % (h_scale, w_scale, width_extra, per_step))
 
-    # 可选 ik_updown 区域缩放：GFA 的 UpperBody2 权重最终映射到
-    # 目标 ik_updown。KK 默认不执行 GF2 整体缩放，因此开启后把
-    # GFA 自动基准一起作用于 UpperBody2；MMD 已在上面的原生 GFA
-    # 循环应用基准，所以这里只叠加面板倍率，避免重复缩放。
-    if (_goh_ik_updown_enabled() and has(src, B_UB2)
-            and has(tgt, 'ik_updown')):
-        user_factor = _goh_ik_updown_multiplier()
-        extra_factor = user_factor if not kk_mode else gfa_ik_base * user_factor
-        if abs(extra_factor - 1.0) > 1e-7:
-            moved += scale_bone(B_UB2, 1.0, extra_factor, 1.0)
-        src['goh_ik_updown_scale_factor'] = float(gfa_ik_base * user_factor)
-        print('[gfa] ik_updown 区域缩放: UpperBody2→ik_updown '
-              'GFA基准=%.3f 倍率=%.3f 实际额外=%.3f'
-              % (gfa_ik_base, user_factor, extra_factor))
-    else:
-        src['goh_ik_updown_scale_factor'] = 1.0
+    # 面板 ik_updown 宽度不再写入骨骼非等比 scale：align_arms_auto 会为
+    # 保持手腕 roll 正常而把整条上身链 scale 等比化，旧倍率因而会变成整体
+    # 放大而不是横向加宽。v133 在 freeze 后按最终 ik_updown 映射权重只改
+    # 横向坐标，这里仅记录意图；GFA 自动基准仍由上面的原生步骤负责。
+    user_factor = _goh_ik_updown_multiplier()
+    src['goh_ik_updown_scale_factor'] = float(gfa_ik_base)
+    src['mowas2_ik_updown_enabled'] = bool(_goh_ik_updown_enabled())
+    src['mowas2_ik_updown_multiplier'] = float(user_factor)
+    print('[gfa] ik_updown 横向倍率 %.3f 延后到冻结网格应用 '
+          '(GFA基准 %.3f)' % (user_factor, gfa_ik_base))
     bpy.context.view_layer.update()
 
     # ============ 5) 整体位置 L606-608 ============
@@ -2753,25 +3291,13 @@ def goh_gfa_bone_align(src, tgt, mesh=None, source_mode=None):
     # GFA 的上臂/前臂/手链长度语义由 align_arms_auto 在步骤 14
     # 统一收敛；KK 使用世界空间端点，标准 MMD 保留旧兼容分支。
     # ============ 15) Head Further Fixing L754-760 (h 项) ============
-    # 0.925/0.85 是 GF2 头颈比例修正；KK/KKS 的头骨比例来自自身 PMX，
-    # 不执行这一组固定系数，避免把已经刚性拟合的头颈再次压短。
-    if not kk_mode:
-        if B_NCK and has(src, B_NCK):
-            moved += scale_local_uniform(B_NCK, 0.925)
-            bpy.context.view_layer.update()
-        if B_HD and has(src, B_HD) and B_NCK and has(src, B_NCK):
-            neck_pos = ww(src, B_NCK)
-            hb = src.pose.bones[B_HD]
-            head_pos = ww(src, B_HD)
-            v = head_pos - neck_pos
-            new_head = neck_pos + v * 0.85
-            d = new_head - head_pos
-            if d.length > 1e-5:
-                wm = src.matrix_world @ hb.matrix
-                hb.matrix = src.matrix_world.inverted() @ (Matrix.Translation(d) @ wm)
-                moved += 1
-    else:
+    # 标准 MMD 的完整 Step0.5 + Step2 由紧接其后的 goh_normalize_head
+    # 统一执行一次。旧代码在这里先做 0.925/0.85，随后又做第二次，导致
+    # 头颈和不同权重的眼白/瞳孔层发生额外相对位移。KK 仍保持原比例。
+    if kk_mode:
         print('[gfa-kk] skip GF2 fixed head/neck correction')
+    else:
+        print('[gfa] defer single head/neck correction to goh_normalize_head')
     bpy.context.view_layer.update()
 
     # ============ 16) Normalize Hand Scale L763-764 ============
@@ -2835,8 +3361,8 @@ def goh_align_bone_lengths(src, tgt, mirrored=False, source_mode=None):
 
         # 先锚肩，再依父→子顺序定位肘和腕；父骨移动后立即更新依赖图，
         # 后续端点读到的就是最新父链。mirrored 时源 L/R 对应目标反侧。
-        # 肩宽倍率只允许改变 ShoulderC/肩帽几何。Arm/Elbow/Wrist 是目标动画
-        # 的真实枢轴，绝不能绕世界中线缩放；否则 0.90 会把腕缩入前臂 10%。
+        # Arm/Elbow/Wrist 必须先锚到目标动画的真实枢轴，绝不能绕世界中线
+        # 缩放；肩宽倍率随后只改冻结几何，否则 0.90 会把腕缩入前臂 10%。
         for side in ('L', 'R'):
             tgt_side = ('r' if side == 'L' else 'l') if mirrored else side.lower()
             targets = (
@@ -2931,7 +3457,7 @@ def goh_align_bone_lengths(src, tgt, mirrored=False, source_mode=None):
             if hn in tgt.pose.bones:
                 hand_tail = wt(tgt, hn)
                 break
-        # 手链目标使用真实 palm 枢轴；肩宽倍率只改变肩帽。
+        # 手链目标使用真实 palm 枢轴；肩宽倍率不参与手链，只在冻结后改肩部几何。
         pairs = (
             # (源子骨, 源段起点, 源段末端, 目标起点, 目标末端(可为None→用target骨tail))
             ('Elbow_' + side, 'Arm_' + side, 'Elbow_' + side, 'hand1' + sl, 'hand2' + sl),
@@ -3044,13 +3570,11 @@ def align_arms_auto(src, tgt, mirrored, source_mode=None):
         _pb.scale = Vector((math.copysign(_g, _s.x), math.copysign(_g, _s.y),
                             math.copysign(_g, _s.z)))
     bpy.context.view_layer.update()
-    # v14b: normalize 会移动 UpperBody 子骨 (含 ShoulderC) → 重新对齐
-    # ShoulderC → hand1 y/z (GFA 段10 L644-650 语义在 normalize 后重保;
-    # 否则 GF2/MMD 多级肩骨 ShoulderC 停在 z≈32.8 vs 目标 28.97, akq3 实测)。
-    # 可调肩宽：GOH 原版肩峰在 clavicle（y≈±1.8），hand1 是肩外侧
-    # 小三角肌带；把 ShoulderC 的 y 目标按倍率向中线收窄即可匹配原版。
-    _sh_scale = _goh_shoulder_scale()
-    src['mowas2_shoulder_scale'] = float(_sh_scale)
+    # normalize 会移动 UpperBody 子骨 (含 ShoulderC)，所以这里仍只把
+    # ShoulderC 对齐到真实 hand1。v133 不再额外缩放中央躯干；体型宽度由
+    # 上面的 ik_updown 控制和冻结后的 foot1 腿根间距共同调整。
+    src['mowas2_shoulder_scale'] = 1.0
+    src['mowas2_shoulder_geometry_version'] = 4
     for side, hand_t in (('L', 'hand1l'), ('R', 'hand1r')):
         _shc = next((x for x in ('ShoulderC_' + side, 'Shoulder_' + side,
                                  'ShoulderSolo_' + side)
@@ -3058,9 +3582,6 @@ def align_arms_auto(src, tgt, mirrored, source_mode=None):
         if not _shc or hand_t not in tgt.pose.bones:
             continue
         _tp = (tgt.matrix_world @ tgt.pose.bones[hand_t].matrix).translation
-        if abs(_sh_scale - 1.0) > 1e-6:
-            _tp = _tp.copy()
-            _tp.y *= _sh_scale
         _cur = (src.matrix_world @ src.pose.bones[_shc].matrix).translation
         _d = Vector((0.0, _tp.y - _cur.y, _tp.z - _cur.z))
         if _d.length > 1e-4:
@@ -3073,7 +3594,7 @@ def align_arms_auto(src, tgt, mirrored, source_mode=None):
     #    注意: 每骨移动后必须 view_layer.update() —— pose_bone.matrix 是
     #    骨架空间矩阵 (含父链), 移动 Elbow 后不 update 的话 Wrist.matrix
     #    仍返回旧父链 → Wrist 偏移算错。肘/腕必须使用目标真实枢轴；
-    #    肩宽倍率只作用于上面的 ShoulderC/肩帽。
+    #    肩宽倍率只在冻结后作用于几何，不改变这些动画枢轴。
     for side in ('L', 'R'):
         su = side.upper()
         ts = ('r' if side == 'L' else 'l') if mirrored else side.lower()
@@ -3351,6 +3872,974 @@ def freeze_mesh(mesh):
         v.co = wv
     mesh.data.update()
     bpy.context.view_layer.update()
+
+
+def _smoothstep01(value):
+    value = max(0.0, min(1.0, float(value)))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _ensure_point_vector_attribute(mesh, name):
+    """Store a restorable point-coordinate baseline for viewport previews."""
+    data = mesh.data
+    attribute = data.attributes.get(name)
+    if attribute is not None and (attribute.domain != 'POINT'
+                                  or attribute.data_type != 'FLOAT_VECTOR'
+                                  or len(attribute.data) != len(data.vertices)):
+        data.attributes.remove(attribute)
+        attribute = None
+    if attribute is None:
+        attribute = data.attributes.new(name=name, type='FLOAT_VECTOR',
+                                        domain='POINT')
+        for vertex, item in zip(data.vertices, attribute.data):
+            item.vector = vertex.co
+    return attribute
+
+
+def _restore_point_vectors(mesh, attribute, indices):
+    restored = 0
+    for index in indices:
+        baseline = Vector(attribute.data[index].vector)
+        vertex = mesh.data.vertices[index]
+        if (vertex.co - baseline).length > 1e-9:
+            vertex.co = baseline
+            restored += 1
+    return restored
+
+
+def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
+    """Apply reversible ik_updown width and foot1 spacing without rest edits.
+
+    Width is evaluated from each source group after walking unmapped bones to the
+    same mapped ancestor used by bone_casting(). UpperBody2 descendants scale only
+    along the target lateral axis. foot1 descendants move away from the center at
+    the thigh root and fade at both the pelvis and foot2 ends. Both sides are
+    accumulated from one baseline so centerline vertices cannot drift by order.
+    """
+    migration_version = 4
+    version = 1
+    ik_enabled = _goh_ik_updown_enabled()
+    ik_factor = _goh_ik_updown_multiplier() if ik_enabled else 1.0
+    foot_factor = _goh_foot1_spacing()
+    if mesh is None or src is None or tgt is None or mesh.type != 'MESH':
+        return {'changed': 0, 'skipped': 'missing mesh/source/target'}
+
+    legacy_version = int(mesh.get('mowas2_shoulder_geometry_version', 0))
+    if (force and bool(mesh.get('mowas2_frozen'))
+            and legacy_version < migration_version):
+        return {'changed': 0, 'skipped': 'v132 body preview requires re-align'}
+    stored_version = int(mesh.get('mowas2_body_curve_version', 0))
+    if (not force and stored_version >= version
+            and bool(mesh.get('mowas2_ik_updown_enabled', False)) == ik_enabled
+            and abs(float(mesh.get('mowas2_ik_updown_multiplier', 1.0))
+                    - ik_factor) <= 1e-6
+            and abs(float(mesh.get('mowas2_foot1_spacing', 1.0))
+                    - foot_factor) <= 1e-6):
+        return {'changed': 0, 'skipped': 'already adjusted'}
+
+    required = ('foot1l', 'foot1r', 'foot2l', 'foot2r')
+    if (not mesh.vertex_groups
+            or not all(name in tgt.pose.bones for name in required)):
+        return {'changed': 0, 'skipped': 'missing groups/target leg bones'}
+
+    direct_targets = set(TGT_VG_ORDER)
+
+    def eventual_targets(group_name):
+        if group_name in direct_targets:
+            return {group_name: 1.0}
+        bone = src.data.bones.get(group_name)
+        while bone is not None:
+            canonical = resolve_pmx_bone(bone.name) or bone.name
+            mapping = GFA_TO_GEM2_TARGET.get(canonical)
+            if mapping:
+                return {name: float(weight) for name, weight in mapping}
+            bone = bone.parent
+        canonical = resolve_pmx_bone(group_name) or group_name
+        mapping = GFA_TO_GEM2_TARGET.get(canonical)
+        return ({name: float(weight) for name, weight in mapping}
+                if mapping else {})
+
+    def target_name(name):
+        if not mirrored:
+            return name
+        swaps = {
+            'foot1l': 'foot1r', 'foot1r': 'foot1l',
+            'foot2l': 'foot2r', 'foot2r': 'foot2l',
+        }
+        return swaps.get(name, name)
+
+    ik_groups = {}
+    arm_block_groups = set()
+    foot_groups = {'l': {}, 'r': {}}
+    knee_groups = {'l': {}, 'r': {}}
+    for group in mesh.vertex_groups:
+        raw_targets = eventual_targets(group.name)
+        targets = (raw_targets if group.name in direct_targets else
+                   {target_name(name): weight
+                    for name, weight in raw_targets.items()})
+        if any(name.startswith(('clavicle', 'hand', 'palm', 'finger'))
+               for name in targets):
+            arm_block_groups.add(group.index)
+        if targets.get('ik_updown', 0.0) > 0.0:
+            ik_groups[group.index] = targets['ik_updown']
+        for side in ('l', 'r'):
+            foot_weight = targets.get('foot1' + side, 0.0)
+            knee_weight = targets.get('foot2' + side, 0.0)
+            if foot_weight > 0.0:
+                foot_groups[side][group.index] = foot_weight
+            if knee_weight > 0.0:
+                knee_groups[side][group.index] = knee_weight
+    if not ik_groups and not foot_groups['l'] and not foot_groups['r']:
+        return {'changed': 0, 'skipped': 'no body-curve vertex groups'}
+
+    ik_vertices = {
+        vertex.index for vertex in mesh.data.vertices
+        if (any(assignment.group in ik_groups and assignment.weight > 1e-7
+                for assignment in vertex.groups)
+            and not any(assignment.group in arm_block_groups
+                        and assignment.weight > 1e-7
+                        for assignment in vertex.groups))
+    }
+    foot_vertices = {
+        vertex.index for vertex in mesh.data.vertices
+        if any(assignment.group in foot_groups['l']
+               or assignment.group in foot_groups['r']
+               for assignment in vertex.groups)
+    }
+    ik_attribute = mesh.data.attributes.get('gem2_ik_updown_width_base')
+    foot_attribute = mesh.data.attributes.get('gem2_foot1_spacing_base')
+    restored = 0
+    if ik_attribute is not None and force:
+        restored += _restore_point_vectors(mesh, ik_attribute, ik_vertices)
+    if foot_attribute is not None and force:
+        restored += _restore_point_vectors(mesh, foot_attribute, foot_vertices)
+    ik_active = abs(ik_factor - 1.0) > 1e-6
+    foot_active = abs(foot_factor - 1.0) > 1e-6
+    if ik_attribute is None and ik_active:
+        ik_attribute = _ensure_point_vector_attribute(
+            mesh, 'gem2_ik_updown_width_base')
+    if foot_attribute is None and foot_active:
+        foot_attribute = _ensure_point_vector_attribute(
+            mesh, 'gem2_foot1_spacing_base')
+
+    def world_head(name):
+        return (tgt.matrix_world @ tgt.pose.bones[name].matrix).translation
+
+    left = world_head('foot1l')
+    right = world_head('foot1r')
+    lateral = left - right
+    if lateral.length <= 1e-7:
+        return {'changed': 0, 'skipped': 'zero foot1 span'}
+    lateral.normalize()
+    center = (left + right) * 0.5
+    mesh_world = mesh.matrix_world
+    world_to_local = mesh_world.inverted_safe().to_3x3()
+    foot_geometry = {}
+    for side in ('l', 'r'):
+        root = world_head('foot1' + side)
+        knee = world_head('foot2' + side)
+        axis = knee - root
+        length = axis.length
+        if length <= 1e-7:
+            continue
+        axis.normalize()
+        root_delta = lateral * (root - center).dot(lateral) * (foot_factor - 1.0)
+        foot_geometry[side] = (root, axis, length, root_delta)
+
+    changed_vertices = set()
+    ik_changed = set()
+    foot_changed = set()
+    maximum_move = 0.0
+    union_vertices = ik_vertices | foot_vertices
+    for index in union_vertices:
+        vertex = mesh.data.vertices[index]
+        point_world = mesh_world @ vertex.co
+        delta_world = Vector()
+        ik_weight = 0.0
+        arm_blocked = False
+        foot_weights = {'l': 0.0, 'r': 0.0}
+        knee_weights = {'l': 0.0, 'r': 0.0}
+        for assignment in vertex.groups:
+            if (assignment.group in arm_block_groups
+                    and assignment.weight > 1e-7):
+                arm_blocked = True
+            ik_weight += (assignment.weight
+                          * ik_groups.get(assignment.group, 0.0))
+            for side in ('l', 'r'):
+                foot_weights[side] += (
+                    assignment.weight
+                    * foot_groups[side].get(assignment.group, 0.0))
+                knee_weights[side] += (
+                    assignment.weight
+                    * knee_groups[side].get(assignment.group, 0.0))
+        if ik_active and ik_weight > 1e-7 and not arm_blocked:
+            signed_width = (point_world - center).dot(lateral)
+            contribution = (lateral * signed_width * (ik_factor - 1.0)
+                            * min(1.0, ik_weight))
+            delta_world += contribution
+            if contribution.length > 1e-9:
+                ik_changed.add(index)
+        if foot_active:
+            for side in ('l', 'r'):
+                if foot_weights[side] <= 1e-7 or side not in foot_geometry:
+                    continue
+                root, axis, length, root_delta = foot_geometry[side]
+                t = (point_world - root).dot(axis) / length
+                pelvis_fade = _smoothstep01((t + 0.25) / 0.30)
+                knee_fade = 1.0 - _smoothstep01((t - 0.05) / 0.60)
+                influence = (min(1.0, foot_weights[side])
+                             * max(0.0, 1.0 - min(1.0, knee_weights[side]))
+                             * pelvis_fade * knee_fade)
+                if influence <= 1e-7:
+                    continue
+                contribution = root_delta * influence
+                delta_world += contribution
+                if contribution.length > 1e-9:
+                    foot_changed.add(index)
+        delta_local = world_to_local @ delta_world
+        if delta_local.length <= 1e-9:
+            continue
+        vertex.co += delta_local
+        changed_vertices.add(index)
+        maximum_move = max(maximum_move, delta_local.length)
+
+    if changed_vertices or restored:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    details = {
+        'mode': 'body_curve_v4',
+        'ik_enabled': bool(ik_enabled),
+        'ik_factor': round(float(ik_factor), 7),
+        'ik_vertices': len(ik_changed),
+        'foot1_spacing': round(float(foot_factor), 7),
+        'foot1_vertices': len(foot_changed),
+        'vertices': len(changed_vertices),
+        'restored': int(restored),
+        'maximum_move': round(float(maximum_move), 7),
+        'mirrored_source': bool(mirrored),
+    }
+    mesh['mowas2_body_curve_version'] = version
+    mesh['mowas2_shoulder_geometry_version'] = migration_version
+    mesh['mowas2_shoulder_scale'] = 1.0
+    mesh['mowas2_ik_updown_enabled'] = bool(ik_enabled)
+    mesh['mowas2_ik_updown_multiplier'] = float(ik_factor)
+    mesh['mowas2_foot1_spacing'] = float(foot_factor)
+    mesh['mowas2_body_curve_details'] = json.dumps(details, sort_keys=True)
+    mesh['mowas2_shoulder_geometry_details'] = mesh['mowas2_body_curve_details']
+    print('[body] ik %.3f + foot1 %.3f: %d vertices, max %.6f'
+          % (ik_factor, foot_factor, len(changed_vertices), maximum_move))
+    return {'changed': len(changed_vertices), 'restored': restored,
+            'details': details}
+
+
+def goh_adjust_shoulder_geometry(mesh, src, tgt, mirrored=False, force=False):
+    """Compatibility wrapper for v132 callers."""
+    return goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored, force)
+
+
+def goh_adjust_arm_inset_geometry(mesh, src, tgt, mirrored=False, force=False):
+    """Rigidly translate each complete arm toward/away from the body center.
+
+    Pure arm vertices receive one constant side translation, so upper arm,
+    forearm, wrist, hand, fingers and attached accessories keep their internal
+    lengths and proportions. Mixed clavicle/torso seam vertices blend by arm
+    weight. Target rest bones and animation pivots are never edited.
+    """
+    version = 1
+    factor = _goh_arm_span_scale()
+    if mesh is None or src is None or tgt is None or mesh.type != 'MESH':
+        return {'changed': 0, 'skipped': 'missing mesh/source/target'}
+    stored_version = int(mesh.get('mowas2_arm_inset_version', 0))
+    stored_factor = float(mesh.get('mowas2_arm_span_scale', factor))
+    if (not force and stored_version >= version
+            and abs(stored_factor - factor) <= 1e-6):
+        return {'changed': 0, 'skipped': 'already adjusted'}
+    required = ('hand1l', 'hand1r', 'foot1l', 'foot1r')
+    if not all(name in tgt.pose.bones for name in required):
+        return {'changed': 0, 'skipped': 'missing target arm/lateral bones'}
+
+    direct_targets = set(TGT_VG_ORDER)
+
+    def eventual_targets(group_name):
+        if group_name in direct_targets:
+            return {group_name: 1.0}
+        bone = src.data.bones.get(group_name)
+        while bone is not None:
+            canonical = resolve_pmx_bone(bone.name) or bone.name
+            mapping = GFA_TO_GEM2_TARGET.get(canonical)
+            if mapping:
+                return {name: float(weight) for name, weight in mapping}
+            bone = bone.parent
+        canonical = resolve_pmx_bone(group_name) or group_name
+        mapping = GFA_TO_GEM2_TARGET.get(canonical)
+        return ({name: float(weight) for name, weight in mapping}
+                if mapping else {})
+
+    def mirrored_target(name):
+        if not mirrored:
+            return name
+        if name == 'clavicle_left':
+            return 'clavicle_right'
+        if name == 'clavicle_right':
+            return 'clavicle_left'
+        if name.startswith(('hand', 'palm', 'finger')):
+            if name.endswith('l'):
+                return name[:-1] + 'r'
+            if name.endswith('r'):
+                return name[:-1] + 'l'
+        return name
+
+    arm_groups = {'l': {}, 'r': {}}
+    for group in mesh.vertex_groups:
+        raw_targets = eventual_targets(group.name)
+        targets = (raw_targets if group.name in direct_targets else
+                   {mirrored_target(name): weight
+                    for name, weight in raw_targets.items()})
+        for name, weight in targets.items():
+            if not name.startswith(('clavicle', 'hand', 'palm', 'finger')):
+                continue
+            side = ('l' if name.endswith(('l', '_left')) else
+                    ('r' if name.endswith(('r', '_right')) else None))
+            if side is not None and weight > 0.0:
+                arm_groups[side][group.index] = max(
+                    arm_groups[side].get(group.index, 0.0), weight)
+    if not arm_groups['l'] and not arm_groups['r']:
+        return {'changed': 0, 'skipped': 'no arm vertex groups'}
+
+    candidates = {
+        vertex.index for vertex in mesh.data.vertices
+        if any(assignment.group in arm_groups['l']
+               or assignment.group in arm_groups['r']
+               for assignment in vertex.groups)
+    }
+    attribute = mesh.data.attributes.get('gem2_arm_inset_base')
+    active = abs(factor - 1.0) > 1e-6
+    restored = (_restore_point_vectors(mesh, attribute, candidates)
+                if attribute is not None and force else 0)
+    if attribute is None and active:
+        attribute = _ensure_point_vector_attribute(mesh, 'gem2_arm_inset_base')
+
+    def world_head(name):
+        return (tgt.matrix_world @ tgt.pose.bones[name].matrix).translation
+
+    left = world_head('hand1l')
+    right = world_head('hand1r')
+    lateral = world_head('foot1l') - world_head('foot1r')
+    if lateral.length <= 1e-7:
+        return {'changed': 0, 'skipped': 'zero body lateral axis'}
+    lateral.normalize()
+    if (left - right).dot(lateral) < 0.0:
+        lateral.negate()
+    center = (left + right) * 0.5
+    translations = {
+        'l': lateral * (left - center).dot(lateral) * (factor - 1.0),
+        'r': lateral * (right - center).dot(lateral) * (factor - 1.0),
+    }
+    world_to_local = mesh.matrix_world.inverted_safe().to_3x3()
+    local_translations = {
+        side: world_to_local @ delta for side, delta in translations.items()
+    }
+    changed_vertices = set()
+    side_vertices = {'l': set(), 'r': set()}
+    maximum_move = 0.0
+    if active:
+        for index in candidates:
+            vertex = mesh.data.vertices[index]
+            weights = {'l': 0.0, 'r': 0.0}
+            for assignment in vertex.groups:
+                for side in ('l', 'r'):
+                    weights[side] += (assignment.weight
+                                      * arm_groups[side].get(
+                                          assignment.group, 0.0))
+            delta = Vector()
+            for side in ('l', 'r'):
+                influence = min(1.0, weights[side])
+                if influence <= 1e-7:
+                    continue
+                delta += local_translations[side] * influence
+                side_vertices[side].add(index)
+            if delta.length <= 1e-9:
+                continue
+            vertex.co += delta
+            changed_vertices.add(index)
+            maximum_move = max(maximum_move, delta.length)
+
+    if changed_vertices or restored:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    details = {
+        'mode': 'rigid_whole_arm_inset',
+        'factor': round(float(factor), 7),
+        'vertices': len(changed_vertices),
+        'left_vertices': len(side_vertices['l']),
+        'right_vertices': len(side_vertices['r']),
+        'restored': int(restored),
+        'maximum_move': round(float(maximum_move), 7),
+        'left_translation': tuple(round(float(value), 7)
+                                  for value in local_translations['l']),
+        'right_translation': tuple(round(float(value), 7)
+                                   for value in local_translations['r']),
+        'mirrored_source': bool(mirrored),
+    }
+    mesh['mowas2_arm_inset_version'] = version
+    mesh['mowas2_arm_span_scale'] = float(factor)
+    mesh['mowas2_arm_inset_details'] = json.dumps(details, sort_keys=True)
+    print('[arm-inset] factor %.3f: %d vertices, max %.6f'
+          % (factor, len(changed_vertices), maximum_move))
+    return {'changed': len(changed_vertices), 'restored': restored,
+            'details': details}
+
+
+def goh_scale_neck_follow_geometry(mesh, src, force=False):
+    """Let neck skin/accessories follow head scale with reversible preview.
+
+    The baseline attribute is captured after head scaling and before this pass.
+    Reapplying the control first restores that baseline, so the viewport slider
+    can move in either direction without accumulating deformation.
+    """
+    version = 2
+    enabled = _goh_enlarge_head()
+    factor = _goh_head_scale()
+    follow = _goh_head_neck_follow()
+    if mesh is None or src is None or mesh.type != 'MESH':
+        return {'changed': 0, 'skipped': 'missing mesh/source'}
+    stored_version = int(mesh.get('mowas2_neck_follow_version', 0))
+    if (not force
+            and stored_version >= version
+            and bool(mesh.get('mowas2_head_enlarge_enabled', False)) == enabled
+            and abs(float(mesh.get('mowas2_head_scale', factor)) - factor) <= 1e-6
+            and abs(float(mesh.get('mowas2_head_neck_follow', follow))
+                    - follow) <= 1e-6):
+        return {'changed': 0, 'skipped': 'already adjusted'}
+
+    def find_bone(canonical):
+        if canonical in src.pose.bones:
+            return canonical
+        for bone in src.pose.bones:
+            if resolve_pmx_bone(bone.name) == canonical:
+                return bone.name
+        return None
+
+    neck_name = find_bone('Neck')
+    head_name = find_bone('Head')
+    if not neck_name or not head_name:
+        return {'changed': 0, 'skipped': 'missing Neck/Head'}
+
+    def under(bone, ancestor_name):
+        while bone is not None:
+            if bone.name == ancestor_name:
+                return True
+            bone = bone.parent
+        return False
+
+    head_groups = set()
+    neck_groups = set()
+    for group in mesh.vertex_groups:
+        source_bone = src.data.bones.get(group.name)
+        canonical = resolve_pmx_bone(group.name)
+        if ((source_bone and under(source_bone, head_name))
+                or canonical in ('Head', 'Eye_L', 'Eye_R')):
+            head_groups.add(group.index)
+        elif ((source_bone and under(source_bone, neck_name))
+              or canonical == 'Neck'):
+            neck_groups.add(group.index)
+
+    accessory_materials = {
+        index for index, material in enumerate(mesh.data.materials)
+        if material and _kw_hit(
+            material.get('mowas2_material_semantic_name', material.name),
+            _NECK_ACCESSORY_KW)
+    }
+    accessory_vertices = set()
+    if accessory_materials:
+        for polygon in mesh.data.polygons:
+            if polygon.material_index in accessory_materials:
+                accessory_vertices.update(polygon.vertices)
+    if not neck_groups and not accessory_vertices:
+        return {'changed': 0, 'skipped': 'no neck weights/accessory materials'}
+
+    candidate_vertices = set(accessory_vertices)
+    for vertex in mesh.data.vertices:
+        if any(assignment.group in neck_groups and assignment.weight > 1e-7
+               for assignment in vertex.groups):
+            candidate_vertices.add(vertex.index)
+    attribute = mesh.data.attributes.get('gem2_neck_follow_base')
+    if stored_version == 1 and attribute is None:
+        return {'changed': 0, 'skipped': 'legacy neck preview requires re-align'}
+    active = enabled and follow > 1e-6 and abs(factor - 1.0) > 1e-6
+    if attribute is None and active:
+        attribute = _ensure_point_vector_attribute(mesh,
+                                                   'gem2_neck_follow_base')
+    restored = (_restore_point_vectors(mesh, attribute, candidate_vertices)
+                if attribute is not None and force else 0)
+
+    if not active:
+        if restored:
+            mesh.data.update()
+            bpy.context.view_layer.update()
+        mesh['mowas2_neck_follow_version'] = version
+        mesh['mowas2_head_enlarge_enabled'] = bool(enabled)
+        mesh['mowas2_head_scale'] = float(factor)
+        mesh['mowas2_head_neck_follow'] = float(follow)
+        mesh['mowas2_neck_follow_changed'] = 0
+        mesh['mowas2_neck_follow_max_move'] = 0.0
+        return {'changed': 0, 'restored': restored,
+                'skipped': 'disabled/no scale'}
+
+    mesh_inv = mesh.matrix_world.inverted_safe()
+    neck_world = (src.matrix_world @
+                  src.pose.bones[neck_name].matrix).translation
+    head_world = (src.matrix_world @
+                  src.pose.bones[head_name].matrix).translation
+    neck = mesh_inv @ neck_world
+    head = mesh_inv @ head_world
+    axis = head - neck
+    axis_length_sq = axis.length_squared
+    if axis_length_sq <= 1e-10:
+        return {'changed': 0, 'skipped': 'zero neck axis'}
+    delta_scale = (factor - 1.0) * follow
+    changed = 0
+    accessory_changed = 0
+    maximum_move = 0.0
+    for index in candidate_vertices:
+        vertex = mesh.data.vertices[index]
+        head_weight = 0.0
+        neck_weight = 0.0
+        for assignment in vertex.groups:
+            if assignment.group in head_groups:
+                head_weight += assignment.weight
+            elif assignment.group in neck_groups:
+                neck_weight += assignment.weight
+        is_accessory = index in accessory_vertices
+        candidate = max(neck_weight, 1.0 if is_accessory else 0.0)
+        available = max(0.0, 1.0 - min(1.0, head_weight))
+        influence = min(1.0, candidate, available)
+        if influence <= 1e-6:
+            continue
+        relative = vertex.co - neck
+        axial_t = relative.dot(axis) / axis_length_sq
+        if axial_t <= -0.25 or axial_t >= 1.25:
+            continue
+        root_falloff = _smoothstep01((axial_t + 0.25) / 0.9)
+        top_falloff = (1.0 - _smoothstep01((axial_t - 1.0) / 0.25)
+                       if axial_t > 1.0 else 1.0)
+        influence *= root_falloff * top_falloff
+        if influence <= 1e-6:
+            continue
+        center = neck + axis * axial_t
+        radial = vertex.co - center
+        delta = radial * (delta_scale * influence)
+        if delta.length <= 1e-9:
+            continue
+        vertex.co += delta
+        changed += 1
+        maximum_move = max(maximum_move, delta.length)
+        if is_accessory:
+            accessory_changed += 1
+
+    if changed or restored:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    mesh['mowas2_neck_follow_version'] = version
+    mesh['mowas2_head_enlarge_enabled'] = bool(enabled)
+    mesh['mowas2_head_scale'] = float(factor)
+    mesh['mowas2_head_neck_follow'] = float(follow)
+    mesh['mowas2_neck_follow_changed'] = int(changed)
+    mesh['mowas2_neck_follow_max_move'] = float(maximum_move)
+    print('[head] neck preview %.3f (head %.3f): %d vertices, %d accessory'
+          % (follow, factor, changed, accessory_changed))
+    return {'changed': changed, 'restored': restored,
+            'accessory': accessory_changed, 'maximum_move': maximum_move,
+            'effective_scale': 1.0 + delta_scale}
+
+
+def goh_fix_pupil_depth_geometry(mesh, src=None, force=False):
+    """Project pupils outside sclera with reversible viewport preview."""
+    from mathutils.bvhtree import BVHTree
+
+    version = 3
+    enabled = _goh_fix_pupil_depth()
+    clearance = _goh_pupil_clearance()
+    if mesh is None or mesh.type != 'MESH':
+        return {'changed': 0, 'skipped': 'missing mesh'}
+    stored_version = int(mesh.get('mowas2_pupil_depth_version', 0))
+    if (not force
+            and stored_version >= version
+            and bool(mesh.get('mowas2_pupil_depth_enabled', True)) == enabled
+            and abs(float(mesh.get('mowas2_pupil_clearance', clearance))
+                    - clearance) <= 1e-7):
+        return {'changed': 0, 'skipped': 'already adjusted'}
+
+    data = mesh.data
+    data.calc_loop_triangles()
+
+    def semantic_name(material):
+        return str(material.get('mowas2_material_semantic_name', material.name))
+
+    sclera_materials = {
+        index for index, material in enumerate(data.materials)
+        if material and _is_sclera_layer(semantic_name(material))
+    }
+    pupil_materials = {
+        index for index, material in enumerate(data.materials)
+        if material and _is_pupil_layer(semantic_name(material))
+    }
+    if not sclera_materials or not pupil_materials:
+        return {'changed': 0, 'skipped': 'no sclera/pupil material pair'}
+
+    sclera_tris = [tuple(triangle.vertices)
+                   for triangle in data.loop_triangles
+                   if triangle.material_index in sclera_materials]
+    if not sclera_tris:
+        return {'changed': 0, 'skipped': 'empty sclera geometry'}
+    sclera_vertices = {index for triangle in sclera_tris for index in triangle}
+    desired_clearance = {}
+    pupil_vertices = set()
+    for triangle in data.loop_triangles:
+        if triangle.material_index not in pupil_materials:
+            continue
+        material = data.materials[triangle.material_index]
+        name = semantic_name(material).casefold() if material else ''
+        layer_clearance = clearance * (1.5 if ('+' in name
+                                               or name == 'eyes_'
+                                               or 'glint' in name
+                                               or 'highlight' in name) else 1.0)
+        for index in triangle.vertices:
+            if index in sclera_vertices:
+                continue
+            pupil_vertices.add(index)
+            desired_clearance[index] = max(
+                desired_clearance.get(index, 0.0), layer_clearance)
+    if not desired_clearance:
+        return {'changed': 0, 'skipped': 'empty pupil geometry'}
+
+    attribute = data.attributes.get('gem2_pupil_depth_base')
+    # A v1 mesh was already moved without a baseline. Treating its current
+    # coordinates as the baseline would double the correction; require a clean
+    # re-align instead of silently damaging it.
+    if stored_version > 0 and attribute is None:
+        return {'changed': 0, 'skipped': 'legacy preview requires re-align'}
+    attribute_was_present = attribute is not None
+    if attribute is None and enabled:
+        attribute = _ensure_point_vector_attribute(mesh,
+                                                   'gem2_pupil_depth_base')
+    restored = 0
+    if attribute is not None and (force or attribute_was_present):
+        restored = _restore_point_vectors(mesh, attribute, pupil_vertices)
+
+    if not enabled:
+        if restored:
+            data.update()
+            bpy.context.view_layer.update()
+        mesh['mowas2_pupil_depth_version'] = version
+        mesh['mowas2_pupil_depth_enabled'] = False
+        mesh['mowas2_pupil_clearance'] = float(clearance)
+        mesh['mowas2_pupil_depth_changed'] = 0
+        mesh['mowas2_pupil_depth_min_before'] = 0.0
+        mesh['mowas2_pupil_depth_min_front_before'] = 0.0
+        mesh['mowas2_pupil_depth_min_front_after'] = 0.0
+        mesh['mowas2_pupil_depth_min_normal_after'] = 0.0
+        mesh['mowas2_pupil_depth_front_guarded'] = 0
+        mesh['mowas2_pupil_depth_front_misses'] = 0
+        mesh['mowas2_pupil_depth_normal_errors'] = 0
+        mesh['mowas2_pupil_depth_front_errors'] = 0
+        mesh['mowas2_pupil_depth_max_move'] = 0.0
+        return {'changed': 0, 'restored': restored, 'skipped': 'disabled'}
+
+    coords = [vertex.co.copy() for vertex in data.vertices]
+
+    # Split the sclera mesh into connected eye components so a nearest/ray query
+    # can never land on the opposite eye.
+    vertex_triangles = {}
+    for triangle_index, triangle in enumerate(sclera_tris):
+        for vertex_index in triangle:
+            vertex_triangles.setdefault(vertex_index, set()).add(triangle_index)
+    unvisited = set(range(len(sclera_tris)))
+    components = []
+    while unvisited:
+        pending = [unvisited.pop()]
+        component_indices = set(pending)
+        while pending:
+            triangle_index = pending.pop()
+            for vertex_index in sclera_tris[triangle_index]:
+                for neighbor in vertex_triangles.get(vertex_index, ()):
+                    if neighbor in unvisited:
+                        unvisited.remove(neighbor)
+                        component_indices.add(neighbor)
+                        pending.append(neighbor)
+        component_tris = [sclera_tris[index]
+                          for index in component_indices]
+        component_vertices = {
+            index for triangle in component_tris for index in triangle
+        }
+        components.append((component_tris, component_vertices))
+    components.sort(key=lambda value: len(value[1]), reverse=True)
+
+    centers = []
+    bone_axes = []
+    mesh_inverse = mesh.matrix_world.inverted_safe()
+    if src is not None and src.type == 'ARMATURE':
+        seen = set()
+        for bone in src.pose.bones:
+            canonical = resolve_pmx_bone(bone.name) or bone.name
+            if canonical not in ('Eye_L', 'Eye_R') or canonical in seen:
+                continue
+            world = src.matrix_world @ bone.head
+            centers.append(mesh_inverse @ world)
+            direction_world = (src.matrix_world.to_3x3()
+                               @ (bone.tail - bone.head))
+            direction_local = mesh_inverse.to_3x3() @ direction_world
+            bone_axes.append(direction_local)
+            seen.add(canonical)
+    if not centers:
+        component = components[0][1]
+        centers = [sum((coords[index] for index in component), Vector())
+                   / len(component)]
+        bone_axes = [Vector()]
+
+    component_centers = [
+        sum((coords[index] for index in vertices), Vector()) / len(vertices)
+        for _triangles, vertices in components
+    ]
+    eye_components = []
+    unused_components = set(range(len(components)))
+    for eye_center in centers:
+        pool = unused_components or set(range(len(components)))
+        component_index = min(
+            pool,
+            key=lambda value: (
+                component_centers[value] - eye_center).length_squared)
+        unused_components.discard(component_index)
+        eye_components.append(components[component_index])
+    eye_bvhs = [BVHTree.FromPolygons(coords, triangles,
+                                     all_triangles=True)
+                 for triangles, _vertices in eye_components]
+
+    center_assignments = {}
+    assigned_points = [[] for _center in centers]
+    for index in desired_clearance:
+        center_index = min(range(len(centers)),
+                           key=lambda value: (
+                               coords[index] - centers[value]).length_squared)
+        center_assignments[index] = center_index
+        assigned_points[center_index].append(coords[index])
+
+    forward_axes = []
+    eye_radii = []
+    ray_extents = []
+    correction_caps = []
+    for center_index, eye_center in enumerate(centers):
+        points = assigned_points[center_index]
+        _triangles, component_vertices = eye_components[center_index]
+        component_center = sum(
+            (coords[index] for index in component_vertices), Vector())
+        component_center /= len(component_vertices)
+        pupil_direction = ((sum(points, Vector()) / len(points)) - eye_center
+                           if points else component_center - eye_center)
+        bone_direction = bone_axes[center_index]
+        use_bone = (bone_direction.length_squared > 1e-12
+                    and pupil_direction.length_squared > 1e-12)
+        if use_bone:
+            bone_direction.normalize()
+            pupil_unit = pupil_direction.normalized()
+            alignment = bone_direction.dot(pupil_unit)
+            if alignment < 0.0:
+                bone_direction.negate()
+                alignment = -alignment
+            # MMD eye bones often point roughly, but not exactly, along gaze.
+            # Only trust the bone axis when it is nearly collinear with the
+            # actual pupil surface; otherwise the centroid axis avoids edge-ray
+            # misses at the upper iris.
+            forward = (bone_direction if alignment >= 0.95
+                       else pupil_direction)
+        else:
+            forward = pupil_direction
+        if forward.length_squared <= 1e-12:
+            forward = component_center - eye_center
+        if forward.length_squared <= 1e-12 and points:
+            forward = points[0] - component_center
+        if forward.length_squared <= 1e-12:
+            return {'changed': 0, 'skipped': 'cannot derive eye forward axis'}
+        forward.normalize()
+        forward_axes.append(forward)
+        radius = max((coords[index] - eye_center).length
+                     for index in component_vertices)
+        projections = [(coords[index] - eye_center).dot(forward)
+                       for index in component_vertices]
+        depth = max(projections) - min(projections)
+        eye_radii.append(radius)
+        ray_extents.append(max(0.25, depth + radius * 0.5
+                               + clearance * 2.0))
+        correction_caps.append(min(
+            max(clearance * 4.0, radius * 0.35), radius * 0.75))
+    changed_vertices = set()
+    clamped_vertices = set()
+    minimum_before = None
+    move_totals = {}
+    # Re-query after every projection because the nearest sclera triangle can
+    # change once the pupil crosses a neighboring face boundary.
+    for pass_index in range(3):
+        pass_changed = 0
+        for index, target_clearance in desired_clearance.items():
+            point = data.vertices[index].co
+            center_index = center_assignments[index]
+            nearest = eye_bvhs[center_index].find_nearest(point)
+            if nearest is None or nearest[0] is None:
+                continue
+            location, normal, _face_index, _distance = nearest
+            normal = normal.copy()
+            eye_center = centers[center_index]
+            radial = location - eye_center
+            if radial.length_squared > 1e-12 and normal.dot(radial) < 0.0:
+                normal.negate()
+            signed = (point - location).dot(normal)
+            if pass_index == 0:
+                minimum_before = signed if minimum_before is None else min(
+                    minimum_before, signed)
+            effective_clearance = target_clearance * 1.05
+            move = effective_clearance - signed
+            if move <= 1e-7:
+                continue
+            moved_so_far = move_totals.get(index, 0.0)
+            remaining = max(0.0, correction_caps[center_index]
+                            - moved_so_far)
+            if remaining <= 1e-7:
+                clamped_vertices.add(index)
+                continue
+            if move > remaining:
+                move = remaining
+                clamped_vertices.add(index)
+            point += normal * move
+            move_totals[index] = moved_so_far + move
+            changed_vertices.add(index)
+            pass_changed += 1
+        if pass_changed == 0:
+            break
+
+    # The normal projection can change the pupil centroid enough to matter at
+    # its outer rim. Recompute the actual gaze axis from the corrected points
+    # immediately before the forward-depth pass.
+    for center_index, eye_center in enumerate(centers):
+        indices = [index for index, assigned in center_assignments.items()
+                   if assigned == center_index]
+        if not indices:
+            continue
+        centroid = sum((data.vertices[index].co for index in indices), Vector())
+        forward = centroid / len(indices) - eye_center
+        if forward.length_squared > 1e-12:
+            forward.normalize()
+            forward_axes[center_index] = forward
+
+    minimum_front_before = None
+    front_guarded_vertices = set()
+    front_misses = set()
+
+    def front_gap(index, point):
+        center_index = center_assignments[index]
+        forward = forward_axes[center_index]
+        extent = ray_extents[center_index]
+        origin = point + forward * extent
+        hit = eye_bvhs[center_index].ray_cast(
+            origin, -forward, extent * 2.5)
+        if hit is None or hit[0] is None:
+            return None, forward
+        return (point - hit[0]).dot(forward), forward
+
+    for index, target_clearance in desired_clearance.items():
+        point = data.vertices[index].co
+        signed, forward = front_gap(index, point)
+        if signed is None:
+            front_misses.add(index)
+            continue
+        minimum_front_before = (signed if minimum_front_before is None else
+                                min(minimum_front_before, signed))
+        move = target_clearance * 1.05 - signed
+        if move <= 1e-7:
+            continue
+        moved_so_far = move_totals.get(index, 0.0)
+        center_index = center_assignments[index]
+        remaining = max(0.0, correction_caps[center_index]
+                        - moved_so_far)
+        if remaining <= 1e-7:
+            clamped_vertices.add(index)
+            continue
+        if move > remaining:
+            move = remaining
+            clamped_vertices.add(index)
+        point += forward * move
+        move_totals[index] = moved_so_far + move
+        changed_vertices.add(index)
+        front_guarded_vertices.add(index)
+
+    minimum_front_after = None
+    minimum_normal_after = None
+    normal_errors = []
+    front_errors = []
+    for index, target_clearance in desired_clearance.items():
+        point = data.vertices[index].co
+        center_index = center_assignments[index]
+        signed_front, _forward = front_gap(index, point)
+        if signed_front is not None:
+            minimum_front_after = (
+                signed_front if minimum_front_after is None else
+                min(minimum_front_after, signed_front))
+            if signed_front + 1e-5 < target_clearance * 1.05:
+                front_errors.append(index)
+        nearest = eye_bvhs[center_index].find_nearest(point)
+        if nearest is None or nearest[0] is None:
+            normal_errors.append(index)
+            continue
+        location, normal, _face_index, _distance = nearest
+        normal = normal.copy()
+        radial = location - centers[center_index]
+        if radial.length_squared > 1e-12 and normal.dot(radial) < 0.0:
+            normal.negate()
+        signed_normal = (point - location).dot(normal)
+        minimum_normal_after = (
+            signed_normal if minimum_normal_after is None else
+            min(minimum_normal_after, signed_normal))
+        if signed_normal + 1e-5 < target_clearance * 1.05:
+            normal_errors.append(index)
+
+    changed = len(changed_vertices)
+    clamped = len(clamped_vertices)
+    maximum_move = max(move_totals.values()) if move_totals else 0.0
+    if changed or restored:
+        data.update()
+        bpy.context.view_layer.update()
+    mesh['mowas2_pupil_depth_version'] = version
+    mesh['mowas2_pupil_depth_enabled'] = True
+    mesh['mowas2_pupil_clearance'] = float(clearance)
+    mesh['mowas2_pupil_depth_changed'] = int(changed)
+    mesh['mowas2_pupil_depth_min_before'] = float(minimum_before or 0.0)
+    mesh['mowas2_pupil_depth_min_front_before'] = float(
+        minimum_front_before or 0.0)
+    mesh['mowas2_pupil_depth_min_front_after'] = float(
+        minimum_front_after or 0.0)
+    mesh['mowas2_pupil_depth_min_normal_after'] = float(
+        minimum_normal_after or 0.0)
+    mesh['mowas2_pupil_depth_front_guarded'] = len(front_guarded_vertices)
+    mesh['mowas2_pupil_depth_front_misses'] = len(front_misses)
+    mesh['mowas2_pupil_depth_normal_errors'] = len(normal_errors)
+    mesh['mowas2_pupil_depth_front_errors'] = len(front_errors)
+    mesh['mowas2_pupil_depth_max_move'] = float(maximum_move)
+    print('[eye] pupil preview: %d vertices, normal %.6f->%.6f (%d err), '
+          'front %.6f->%.6f (%d moved/%d miss/%d err), max %.6f, clamp %d'
+          % (changed, minimum_before or 0.0,
+             minimum_normal_after or 0.0, len(normal_errors),
+             minimum_front_before or 0.0, minimum_front_after or 0.0,
+             len(front_guarded_vertices), len(front_misses),
+             len(front_errors), maximum_move, clamped))
+    return {'changed': changed, 'restored': restored,
+            'minimum_before': minimum_before,
+            'minimum_normal_after': minimum_normal_after,
+            'minimum_front_before': minimum_front_before,
+            'minimum_front_after': minimum_front_after,
+            'front_guarded': len(front_guarded_vertices),
+            'front_misses': len(front_misses),
+            'normal_errors': len(normal_errors),
+            'front_errors': len(front_errors),
+            'maximum_move': maximum_move, 'clamped': clamped}
 
 
 def goh_retarget_mmd_forearm_geometry(mesh, src, tgt, mirrored=False,
@@ -4405,14 +5894,14 @@ def decimate_to_target(mesh, target_faces=21845, hand_ratio=0.7,
     HAND_SINGLE = {'palm1l', 'palm1r', 'palm2l', 'palm2r', 'palm3l', 'palm3r',
                    'hand_rot1l', 'hand_rot1r'}
     me = mesh.data
-    # E6.18: 减面前必须清 shape keys (KK/PMX 表情 morphs) —— 否则 DECIMATE
-    # modifier 在带 shape key 的 mesh 上 apply 静默失败, 减面无效 (千咲 body 卡死)。
+    # 主流程必须先由 freeze_mesh 烘焙 evaluated 形态；禁止在此静默丢弃
+    # Shape Key。这样旧脚本误把未冻结网格直接送来时会明确失败。
     if me.shape_keys:
-        try:
-            mesh.shape_key_clear()
-            print('[decimate] shape keys cleared (morphs dropped)')
-        except Exception:
-            pass
+        if not mesh.get('mowas2_frozen'):
+            raise RuntimeError(
+                'decimate_to_target requires freeze_mesh before Shape Keys')
+        mesh.shape_key_clear()
+        print('[decimate] stale shape keys cleared after evaluated freeze')
     face_mats = {i for i, m in enumerate(me.materials)
                  if m and any(kw in m.name.lower() for kw in FACE_KW)}
     cuff_mats = {i for i, m in enumerate(me.materials)
@@ -4648,22 +6137,69 @@ def uv_seam_split(mesh):
 #  主入口
 # ═══════════════════════════════════════════════════════════════
 def _align_options_changed(mesh, src):
-    """检测对齐期选项（脚部尺寸/肩宽倍率）是否与冻结时不同。
-
-    脚部尺寸与肩宽倍率都作用在【对齐阶段】的网格/骨架上；网格一旦
-    冻结，改这两个值不会生效（用户实测"没变化"）。返回 True 表示
-    需要重新导入源模型重新对齐。
-    """
+    """检测冻结几何选项是否变化；变化时必须从 PMX 干净重导。"""
     try:
         stored = mesh.get('mowas2_foot_scale')
         if stored is not None and abs(float(stored) - _goh_foot_scale()) > 1e-4:
             return True
     except Exception:
         pass
+
     try:
-        stored = src.get('mowas2_shoulder_scale')
-        if stored is not None and abs(float(stored) - _goh_shoulder_scale()) > 1e-4:
+        body_version = int(mesh.get('mowas2_shoulder_geometry_version', 0))
+        # v1/v2 moved shoulder geometry and v3 widened only the central torso.
+        # Rebuild once from PMX so v4 starts from the untouched body silhouette.
+        if body_version < 4:
             return True
+        if abs(float(mesh.get('mowas2_foot1_spacing', 1.0))
+               - _goh_foot1_spacing()) > 1e-4:
+            return True
+        if bool(mesh.get('mowas2_ik_updown_enabled', False)) != _goh_ik_updown_enabled():
+            return True
+        if abs(float(mesh.get('mowas2_ik_updown_multiplier', 1.0))
+               - _goh_ik_updown_multiplier()) > 1e-4:
+            return True
+    except Exception:
+        pass
+
+    enabled = _goh_enlarge_head()
+    factor = _goh_head_scale()
+    follow = _goh_head_neck_follow()
+    try:
+        stored_enabled = mesh.get('mowas2_head_enlarge_enabled')
+        if stored_enabled is None:
+            # 旧快照没有可靠的 Head pose 烘焙记录。当前开启时重导；关闭
+            # 时保持兼容，不无故重跑已经验证的旧导出。
+            if enabled:
+                return True
+        else:
+            if bool(stored_enabled) != enabled:
+                return True
+            if enabled and abs(float(mesh.get('mowas2_head_scale', factor))
+                               - factor) > 1e-4:
+                return True
+            if enabled and abs(float(mesh.get('mowas2_head_neck_follow', follow))
+                               - follow) > 1e-4:
+                return True
+            if (enabled and follow > 1e-4
+                    and int(mesh.get('mowas2_neck_follow_version', 0)) < 2):
+                return True
+    except Exception:
+        pass
+
+    # v2 在网格属性中保存对齐基准，可在视口里反复增减间距。v1 没有
+    # 基准，必须重导；若预览回调未能在当前场景运行，设置差异也会重导。
+    try:
+        pupil_version = int(mesh.get('mowas2_pupil_depth_version', 0))
+        if pupil_version in (1, 2):
+            return True
+        if pupil_version > 0:
+            if bool(mesh.get('mowas2_pupil_depth_enabled', True)) != _goh_fix_pupil_depth():
+                return True
+            if abs(float(mesh.get('mowas2_pupil_clearance',
+                                  _goh_pupil_clearance()))
+                   - _goh_pupil_clearance()) > 1e-5:
+                return True
     except Exception:
         pass
     return False
@@ -4848,8 +6384,8 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     """仅对齐：把源模型整体刚性拟合到目标骨架（头/身/腿摆好、贴地、手臂垂落）。
     不绑骨、不减面、不导出 —— 供面板【步骤3 摆好头身腿】使用。
     若网格已冻结（跑过本步骤/完整管线），直接返回已保存快照，避免重复变换；
-    但冻结后修改了脚部尺寸/肩宽倍率等对齐期选项时，会自动重新导入源模型
-    重新对齐（否则新值不生效）。"""
+    但冻结后修改脚部、肩宽、头颈或已应用的瞳孔间距时，会自动重新导入源
+    模型重新对齐（否则新值不生效或无法恢复旧几何）。"""
     if not output_dir:
         output_dir = OUT_DEFAULT
     src, tgt, mesh, root = resolve_scene()
@@ -4863,7 +6399,7 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
         if _align_options_changed(mesh, src):
             if not pmx_path or not os.path.isfile(pmx_path):
                 raise RuntimeError(_("mowas2.err.align_changed_requires_pmx"))
-            print('[reimport] 对齐选项已修改 (脚部/肩宽), 重新导入并重新对齐')
+            print('[reimport] 冻结几何选项已修改, 重新导入并重新对齐')
             src, mesh, root = _reimport_source(pmx_path, tgt)
         else:
             print('[align] 已冻结，跳过（直接执行步骤4 完整导出即可）')
@@ -4925,6 +6461,12 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     #    冻结后 mesh 脱离源骨架，后续 run_full 检测到 mowas2_frozen 会跳过对齐阶段，
     #    直接从绑定开始 —— 避免重复刚性拟合导致双重变换。
     freeze_mesh(mesh)
+    neck_result = goh_scale_neck_follow_geometry(mesh, src)
+    if neck_result.get('changed'):
+        print('[5.06] neck/accessory follow:', neck_result['changed'])
+    pupil_result = goh_fix_pupil_depth_geometry(mesh, src)
+    if pupil_result.get('changed'):
+        print('[5.07] pupil depth geometry:', pupil_result['changed'])
     forearm_result = goh_retarget_mmd_forearm_geometry(
         mesh, src, tgt, mirrored=mirrored, source_mode=mode)
     if forearm_result.get('changed'):
@@ -4932,6 +6474,14 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     # GFA 后任一源分支都可能改变脚底；归一化只读取源 ankle 权重，
     # 不改变 KK/MMD 的骨骼对齐分支。
     normalize_foot_geometry(mesh, src, tgt, ground_z)
+    body_result = goh_adjust_body_curve_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if body_result.get('changed'):
+        print('[5.2] body curve / foot1 spacing:', body_result['changed'])
+    arm_inset_result = goh_adjust_arm_inset_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if arm_inset_result.get('changed'):
+        print('[5.3] rigid whole-arm inset:', arm_inset_result['changed'])
     mesh['mowas2_frozen'] = True
     mesh['mowas2_mirrored'] = mirrored   # 复用首次判定的镜像方向，供绑定阶段换名
     mesh['mowas2_source_mode'] = mode
@@ -4976,7 +6526,37 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
                 "mowas2.err.toon_dependency_missing",
                 workshop=_TOON_SHADER_WORKSHOP_ID))
         print('[toon] dependency root:', toon_root)
+    # 保留清洗前的语义名：Unicode/符号可能正是 hitomi/sirome/Eyes+ 的
+    # 分类依据，文件名清洗后不能再恢复。
+    original_material_names = {}
+    for mat in mesh.data.materials:
+        if not mat:
+            continue
+        semantic = mat.get('mowas2_material_semantic_name')
+        if not semantic:
+            semantic = mat.name
+            mat['mowas2_material_semantic_name'] = semantic
+        original_material_names[mat.as_pointer()] = str(semantic)
     sanitize_materials()
+    material_semantics = {
+        mat.name: original_material_names.get(mat.as_pointer(), mat.name)
+        for mat in mesh.data.materials if mat
+    }
+    hidden_mats = set()
+    hidden_alpha = {}
+    for mat in mesh.data.materials:
+        alpha = _material_static_alpha(mat)
+        if mat and alpha is not None and alpha <= 1e-4:
+            hidden_mats.add(mat.name)
+            hidden_alpha[mat.name] = alpha
+    if hidden_mats:
+        print('[materials] skip static alpha=0:', sorted(hidden_alpha.items()))
+    # Match GFA's single-sided humanskin contract. Exceptional cloth/hair may
+    # opt in explicitly without making closed eye/sclera shells two-sided.
+    two_sided_mats = {
+        mat.name for mat in mesh.data.materials
+        if mat and bool(mat.get('gem2_two_sided', False))
+    }
     out_sub = _entity_output_dir(output_dir, skin_name)
     _assert_output_does_not_delete_source_textures(out_sub, mesh)
     os.makedirs(out_sub, exist_ok=True)
@@ -4991,9 +6571,9 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
                 raise RuntimeError(_(
                     "mowas2.err.cleanup_failed", path=cleanup_path,
                     error=exc)) from exc
-    # PLY 在贴图处理后写入：TGA/DDS 共用的 alpha plan 决定每个 MESH 的
-    # MESH_FLAG_ALPHA, 与 mtl 的 blend 重写同一套判定 (修复旧版两侧不一致:
-    # 眉毛/眼线/瞳孔 mtl=blend 但 ply 无 0x0002 → 游戏里 alpha 被忽略)。
+    # PLY 在贴图处理后写入：TGA/DDS 共用的材质级 plan 决定每个 MESH 的
+    # MESH_FLAG_ALPHA。Eyes+/eyeblend 保留软 alpha；MMD 常量 alpha=0 的
+    # EyeShadow 等默认隐藏层不写 MTL、MESH 或三角形。
 
     mdl_src = tgt.get('gem2_mdl_path')
     if not mdl_src or not os.path.isfile(mdl_src):
@@ -5023,22 +6603,18 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
         f.write('{game_entity\n\t{Extension "%s.mdl"}\n}\n' % skin_name)
 
     # 材质循环: 写初始 mtl (blend none 占位, [8.5] 按 plan 重写) + 拷贴图。
+    # MMD 节点树常同时包含 diffuse/toon/sphere；必须选 Base Color 语义图，
+    # 不能依赖 TEX_IMAGE 的迭代顺序。
     mat_diffuse = {}   # 材质名 -> diffuse 贴图名(去扩展名), 供 ply alpha_mats
+    material_names_by_diffuse = {}
     for mat in mesh.data.materials:
-        if not mat:
+        if not mat or mat.name in hidden_mats:
             continue
-        tex = None
-        if mat.use_nodes and mat.node_tree:
-            for node in mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image and node.image.filepath:
-                    absp = bpy.path.abspath(node.image.filepath)
-                    if absp and os.path.isfile(absp):
-                        tex = absp
-                        break
+        tex = _material_diffuse_path(mat)
         diffuse = os.path.splitext(os.path.basename(tex))[0] if tex else mat.name
-        # 注意: 这里【不】调用 _tex_has_alpha —— 那会对每张贴图 bpy.data.images.load()
-        # 在 GUI 下同步加载 35 张大图会慢到像卡死；alpha/blend 由 [8.5] 统一检测重写。
+        semantic_name = material_semantics.get(mat.name, mat.name)
         mat_diffuse[mat.name] = diffuse
+        material_names_by_diffuse.setdefault(diffuse, []).append(semantic_name)
         with open(os.path.join(out_sub, mat.name + '.mtl'), 'w', encoding='utf-8') as f:
             f.write('{material simple\n\t{diffuse "%s"}\n\t{blend none}\n}\n' % (diffuse,))
         if tex:
@@ -5050,15 +6626,20 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
 
     # 8.5 用户可选内置 TGA 或外部 NVTT DDS；两者复用完全相同的 alpha
     # 分类、黑底填充、MTL 重写和 PLY flag 判定。
+    texture_alpha = {}
     try:
         mode = mesh.get('mowas2_source_mode') or detect_source_mode(tgt=tgt)
         if texture_format == 'DDS':
             plan = convert_textures_to_dds(
                 out_sub, mode=mode, nvtt_path=nvtt_path,
-                toon_shader=toon_shader)
+                toon_shader=toon_shader,
+                material_names_by_diffuse=material_names_by_diffuse,
+                alpha_by_diffuse=texture_alpha)
         else:
             plan = convert_textures_to_tga(
-                out_sub, mode=mode, toon_shader=toon_shader)
+                out_sub, mode=mode, toon_shader=toon_shader,
+                material_names_by_diffuse=material_names_by_diffuse,
+                alpha_by_diffuse=texture_alpha)
         print('[8.5] textures ->', texture_format, 'OK, plan:', len(plan),
               '| mode:', mode,
               '| alpha:', 'test' if _goh_alpha_test_mode() else 'blend-aware')
@@ -5069,20 +6650,57 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
             "mowas2.err.texture_export_failed", format=texture_format,
             error=exc)) from exc
 
+    # 贴图按所有可见 consumer 的最强 alpha 需求编码，再按材质细分 render
+    # mode。默认隐藏材质已从 consumer 集合移除，因此 Eyes+/eyeblend 可以
+    # 独立得到 DXT5 + pupil=blend。
+    plan_folded = {key.casefold(): value for key, value in plan.items()}
+    material_plan = {}
+    for material_name, diffuse in mat_diffuse.items():
+        texture_mode = plan.get(diffuse,
+                                plan_folded.get(diffuse.casefold(), 'none'))
+        semantic_name = material_semantics.get(material_name, material_name)
+        has_alpha = bool(texture_alpha.get(
+            diffuse, texture_alpha.get(diffuse.casefold(), False)))
+        blend = _material_alpha_mode(semantic_name, diffuse, texture_mode,
+                                     has_alpha=has_alpha)
+        material_plan[material_name] = blend
+        path = os.path.join(out_sub, material_name + '.mtl')
+        if blend == 'test':
+            content = ('{material simple\n\t{diffuse "%s"}'
+                       '\n\t{alpharef 127}\n\t{blend test}'
+                       '\n\t{alphatocoverage}\n}\n' % diffuse)
+        else:
+            content = ('{material simple\n\t{diffuse "%s"}'
+                       '\n\t{blend %s}\n}\n' % (diffuse, blend))
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(content)
+    print('[8.55] material alpha plan:', sorted(material_plan.items()))
+
     if toon_shader:
         apply_toon_shader_conversion(out_sub)
     else:
         print('[toon] disabled: keep material simple')
+    _validate_eye_material_contract(
+        out_sub, material_semantics, mat_diffuse, material_plan,
+        two_sided_mats, hidden_mats)
 
     # PLY 写入: MESH_FLAG_ALPHA 与 mtl blend 同源 (plan)。
     # 2026-08-17 晚 (GOH 对照): 0x0002 只给 blend 半透明材质; test 镂空材质
     # 不带 (GOH 304 例 test 全为 0x0C15 无 0x0002)。
-    # 同一贴图可能被多个材质引用 (如 bodytights_0..6 共用一张), 由材质名映射。
-    alpha_mats = {m for m, d in mat_diffuse.items() if plan.get(d) == 'blend'}
+    # 同一贴图可被眼白/瞳孔等不同材质共享；PLY flag 必须用材质级 plan。
+    alpha_mats = {name for name, blend in material_plan.items()
+                  if blend == 'blend'}
     if plan:
         print('[8.6] alpha MESH (MESH_FLAG_ALPHA):', sorted(alpha_mats))
-    export_ply_game(os.path.join(out_sub, skin_name + '.ply'), mesh, tgt,
-                    alpha_mats=alpha_mats)
+    ply_path = os.path.join(out_sub, skin_name + '.ply')
+    expected_written = export_ply_game(
+        ply_path, mesh, tgt,
+        alpha_mats=alpha_mats,
+        two_sided_mats=two_sided_mats,
+        skip_mats=hidden_mats)
+    _validate_exported_ply_contract(
+        ply_path, out_sub, hidden_mats, alpha_mats, two_sided_mats,
+        material_semantics, mat_diffuse, expected_written)
 
     print('=' * 60)
     return out_sub
@@ -5117,12 +6735,12 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
     already_frozen = mesh.get('mowas2_frozen') or (
         not any(m.type == 'ARMATURE' for m in mesh.modifiers)
         and mesh.parent == tgt)
-    # 冻结后修改脚部尺寸/肩宽倍率 → 冻结快照不含新值, 必须重新导入对齐
-    # (否则用户改选项"没变化")。
+    # 冻结后修改脚部、肩宽、头颈或已应用的瞳孔选项，必须重新导入对齐，
+    # 否则 UI 接受了新值但 frozen 几何不会恢复/更新。
     if already_frozen and _align_options_changed(mesh, src):
         if not pmx_path or not os.path.isfile(pmx_path):
             raise RuntimeError(_("mowas2.err.align_changed_requires_pmx"))
-        print('[reimport] 对齐选项已修改 (脚部/肩宽), 重新导入并重新对齐')
+        print('[reimport] 冻结几何选项已修改, 重新导入并重新对齐')
         src, mesh, root = _reimport_source(pmx_path, tgt)
         already_frozen = False
     print('[pre] already_frozen:', already_frozen)
@@ -5155,21 +6773,15 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
                         pass
         print('[1] rigids removed:', removed)
 
-        # 1.5 清理: 删除与 mesh 共享 data 的重复对象 + 清形态键。
+        # 1.5 清理: 删除与 mesh 共享 data 的重复对象。
         #     KK 类模型 mmd_tools 导入可能产生 100+ 个共享同一 mesh data 的对象
-        #     (千咲 users=149) → 多用户 data 无法 apply modifier, DECIMATE 异常;
-        #     形态键 (morphs) 会阻止 modifier apply, 且减面后无法保留 → 全删。
+        #     (千咲 users=149)。Shape Key 不能在这里提前清除：freeze_mesh 会先
+        #     读取 evaluated 顶点再清键，从而烘焙当前眼部/表情形态。
         for o in list(bpy.data.objects):
             if o is mesh and o.type == 'MESH':
                 continue
             if o.type == 'MESH' and o.data == mesh.data:
                 bpy.data.objects.remove(o, do_unlink=True)
-        if mesh.data.shape_keys:
-            try:
-                mesh.shape_key_clear()
-            except Exception:
-                pass
-            print('[1.5] shape keys cleared')
         print('[1.5] mesh data users after cleanup:', mesh.data.users)
 
         # 2. mirror detect (标准 MMD 源跳过: 见 align_only 注释)
@@ -5217,6 +6829,23 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
         # 复用首次对齐判定的镜像方向（冻结时已写入 mesh 属性）
         mirrored = bool(mesh.get('mowas2_mirrored'))
         print('[skip] align already done, mirrored:', mirrored)
+
+    # 冻结几何修正放在分支外：v133 对齐快照可即时重算身形、头颈和瞳孔。
+    # 旧 v132 身形必须由 _align_options_changed 从 PMX 干净重建。
+    body_result = goh_adjust_body_curve_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if body_result.get('changed'):
+        print('[5.2] body curve / foot1 spacing:', body_result['changed'])
+    arm_inset_result = goh_adjust_arm_inset_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if arm_inset_result.get('changed'):
+        print('[5.3] rigid whole-arm inset:', arm_inset_result['changed'])
+    neck_result = goh_scale_neck_follow_geometry(mesh, src)
+    if neck_result.get('changed'):
+        print('[5.06] neck/accessory follow:', neck_result['changed'])
+    pupil_result = goh_fix_pupil_depth_geometry(mesh, src)
+    if pupil_result.get('changed'):
+        print('[5.07] pupil depth geometry:', pupil_result['changed'])
 
     # 6. casting + bind + transfer
     # run_full 可在 align_only 或上一次完整导出后再次执行；绑定完成后
@@ -5320,9 +6949,12 @@ _MOWAS2_PERSISTED_PROPS = (
     'pmx_path', 'mdl_path', 'output_dir', 'texture_format', 'nvtt_path',
     'toon_shader', 'ground_z', 'protect_face', 'protect_tight',
     'enable_decimate', 'skin_name', 'goh_hand_split', 'goh_gfa_longarm',
-    'goh_enlarge_head', 'goh_head_scale', 'goh_alpha_test',
+    'goh_enlarge_head', 'goh_head_scale', 'goh_head_neck_follow',
+    'goh_alpha_test', 'goh_fix_pupil_depth', 'goh_pupil_clearance',
     'goh_ik_updown_scale', 'goh_ik_updown_multiplier', 'goh_foot_scale',
-    'goh_shoulder_scale', 'goh_torso_ik_merge', 'goh_iklr_keep',
+    'goh_foot1_spacing', 'goh_arm_span_scale', 'goh_shoulder_scale',
+    'goh_torso_ik_merge',
+    'goh_iklr_keep',
     'goh_hand_clamp', 'goh_wrist_stitch', 'goh_finger_curl',
 )
 _mowas2_settings_restore_depth = 0
@@ -5343,6 +6975,58 @@ def _persist_mowas2_settings(props):
 
 
 def _mowas2_setting_updated(props, context):
+    _persist_mowas2_settings(props)
+
+
+def _preview_aligned_geometry(props, context, kind):
+    _persist_mowas2_settings(props)
+    if _mowas2_settings_restore_depth or context is None:
+        return
+    try:
+        src, tgt, mesh, _root = resolve_scene()
+        if not bool(mesh.get('mowas2_frozen')):
+            return
+        if kind in {'shoulder', 'arm', 'neck'} and mesh.parent is tgt:
+            print('[preview:%s] skipped: reopen the aligned snapshot before binding'
+                  % kind)
+            return
+        if kind == 'pupil':
+            result = goh_fix_pupil_depth_geometry(mesh, src, force=True)
+        elif kind == 'shoulder':
+            result = goh_adjust_body_curve_geometry(
+                mesh, src, tgt, mirrored=bool(mesh.get('mowas2_mirrored')),
+                force=True)
+        elif kind == 'arm':
+            result = goh_adjust_arm_inset_geometry(
+                mesh, src, tgt, mirrored=bool(mesh.get('mowas2_mirrored')),
+                force=True)
+        else:
+            result = goh_scale_neck_follow_geometry(mesh, src, force=True)
+        print('[preview:%s] %s' % (kind, result))
+    except Exception as exc:
+        # Property updates also occur in unrelated/imported PLY scenes. Those do
+        # not have the PMX source rig needed for alignment preview.
+        print('[preview:%s] skipped: %s' % (kind, exc))
+
+
+def _mowas2_pupil_preview_updated(props, context):
+    _preview_aligned_geometry(props, context, 'pupil')
+
+
+def _mowas2_neck_preview_updated(props, context):
+    _preview_aligned_geometry(props, context, 'neck')
+
+
+def _mowas2_body_preview_updated(props, context):
+    _preview_aligned_geometry(props, context, 'shoulder')
+
+
+def _mowas2_arm_preview_updated(props, context):
+    _preview_aligned_geometry(props, context, 'arm')
+
+
+def _mowas2_shoulder_preview_updated(props, context):
+    # Legacy hidden property: retain persistence without reapplying v3 geometry.
     _persist_mowas2_settings(props)
 
 
@@ -5498,6 +7182,11 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
         description=_("mowas2.prop.goh_head_scale.desc"),
         default=1.06, min=0.9, max=1.5, soft_min=1.0, soft_max=1.3,
         update=_mowas2_setting_updated)
+    goh_head_neck_follow: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_head_neck_follow"),
+        description=_("mowas2.prop.goh_head_neck_follow.desc"),
+        default=0.0, min=0.0, max=1.0, soft_min=0.0, soft_max=1.0,
+        subtype='FACTOR', update=_mowas2_neck_preview_updated)
     # GOH 原生透明材质默认 alpharef 127 + blend test；关闭后恢复
     # 旧版 blend 分类，便于用户在同一模型上做 A/B 对照。
     goh_alpha_test: bpy.props.BoolProperty(
@@ -5505,18 +7194,27 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
         description=_("mowas2.prop.goh_alpha_test.desc"),
         default=GOH_ALPHA_TEST_TRANSPARENT,
         update=_mowas2_setting_updated)
+    goh_fix_pupil_depth: bpy.props.BoolProperty(
+        name=_("mowas2.prop.goh_fix_pupil_depth"),
+        description=_("mowas2.prop.goh_fix_pupil_depth.desc"),
+        default=True, update=_mowas2_pupil_preview_updated)
+    goh_pupil_clearance: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_pupil_clearance"),
+        description=_("mowas2.prop.goh_pupil_clearance.desc"),
+        default=0.006, min=0.0, max=0.1, soft_min=0.002,
+        soft_max=0.05, precision=4, update=_mowas2_pupil_preview_updated)
     # UpperBody2 的权重映射到目标 ik_updown；启用后按 GFA 自动基准
     # WidthExtraScaling_PerStep**0.5 再乘下面的可调倍率。
     goh_ik_updown_scale: bpy.props.BoolProperty(
         name=_("mowas2.prop.goh_ik_updown_scale"),
         description=_("mowas2.prop.goh_ik_updown_scale.desc"),
-        default=GOH_IK_UPDOWN_SCALE, update=_mowas2_setting_updated)
+        default=GOH_IK_UPDOWN_SCALE, update=_mowas2_body_preview_updated)
     goh_ik_updown_multiplier: bpy.props.FloatProperty(
         name=_("mowas2.prop.goh_ik_updown_multiplier"),
         description=_("mowas2.prop.goh_ik_updown_multiplier.desc"),
         default=GOH_IK_UPDOWN_MULTIPLIER,
-        min=0.5, max=1.8, soft_min=0.8, soft_max=1.3,
-        update=_mowas2_setting_updated)
+        min=0.8, max=1.3, soft_min=0.95, soft_max=1.15,
+        precision=3, update=_mowas2_body_preview_updated)
     # 脚部尺寸倍率：脚/鞋在贴地归一化时按目标 ankle 锚点缩放，
     # 脚底始终钳在地面，不会陷地。1.0 保持旧的贴地压缩行为。
     goh_foot_scale: bpy.props.FloatProperty(
@@ -5524,13 +7222,24 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
         description=_("mowas2.prop.goh_foot_scale.desc"),
         default=1.0, min=0.7, max=2.0, soft_min=0.8, soft_max=1.6,
         update=_mowas2_setting_updated)
-    # 肩宽倍率：GOH 原版肩峰在 clavicle（y≈±1.8），hand1 是肩外侧
-    # 小三角肌带；<1 把肩线向中线收窄匹配原版，1.0 保持当前行为。
+    # foot1 腿根间距：以目标 foot1 中点为基准外移上腿根几何，并在到达
+    # foot2 前渐隐；目标骨架和膝/踝枢轴保持不变。
+    goh_foot1_spacing: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_foot1_spacing"),
+        description=_("mowas2.prop.goh_foot1_spacing.desc"),
+        default=1.0, min=0.8, max=1.3, soft_min=0.95, soft_max=1.15,
+        precision=3, update=_mowas2_body_preview_updated)
+    goh_arm_span_scale: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_arm_span_scale"),
+        description=_("mowas2.prop.goh_arm_span_scale.desc"),
+        default=1.0, min=0.75, max=1.1, soft_min=0.9, soft_max=1.05,
+        precision=3, update=_mowas2_arm_preview_updated)
+    # v132 兼容字段：v133 起不再应用中央躯干横向缩放。
     goh_shoulder_scale: bpy.props.FloatProperty(
         name=_("mowas2.prop.goh_shoulder_scale"),
         description=_("mowas2.prop.goh_shoulder_scale.desc"),
-        default=1.0, min=0.8, max=1.3, soft_min=0.85, soft_max=1.1,
-        update=_mowas2_setting_updated)
+        default=1.0, min=0.5, max=1.3, soft_min=0.7, soft_max=1.1,
+        options={'HIDDEN'}, update=_mowas2_shoulder_preview_updated)
     # 腰腹 IK 合并：ik_leftright 按保留比例并入 ik_updown，缓解大角度弯腰撕裂。
     goh_torso_ik_merge: bpy.props.BoolProperty(
         name=_("mowas2.prop.goh_torso_ik_merge"),
@@ -5802,17 +7511,26 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         row = box.row()
         row.enabled = bool(props.goh_enlarge_head)
         row.prop(props, "goh_head_scale")
-        # GOH 原生透明材质对照开关：默认 test，关闭可回到旧 blend。
+        row = box.row()
+        row.enabled = bool(props.goh_enlarge_head)
+        row.prop(props, "goh_head_neck_follow", slider=True)
+        # GOH 原生透明材质对照开关；GFA Eyes+/eyeblend 独立遵循 opaque 契约。
         box.prop(props, "goh_alpha_test")
-        # UpperBody2 权重最终进入目标 ik_updown，默认关闭以保持旧结果。
+        box.prop(props, "goh_fix_pupil_depth")
+        row = box.row()
+        row.enabled = bool(props.goh_fix_pupil_depth)
+        row.prop(props, "goh_pupil_clearance")
+        # UpperBody2 权重最终进入目标 ik_updown；倍率改动会在再次对齐时
+        # 从原 PMX 重建，避免在冻结网格上累计缩放。
         box.prop(props, "goh_ik_updown_scale")
         row = box.row()
         row.enabled = bool(props.goh_ik_updown_scale)
         row.prop(props, "goh_ik_updown_multiplier")
+        # foot1 上腿根间距与整臂间距支持冻结后即时、可逆预览。
+        box.prop(props, "goh_foot1_spacing", slider=True)
+        box.prop(props, "goh_arm_span_scale", slider=True)
         # 脚部尺寸可调：>1 放大脚/鞋（贴地不陷），<1 收窄。
         box.prop(props, "goh_foot_scale")
-        # 肩宽可调：<1 匹配 GOH 原版 clavicle 肩宽，1.0 保持当前。
-        box.prop(props, "goh_shoulder_scale")
         # 腰腹 IK 合并：缓解大角度弯腰时腰腹被 ik_leftright/ik_updown 拉开。
         box.prop(props, "goh_torso_ik_merge")
         row = box.row()
@@ -5836,8 +7554,10 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         box.label(text=_("mowas2.vehicle.desc"), icon='DOT')
         box.operator("gem2.mowas2_import_vehicle_folder",
                      text=_("mowas2.vehicle.import"), icon='FILE_FOLDER')
-        box.operator("gem2.mowas2_export_vehicle_folder",
-                     text=_("mowas2.vehicle.export"), icon='EXPORT')
+        box.operator("gem2.export_vehicle_to_mowas2",
+                     text=_("mowas2.vehicle.export_mowas2"), icon='EXPORT')
+        box.operator("gem2.export_vehicle_to_goh",
+                     text=_("mowas2.vehicle.export_goh"), icon='EXPORT')
 
         # GOH 动画 (2026-08-18): 从 properties.pak 提取 .anm 测试模型
         box = layout.box()

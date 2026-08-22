@@ -5,7 +5,7 @@ import traceback
 import os
 import bpy
 from bpy.props import StringProperty
-from bpy_extras.io_utils import ImportHelper
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from .i18n import _
 
@@ -30,6 +30,37 @@ def _set_export_dir(d):
         f(d)
     except Exception:
         pass
+
+
+def _expanded_fbx_selection(context):
+    """Include rig dependencies without pulling unrelated scene objects."""
+    selected = {
+        obj for obj in context.selected_objects
+        if obj.type in {'ARMATURE', 'MESH', 'EMPTY'}
+    }
+    explicit_armatures = {
+        obj for obj in selected if obj.type == 'ARMATURE'
+    }
+    for obj in tuple(selected):
+        if obj.type != 'MESH':
+            continue
+        for modifier in obj.modifiers:
+            if modifier.type == 'ARMATURE' and modifier.object:
+                selected.add(modifier.object)
+    if explicit_armatures:
+        for obj in context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+            if any(modifier.type == 'ARMATURE' and
+                   modifier.object in explicit_armatures
+                   for modifier in obj.modifiers):
+                selected.add(obj)
+    for obj in tuple(selected):
+        parent = obj.parent
+        while parent and parent.type in {'ARMATURE', 'EMPTY'}:
+            selected.add(parent)
+            parent = parent.parent
+    return selected
 
 
 class ImportGEM2PLY(bpy.types.Operator, ImportHelper):
@@ -84,42 +115,110 @@ class ImportGEM2VOL(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
 
-class ExportGEM2(bpy.types.Operator):
-    bl_idname = "export_scene.gem2"
-    bl_label = _("operator.export.label")
-    bl_options = {'UNDO'}
-    directory: StringProperty(subtype='DIR_PATH')
+class ExportGEM2FBX(bpy.types.Operator, ExportHelper):
+    """Export the current Blender scene or selection as FBX."""
+    bl_idname = "export_scene.gem2_goh_fbx"
+    bl_label = _("operator.export_fbx.label")
+    bl_description = _("operator.export_fbx.desc")
+    bl_options = {'REGISTER'}
 
-    material_mode: bpy.props.EnumProperty(
-        name=_("operator.export.material_format"),
-        items=[
-            ('SIMPLE', _("operator.export.simple"), ''),
-            ('BUMP', _("operator.export.bump"), ''),
-        ],
-        default='SIMPLE',
-    )
+    filename_ext = ".fbx"
+    filter_glob: StringProperty(default="*.fbx", options={'HIDDEN'})
+    use_selection: bpy.props.BoolProperty(
+        name=_("operator.export_fbx.selection"), default=True)
+    bake_animation: bpy.props.BoolProperty(
+        name=_("operator.export_fbx.animation"), default=True)
+    apply_modifiers: bpy.props.BoolProperty(
+        name=_("operator.export_fbx.modifiers"), default=True)
+    global_scale: bpy.props.FloatProperty(
+        name=_("operator.export_fbx.scale"), default=1.0,
+        min=0.0001, soft_max=100.0)
 
     def invoke(self, context, event):
         paths = _get_paths()
-        if paths.get('export') and os.path.isdir(paths['export']):
-            self.directory = paths['export']
+        directory = paths.get('export') or ''
+        if not os.path.isdir(directory):
+            directory = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ''
+        basename = (os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+                    if bpy.data.filepath else "untitled")
+        self.filepath = os.path.join(directory, basename + self.filename_ext)
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
     def draw(self, context):
-        self.layout.prop(self, "material_mode")
+        layout = self.layout
+        layout.prop(self, "use_selection")
+        layout.prop(self, "bake_animation")
+        layout.prop(self, "apply_modifiers")
+        layout.prop(self, "global_scale")
 
     def execute(self, context):
         try:
-            from .gem2_export import gem2_export
-            if not self.directory:
-                self.report({'ERROR'}, _("operator.export.select_dir"))
+            filepath = self.filepath
+            if not filepath:
+                self.report({'ERROR'}, _("operator.export_fbx.select_file"))
                 return {'CANCELLED'}
-            _set_export_dir(self.directory)
-            return gem2_export(self.directory, self)
-        except Exception as e:
+            if not filepath.lower().endswith(self.filename_ext):
+                filepath += self.filename_ext
+            original_selected = set(context.selected_objects)
+            original_active = context.view_layer.objects.active
+            if self.use_selection:
+                export_selection = _expanded_fbx_selection(context)
+                if not export_selection:
+                    self.report(
+                        {'ERROR'}, _("operator.export_fbx.no_selection"))
+                    return {'CANCELLED'}
+                for obj in context.view_layer.objects:
+                    obj.select_set(obj in export_selection)
+                if original_active not in export_selection:
+                    context.view_layer.objects.active = next(
+                        (obj for obj in export_selection
+                         if obj.type == 'ARMATURE'),
+                        next(iter(export_selection)))
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)),
+                        exist_ok=True)
+            _set_export_dir(os.path.dirname(os.path.abspath(filepath)))
+            try:
+                result = bpy.ops.export_scene.fbx(
+                    filepath=filepath,
+                    use_selection=self.use_selection,
+                    object_types={'ARMATURE', 'MESH', 'EMPTY'},
+                    global_scale=self.global_scale,
+                    apply_unit_scale=True,
+                    apply_scale_options='FBX_SCALE_NONE',
+                    use_space_transform=True,
+                    bake_space_transform=False,
+                    use_mesh_modifiers=self.apply_modifiers,
+                    use_mesh_modifiers_render=self.apply_modifiers,
+                    use_triangles=False,
+                    use_custom_props=True,
+                    add_leaf_bones=False,
+                    primary_bone_axis='Y',
+                    secondary_bone_axis='X',
+                    bake_anim=self.bake_animation,
+                    bake_anim_use_all_bones=True,
+                    bake_anim_use_nla_strips=False,
+                    bake_anim_use_all_actions=False,
+                    bake_anim_simplify_factor=0.0,
+                    path_mode='AUTO',
+                    embed_textures=False,
+                    axis_forward='-Z',
+                    axis_up='Y',
+                )
+            finally:
+                if self.use_selection:
+                    for obj in context.view_layer.objects:
+                        obj.select_set(obj in original_selected)
+                    if (original_active and
+                            original_active.name in context.view_layer.objects):
+                        context.view_layer.objects.active = original_active
+            if 'FINISHED' in result:
+                self.report({'INFO'}, _(
+                    "operator.export_fbx.done", file=filepath))
+            return result
+        except Exception as exc:
             traceback.print_exc()
-            self.report({'ERROR'}, _("operator.export.failed", error=e))
+            self.report({'ERROR'}, _("operator.export.failed", error=exc))
             return {'CANCELLED'}
 
 
@@ -333,12 +432,12 @@ def _menu_import(self, context):
     self.layout.operator(ImportGEM2ANM.bl_idname, text=_("menu.import.anm"))
 
 def _menu_export(self, context):
-    self.layout.operator(ExportGEM2.bl_idname, text=_("menu.export.mdl"))
+    self.layout.operator(ExportGEM2FBX.bl_idname, text=_("menu.export.fbx"))
     self.layout.operator(ExportGEM2ANM.bl_idname, text=_("menu.export.anm"))
 
 
-OPERATOR_CLASSES = (ImportGEM2PLY, ImportGEM2VOL, ImportGEM2ANM, ExportGEM2,
-                    ExportGEM2ANM, ExtractGOHANM,
+OPERATOR_CLASSES = (ImportGEM2PLY, ImportGEM2VOL, ImportGEM2ANM,
+                    ExportGEM2FBX, ExportGEM2ANM, ExtractGOHANM,
                     IO_FH_gem2ply, IO_FH_gem2anm)
 
 
@@ -357,7 +456,16 @@ def register():
 
 
 def unregister():
-    bpy.types.TOPBAR_MT_file_export.remove(_menu_export)
-    bpy.types.TOPBAR_MT_file_import.remove(_menu_import)
+    for menu, callback in (
+            (bpy.types.TOPBAR_MT_file_export, _menu_export),
+            (bpy.types.TOPBAR_MT_file_import, _menu_import)):
+        try:
+            menu.remove(callback)
+        except (RuntimeError, ValueError):
+            pass
     for cls in reversed(OPERATOR_CLASSES):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            # Another enabled GEM2 variant may have replaced the same RNA id.
+            pass

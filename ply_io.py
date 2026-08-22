@@ -63,7 +63,7 @@ def _parse_bones_flat(content):
         if inner.startswith('{'): inner = inner[1:].strip()
         if inner.endswith('}'): inner = inner[:-1].strip()
         nm = re.search(
-            r'\bbone\s+(?:(revolute|prizmatic|prismatic)\s+)?"([^"]+)"',
+            r'\bbone(?:\s+(revolute|prizmatic|prismatic|socket))?\s+"([^"]+)"',
             inner, re.IGNORECASE)
         if not nm:
             return None
@@ -75,15 +75,19 @@ def _parse_bones_flat(content):
         remaining = inner
         pre_text = ""
         while True:
-            cs = remaining.find('{bone')
-            if cs == -1:
+            child_match = re.search(r'\{\s*bone\b', remaining, re.IGNORECASE)
+            if child_match is None:
                 pre_text += remaining
                 break
+            cs = child_match.start()
             pre_text += remaining[:cs]
             ce = _find_brace(remaining, cs)
-            if ce == -1: break
+            if ce == -1:
+                pre_text += remaining[cs:]
+                break
             child = _parse_node(remaining[cs:ce+1])
-            if child: children.append(child)
+            if child:
+                children.append(child)
             remaining = remaining[ce+1:]
 
         matrix = None; position = None; orientation = None
@@ -112,12 +116,17 @@ def _parse_bones_flat(content):
                 vals = [float(ori_m.group(i)) for i in range(1, 10)]
                 orientation = [vals[i*3:(i+1)*3] for i in range(3)]
 
-        has_volumeview = '{VolumeView' in pre_text
-        params_m = re.search(r'\{parameters\s+"([^"]*)"\}', pre_text)
+        has_volumeview = bool(re.search(
+            r'\{\s*VolumeView\b', pre_text, re.IGNORECASE))
+        params_m = re.search(r'\{parameters\s+"([^"]*)"\}', pre_text,
+                             re.IGNORECASE)
         if params_m: params = params_m.group(1)
-        limits_m = re.search(r'\{limits\s+([-\d.e+-]+)\s+([-\d.e+-]+)\}', pre_text)
+        limits_m = re.search(
+            r'\{limits\s+([-\d.e+-]+)\s+([-\d.e+-]+)\}', pre_text,
+            re.IGNORECASE)
         if limits_m: limits = (float(limits_m.group(1)), float(limits_m.group(2)))
-        speed_m = re.search(r'\{speed\s+([-\d.e+-]+)\}', pre_text)
+        speed_m = re.search(r'\{speed\s+([-\d.e+-]+)\}', pre_text,
+                            re.IGNORECASE)
         if speed_m: speed = float(speed_m.group(1))
 
         return {
@@ -128,9 +137,10 @@ def _parse_bones_flat(content):
             'params': params, 'limits': limits, 'speed': speed,
         }
 
-    skel_start = content.find('{Skeleton')
-    if skel_start == -1:
+    skel_match = re.search(r'\{\s*skeleton\b', content, re.IGNORECASE)
+    if skel_match is None:
         return None, None
+    skel_start = skel_match.start()
     skel_end = find_matching_brace(content, skel_start)
     if skel_end == -1:
         return None, None
@@ -139,12 +149,16 @@ def _parse_bones_flat(content):
     root_bones = []
     remaining = skeleton_text
     while True:
-        bs = remaining.find('{bone')
-        if bs == -1: break
+        bone_match = re.search(r'\{\s*bone\b', remaining, re.IGNORECASE)
+        if bone_match is None:
+            break
+        bs = bone_match.start()
         be = _find_brace(remaining, bs)
-        if be == -1: break
+        if be == -1:
+            break
         bone = _parse_node(remaining[bs:be+1])
-        if bone: root_bones.append(bone)
+        if bone:
+            root_bones.append(bone)
         remaining = remaining[be+1:]
 
     if not root_bones:

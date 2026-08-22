@@ -1,6 +1,6 @@
 ;Exported by: 26920
 ;Date:        Tue Mar 28 01:34:34 2017
-;File:        [source path removed]
+;File:        E:\men of war mod\gb_com\gb_com\gb_com.max
 {Skeleton
 	{bone revolute "basis"
 		{limits -30 30}

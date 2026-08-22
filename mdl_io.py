@@ -24,7 +24,7 @@ def parse_mdl(content):
         if inner.endswith('}'): inner = inner[:-1].strip()
 
         nm = re.search(
-            r'\bbone\s+(?:(revolute|prizmatic|prismatic)\s+)?"([^"]+)"',
+            r'\bbone(?:\s+(revolute|prizmatic|prismatic|socket))?\s+"([^"]+)"',
             inner, re.IGNORECASE)
         if not nm:
             return None
@@ -37,15 +37,19 @@ def parse_mdl(content):
         remaining = inner
         pre_text = ""
         while True:
-            cs = remaining.find('{bone')
-            if cs == -1:
+            child_match = re.search(r'\{\s*bone\b', remaining, re.IGNORECASE)
+            if child_match is None:
                 pre_text += remaining
                 break
+            cs = child_match.start()
             pre_text += remaining[:cs]
             ce = find_matching_brace(remaining, cs)
-            if ce == -1: break
+            if ce == -1:
+                pre_text += remaining[cs:]
+                break
             child = _parse_node(remaining[cs:ce+1])
-            if child: children.append(child)
+            if child:
+                children.append(child)
             remaining = remaining[ce+1:]
 
         matrix = None; position = None; orientation = None
@@ -76,25 +80,33 @@ def parse_mdl(content):
                 vals = [float(ori_m.group(i)) for i in range(1, 10)]
                 orientation = [vals[i*3:(i+1)*3] for i in range(3)]
 
-        has_volumeview = '{VolumeView' in pre_text
-        params_m = re.search(r'\{parameters\s+"([^"]*)"\}', pre_text)
+        volume_views = re.findall(
+            r'\{\s*VolumeView\s+"([^"]+)"', pre_text, re.IGNORECASE)
+        has_volumeview = bool(volume_views)
+        params_m = re.search(r'\{parameters\s+"([^"]*)"\}', pre_text,
+                             re.IGNORECASE)
         if params_m: params = params_m.group(1)
-        limits_m = re.search(r'\{limits\s+([-\d.e+-]+)\s+([-\d.e+-]+)\}', pre_text)
+        limits_m = re.search(
+            r'\{limits\s+([-\d.e+-]+)\s+([-\d.e+-]+)\}', pre_text,
+            re.IGNORECASE)
         if limits_m: limits = (float(limits_m.group(1)), float(limits_m.group(2)))
-        speed_m = re.search(r'\{speed\s+([-\d.e+-]+)\}', pre_text)
+        speed_m = re.search(r'\{speed\s+([-\d.e+-]+)\}', pre_text,
+                            re.IGNORECASE)
         if speed_m: speed = float(speed_m.group(1))
 
         return {
             'name': name, 'matrix': matrix, 'position': position,
             'orientation': orientation, 'children': children,
-            'has_volumeview': has_volumeview, 'is_revolute': is_revolute,
+            'has_volumeview': has_volumeview, 'volume_views': volume_views,
+            'bone_type': bone_kind, 'is_revolute': is_revolute,
             'is_prizmatic': is_prizmatic,
             'params': params, 'limits': limits, 'speed': speed,
         }
 
-    skel_start = content.find('{Skeleton')
-    if skel_start == -1:
+    skel_match = re.search(r'\{\s*skeleton\b', content, re.IGNORECASE)
+    if skel_match is None:
         return [], None
+    skel_start = skel_match.start()
     skel_end = find_matching_brace(content, skel_start)
     if skel_end == -1:
         return [], None
@@ -103,12 +115,16 @@ def parse_mdl(content):
     root_bones = []
     remaining = skeleton_text
     while True:
-        bs = remaining.find('{bone')
-        if bs == -1: break
+        bone_match = re.search(r'\{\s*bone\b', remaining, re.IGNORECASE)
+        if bone_match is None:
+            break
+        bs = bone_match.start()
         be = find_matching_brace(remaining, bs)
-        if be == -1: break
+        if be == -1:
+            break
         bone = _parse_node(remaining[bs:be+1])
-        if bone: root_bones.append(bone)
+        if bone:
+            root_bones.append(bone)
         remaining = remaining[be+1:]
 
     # 找 mesh_parent
@@ -134,8 +150,11 @@ def flatten_bones(root_bones):
             'position': node['position'],
             'orientation': node['orientation'],
             'parent': parent_name,
+            'bone_type': node.get('bone_type', ''),
             'is_revolute': node.get('is_revolute', False),
             'is_prizmatic': node.get('is_prizmatic', False),
+            'has_volumeview': node.get('has_volumeview', False),
+            'volume_views': list(node.get('volume_views', [])),
             'params': node.get('params'),
             'limits': node.get('limits'),
             'speed': node.get('speed'),
@@ -147,7 +166,8 @@ def flatten_bones(root_bones):
     return flat
 
 
-def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path):
+def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path,
+                   preserve_rest_matrix=False):
     """从根骨骼列表创建 Blender 骨架，返回 arm_obj"""
     flat = flatten_bones(root_bones)
 
@@ -216,9 +236,13 @@ def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path):
             eb.parent = created[parent_name]
             eb.use_connect = False
 
-    # 修正尾部
+    # Vehicle parts use the stored bone transform as a rigid pivot. Re-aiming
+    # tails at the first child changes that rest orientation, so preserve the
+    # imported matrix when requested and adjust only the display length.
     for eb in edit_bones:
-        if eb.children:
+        if preserve_rest_matrix:
+            eb.length = 0.2
+        elif eb.children:
             first_child = list(eb.children)[0]
             eb.tail = first_child.head.copy()
         else:

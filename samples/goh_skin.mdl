@@ -1,6 +1,6 @@
 ;Exported by: Zhang_zh
 ;Date:        Sun Feb 23 23:53:14 2025
-;File:        [source path removed]
+;File:        E:\0_Self_Documents\Other\GOHMOD\GENSHIN\00tac\tac_yelan.max
 {Skeleton
 	{bone revolute "basis"
 		{limits -30 30}

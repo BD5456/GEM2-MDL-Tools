@@ -32,7 +32,7 @@ from mathutils import Matrix, Vector
 from .i18n import _
 from .ply_io import import_ply, import_vol
 from .ply_io import _parse_bones_flat, _precompute_bone_world_mats
-from .mdl_io import build_armature
+from .mdl_io import build_armature, flatten_bones, parse_mdl
 from .core import find_matching_brace, row34_to_blender, ori_to_blender
 
 # 载具对象标记 (导入时写入)
@@ -40,6 +40,9 @@ BONE_KEY = 'gem2_vehicle_bone'    # 该对象挂的骨名 (导出拆分依据)
 VOL_KEY = 'gem2_vehicle_vol'      # 外部 EVLM .vol 多面体
 PRIMITIVE_VOL_KEY = 'gem2_vehicle_primitive_volume'  # MDL 内嵌 Box/Cylinder
 FOLDER_KEY = 'gem2_vehicle_dir'   # 来源文件夹
+RIGID_MOD_KEY = 'gem2_vehicle_rigid_binding'
+RIGID_MOD_NAME = 'GEM2 Rigid Bone'
+MATRIX_EPS = 1e-4
 _FLOAT_RE = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
 
 
@@ -70,47 +73,63 @@ def _style_vol_object(obj, referenced):
     obj['gem2_vehicle_volume_referenced'] = bool(referenced)
 
 
+def _add_rigid_bone_binding(obj, arm_obj, bone_name):
+    """Drive one rigid vehicle object from its named pose bone."""
+    if not arm_obj or bone_name not in arm_obj.pose.bones:
+        return False
+    for modifier in list(obj.modifiers):
+        if modifier.type == 'ARMATURE' and modifier.name == RIGID_MOD_NAME:
+            obj.modifiers.remove(modifier)
+    for group in list(obj.vertex_groups):
+        obj.vertex_groups.remove(group)
+    group = obj.vertex_groups.new(name=bone_name)
+    if obj.data.vertices:
+        group.add(range(len(obj.data.vertices)), 1.0, 'REPLACE')
+    modifier = obj.modifiers.new(name=RIGID_MOD_NAME, type='ARMATURE')
+    modifier.object = arm_obj
+    modifier.use_vertex_groups = True
+    obj[RIGID_MOD_KEY] = modifier.name
+    return True
+
+
 def _find_mdl(dirpath):
     mdls = glob.glob(os.path.join(dirpath, '*.mdl'))
     return mdls[0] if mdls else None
 
 
 def _find_volumeview_map(content):
-    """返回 ``{bone_name: [ply_name, ...]}``，只认骨块的直属 VolumeView。
+    """Return every mesh view owned by each bone, including LODView entries.
 
-    不能用“下一个 bone 之前的文本窗口”：父骨块内嵌子骨，且引擎还有
-    ``bone prizmatic``，窗口法会把子骨 VolumeView 归给父骨。这里对每个骨块
-    做括号配平，并仅接受相对骨块深度 1 的 ``{VolumeView ...}``。
+    The shared recursive MDL parser removes child bone blocks before collecting
+    VolumeView declarations. This keeps child meshes away from their parents
+    while still retaining views nested one level inside ``LODView``.
     """
-    out = {}
-    bone_re = re.compile(
-        r'\{\s*bone\s+(?:(?:revolute|prizmatic|prismatic)\s+)?"([^"]+)"',
-        re.IGNORECASE)
-    vv_re = re.compile(r'\{\s*VolumeView\s+"([^"]+)"', re.IGNORECASE)
-    for match in bone_re.finditer(content):
-        start = match.start()
-        end = find_matching_brace(content, start)
-        if end < 0:
-            raise ValueError('unclosed MDL bone block: %s' % match.group(1))
-        block = content[start:end + 1]
-        depth = 0
-        refs = []
-        i = 0
-        while i < len(block):
-            ch = block[i]
-            if ch == '{':
-                direct = depth == 1
-                if direct:
-                    vv = vv_re.match(block, i)
-                    if vv:
-                        refs.append(vv.group(1))
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-            i += 1
-        if refs:
-            out[match.group(1)] = refs
-    return out
+    roots, _mesh_parent = parse_mdl(content)
+    flat = flatten_bones(roots)
+    return {
+        name: list(info.get('volume_views', []))
+        for name, info in flat.items()
+        if info.get('volume_views')
+    }
+
+
+def _is_lod_view(reference):
+    stem = os.path.splitext(os.path.basename(
+        reference.replace('\\', '/')))[0]
+    return bool(re.search(r'(?:^|_)lod\d*$', stem, re.IGNORECASE))
+
+
+def _primary_volumeview_map(volumeview_map):
+    """Choose the highest-detail view for Blender while retaining all MDL refs."""
+    primary = {}
+    for bone_name, references in volumeview_map.items():
+        if not references:
+            continue
+        reference = next(
+            (item for item in references if not _is_lod_view(item)),
+            references[0])
+        primary[bone_name] = [reference]
+    return primary
 
 
 def _node_local_matrix(block):
@@ -286,7 +305,7 @@ def import_vehicle_folder(dirpath):
             arm_obj = build_armature(
                 os.path.splitext(os.path.basename(mdl_path))[0],
                 _root_list_from_flat(mdl_bones, mesh_parent), mesh_parent,
-                mdl_path)
+                mdl_path, preserve_rest_matrix=True)
             arm_obj.name = os.path.splitext(os.path.basename(mdl_path))[0] + '_Armature'
             arm_obj[FOLDER_KEY] = dirpath
             arm_obj.parent = veh_root
@@ -297,19 +316,30 @@ def import_vehicle_folder(dirpath):
                     for name, rows in json.loads(stored).items()
                 }
         veh_root['gem2_vehicle_mdl_file'] = os.path.basename(mdl_path)
+    primary_vv_map = _primary_volumeview_map(vv_map)
+    lod_references = [
+        reference for references in vv_map.values() for reference in references
+        if _is_lod_view(reference)
+    ]
     veh_root['gem2_vehicle_armature'] = arm_obj.name if arm_obj else ''
     veh_root['gem2_vehicle_vv_map'] = json.dumps(vv_map)
+    veh_root['gem2_vehicle_primary_vv_map'] = json.dumps(primary_vv_map)
+    veh_root['gem2_vehicle_lod_files'] = json.dumps(lod_references)
 
     refs_by_file = {}
-    for bone_name, refs in vv_map.items():
+    for bone_name, refs in primary_vv_map.items():
         for ref in refs:
             key = os.path.basename(ref.replace('\\', '/')).casefold()
             refs_by_file.setdefault(key, []).append((bone_name, ref))
 
     imported = []
+    skipped_ply = []
     for ply in sorted(glob.glob(os.path.join(dirpath, '*.ply'))):
         filename = os.path.basename(ply)
         refs = refs_by_file.get(filename.casefold(), [])
+        if vv_map and not refs:
+            skipped_ply.append(filename)
+            continue
         try:
             obj, _arm, _helper = import_ply(
                 ply, skip_mdl_transform=True, skip_armature=True,
@@ -321,6 +351,7 @@ def import_vehicle_folder(dirpath):
         obj[FOLDER_KEY] = dirpath
         obj['gem2_vehicle_ply_file'] = filename
         obj['gem2_vehicle_instance'] = 0
+        bone_name = ''
         if refs:
             bone_name, _ref = refs[0]
             if bone_name not in world_mats:
@@ -335,6 +366,9 @@ def import_vehicle_folder(dirpath):
         obj['gem2_vehicle_home_matrix'] = json.dumps(
             [[float(value) for value in row] for row in obj.matrix_world])
         obj.parent = veh_root
+        if bone_name and not _add_rigid_bone_binding(obj, arm_obj, bone_name):
+            raise RuntimeError('VolumeView %s cannot bind bone %s'
+                               % (filename, bone_name))
         imported.append(obj.name)
 
         # 同文件多骨引用必须是链接实例：局部顶点完全相同，仅骨世界矩阵不同。
@@ -353,6 +387,9 @@ def import_vehicle_folder(dirpath):
             inst['gem2_vehicle_home_matrix'] = json.dumps(
                 [[float(value) for value in row] for row in inst.matrix_world])
             inst.parent = veh_root
+            if not _add_rigid_bone_binding(inst, arm_obj, bone_name):
+                raise RuntimeError('VolumeView %s cannot bind bone %s'
+                                   % (filename, bone_name))
             imported.append(inst.name)
         print('[vehicle] imported %s -> %s' % (
             filename, ', '.join(b for b, _r in refs) if refs else '(unbound)'))
@@ -413,6 +450,10 @@ def import_vehicle_folder(dirpath):
                 vol_obj['gem2_vehicle_home_matrix'] = json.dumps(
                     [[float(value) for value in row] for row in world_matrix])
                 vol_obj.parent = veh_root
+                if bone_name and not _add_rigid_bone_binding(
+                        vol_obj, arm_obj, bone_name):
+                    raise RuntimeError('Volume %s cannot bind bone %s'
+                                       % (ref['volume_name'], bone_name))
                 _style_vol_object(vol_obj, referenced)
                 _move_to_collection(
                     vol_obj, vol_collection if referenced else unused_vol_collection)
@@ -452,6 +493,9 @@ def import_vehicle_folder(dirpath):
             obj['gem2_vehicle_home_matrix'] = json.dumps(
                 [[float(value) for value in row] for row in world_matrix])
             obj.parent = veh_root
+            if not _add_rigid_bone_binding(obj, arm_obj, bone_name):
+                raise RuntimeError('Primitive Volume %s cannot bind bone %s'
+                                   % (ref['volume_name'], bone_name))
             obj['gem2_vehicle_primitive_geometry_hash'] = \
                 _mesh_geometry_hash(mesh)
             _style_vol_object(obj, True)
@@ -463,15 +507,23 @@ def import_vehicle_folder(dirpath):
     veh_root['gem2_vehicle_primitive_volume_count'] = len(primitive_names)
 
     mtls = glob.glob(os.path.join(dirpath, '*.mtl'))
-    bpy.context.view_layer.objects.active = veh_root
-    veh_root.select_set(True)
-    print('[vehicle] 导入完成: %d PLY 实例, %d vol '
-          '(%d MDL引用可见, %d 未引用已隐藏), %d MDL原语, %d mtl, '
-          '骨架 %s (%d bones, %d VolumeView)'
-          % (len(imported), len(vols), active_vols, unused_vols,
+    bpy.ops.object.select_all(action='DESELECT')
+    visible_parts = [bpy.data.objects.get(name) for name in imported]
+    visible_parts = [obj for obj in visible_parts if obj is not None]
+    for obj in visible_parts:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = (
+        visible_parts[0] if visible_parts else veh_root)
+    print('[vehicle] 导入完成: %d 主视图 PLY 实例, 跳过 %d 个旁路 PLY '
+          '(%d LOD), %d vol (%d MDL引用可见, %d 未引用已隐藏), '
+          '%d MDL原语, %d mtl, 骨架 %s '
+          '(%d bones, %d primary / %d total VolumeView)'
+          % (len(imported), len(skipped_ply), len(lod_references),
+             len(vols), active_vols, unused_vols,
              len(primitive_names), len(mtls),
              arm_obj.name if arm_obj else '无',
              len(arm_obj.data.bones) if arm_obj else 0,
+             sum(len(refs) for refs in primary_vv_map.values()),
              sum(len(refs) for refs in vv_map.values())))
     return veh_root
 
@@ -846,6 +898,7 @@ def _export_vehicle_textures(output_dir, src_dir, parts):
         role_stems[material.as_pointer()] = mapped
 
     from .mtl_io import _collect_search_dirs, _search_texture_file
+    from .pak_io import is_packed_cache_path, packed_texture_variants
     for walk_root, _dirs, files in os.walk(src_dir):
         for filename in files:
             if not filename.lower().endswith('.mtl'):
@@ -871,9 +924,12 @@ def _export_vehicle_textures(output_dir, src_dir, parts):
                 role = match.group(2).lower()
                 texture_ref = match.group(3)
                 stem = mapped.get(role)
+                source_texture = _search_texture_file(
+                    texture_ref, search_dirs)
+                if source_texture and is_packed_cache_path(source_texture):
+                    packed_texture_variants(texture_ref, search_dirs)
+                    _stage_variants(source_texture)
                 if not stem:
-                    source_texture = _search_texture_file(
-                        texture_ref, search_dirs)
                     if source_texture:
                         stem = _stage_file(source_texture)
                         _stage_variants(source_texture)
@@ -908,8 +964,13 @@ def _export_vehicle_textures(output_dir, src_dir, parts):
     }
 
 
-def export_vehicle_folder(output_dir, root_obj=None):
-    """安全拆分导出载具；PLY 非坐标载荷和 MDL 原文保持不变。"""
+def export_vehicle_folder(output_dir, root_obj=None, target_game=None):
+    """Safely export a vehicle folder and optionally convert its MDL dialect.
+
+    PLY/VOL payloads and all non-MDL sidecars keep the existing safe-export
+    behavior. ``target_game`` may be ``GOH`` or ``MOWAS2``; conversion is
+    deliberately limited to known incompatible MDL animation syntax.
+    """
     output_dir = os.path.abspath(output_dir)
     if root_obj is None:
         active = bpy.context.active_object
@@ -928,6 +989,17 @@ def export_vehicle_folder(output_dir, root_obj=None):
         raise RuntimeError('载具来源目录缺失: %s' % src_dir)
     if os.path.normcase(output_dir) == os.path.normcase(os.path.abspath(src_dir)):
         raise RuntimeError('为避免覆盖原始模板，载具导出目录不能等于来源目录')
+
+    target_name = str(target_game or '').strip().upper()
+    mdl_path = _find_mdl(src_dir)
+    goh_def_plan = None
+    if target_name == 'GOH':
+        if not mdl_path:
+            raise RuntimeError('载具文件夹没有可用于 GOH DEF 的 MDL')
+        # Preflight before writing geometry: legacy MOWAS2 DEF files contain
+        # unresolved macros in GOH, so rebuild one from verified vanilla calls.
+        from .def_compat import prepare_vanilla_goh_def
+        goh_def_plan = prepare_vanilla_goh_def(src_dir, mdl_path)
     os.makedirs(output_dir, exist_ok=True)
 
     arm_name = root_obj.get('gem2_vehicle_armature', '')
@@ -962,7 +1034,7 @@ def export_vehicle_folder(output_dir, root_obj=None):
             raise RuntimeError('MDL 原语碰撞体元数据不完整: %s' % obj.name)
         home = Matrix(json.loads(home_raw))
         current_local = root_obj.matrix_world.inverted() @ obj.matrix_world
-        if _matrix_delta(current_local, home) > 1e-5:
+        if _matrix_delta(current_local, home) > MATRIX_EPS:
             raise RuntimeError(
                 'MDL 原语碰撞体 %s 的对象变换已改变；当前安全导出只读'
                 % obj.name)
@@ -974,7 +1046,7 @@ def export_vehicle_folder(output_dir, root_obj=None):
         local_raw = obj.get('gem2_vehicle_volume_local_matrix')
         if bone_name and local_raw and bone_name in world_mats:
             expected_home = world_mats[bone_name] @ Matrix(json.loads(local_raw))
-            if _matrix_delta(home, expected_home) > 1e-5:
+            if _matrix_delta(home, expected_home) > MATRIX_EPS:
                 raise RuntimeError(
                     'MDL 原语碰撞体 %s 的骨/局部矩阵与 MDL 不一致'
                     % obj.name)
@@ -1017,25 +1089,50 @@ def export_vehicle_folder(output_dir, root_obj=None):
         if os.path.basename(source).casefold() not in exported_vols:
             shutil.copy2(source, os.path.join(output_dir, os.path.basename(source)))
 
-    # MDL 不做正则重写：文件名保持原值，所以连编码、空白、动画和所有骨类型
-    # 都可以逐字节保留。
-    mdl_path = _find_mdl(src_dir)
+    # Copy first, then apply the selected engine dialect only to the exported
+    # MDL. The source template is never modified.
+    mdl_output_path = None
     if mdl_path:
-        shutil.copy2(mdl_path, os.path.join(output_dir, os.path.basename(mdl_path)))
+        mdl_output_path = os.path.join(output_dir, os.path.basename(mdl_path))
+        shutil.copy2(mdl_path, mdl_output_path)
+    if target_game:
+        if not mdl_output_path:
+            raise RuntimeError('载具文件夹没有可转换的 MDL')
+        from .mdl_compat import convert_mdl_file
+        compatibility = convert_mdl_file(mdl_output_path, target_game)
+        root_obj['gem2_vehicle_last_mdl_compat'] = json.dumps(compatibility)
+        print('[vehicle] MDL target=%s changed=%s hidden=%d restored=%d'
+              % (compatibility['target'], compatibility['changed'],
+                 compatibility['events_hidden'],
+                 compatibility['events_restored']))
 
     _export_vehicle_animations(output_dir, src_dir, mdl_path)
 
     # 复制全部旁车资源和子目录；PLY/MDL/VOL/ANM 由上面专门处理。
+    # GOH 的 DEF 由原版模板生成器接管，绝不再复制旧 MOWAS2 宏。
+    skipped_sidecars = {'.ply', '.mdl', '.vol', '.anm'}
+    if target_name == 'GOH':
+        skipped_sidecars.add('.def')
     for walk_root, _dirs, files in os.walk(src_dir):
         rel = os.path.relpath(walk_root, src_dir)
         dest_root = output_dir if rel == '.' else os.path.join(output_dir, rel)
         os.makedirs(dest_root, exist_ok=True)
         for filename in files:
-            if os.path.splitext(filename)[1].lower() in {
-                    '.ply', '.mdl', '.vol', '.anm'}:
+            if os.path.splitext(filename)[1].lower() in skipped_sidecars:
                 continue
             shutil.copy2(os.path.join(walk_root, filename),
                          os.path.join(dest_root, filename))
+
+    if goh_def_plan is not None:
+        from .def_compat import report_json, write_vanilla_goh_def
+        def_compatibility = write_vanilla_goh_def(
+            goh_def_plan, output_dir)
+        root_obj['gem2_vehicle_last_def_compat'] = report_json(
+            def_compatibility)
+        print('[vehicle] DEF target=GOH generator=%s volumes=%d changed=%s'
+              % (def_compatibility['generator'],
+                 len(def_compatibility['volumes']),
+                 def_compatibility['changed']))
 
     _export_vehicle_textures(output_dir, src_dir, parts)
 
@@ -1102,7 +1199,7 @@ def _export_part_vol(filepath, instances, world_mats):
             raise RuntimeError('碰撞体缺少导入矩阵: %s' % obj.name)
         home = Matrix(json.loads(home_raw))
         current_local = root.matrix_world.inverted() @ obj.matrix_world
-        if _matrix_delta(current_local, home) > 1e-5:
+        if _matrix_delta(current_local, home) > MATRIX_EPS:
             raise RuntimeError('碰撞体 %s 的对象变换已改变；请在编辑模式移动顶点'
                                % obj.name)
         bone_name = obj.get(BONE_KEY, '')
@@ -1112,7 +1209,7 @@ def _export_part_vol(filepath, instances, world_mats):
                 raise RuntimeError('碰撞体 %s 引用的骨不存在: %s'
                                    % (obj.name, bone_name))
             expected_home = bone_world @ Matrix(json.loads(local_raw))
-            if _matrix_delta(home, expected_home) > 1e-5:
+            if _matrix_delta(home, expected_home) > MATRIX_EPS:
                 raise RuntimeError('碰撞体 %s 的骨/局部矩阵与 MDL 不一致'
                                    % obj.name)
 
@@ -1177,13 +1274,13 @@ def _export_part_ply(filepath, instances, world_mats):
             raise RuntimeError('载具实例缺少 home 矩阵: %s' % obj.name)
         home = Matrix(json.loads(home_raw))
         current_local = root.matrix_world.inverted() @ obj.matrix_world
-        if _matrix_delta(current_local, home) > 1e-5:
+        if _matrix_delta(current_local, home) > MATRIX_EPS:
             raise RuntimeError('载具实例 %s 的对象变换已改变；请在编辑模式移动顶点'
                                % obj.name)
         bone_name = obj.get(BONE_KEY)
         if bone_name:
             expected_home = world_mats.get(bone_name)
-            if expected_home is None or _matrix_delta(home, expected_home) > 1e-5:
+            if expected_home is None or _matrix_delta(home, expected_home) > MATRIX_EPS:
                 raise RuntimeError('载具实例 %s 的骨矩阵与 MDL 不一致' % obj.name)
 
     stride = int(primary.get('gem2_vertex_stride', 0))
@@ -1238,6 +1335,31 @@ def _export_part_ply(filepath, instances, world_mats):
 #  算子
 # ═══════════════════════════════════════════════════════════════
 
+
+def _frame_selected_vehicle(context):
+    """Frame imported visible parts when the operator runs from a 3D view."""
+    screen = getattr(context, 'screen', None)
+    if screen is None:
+        return
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        region = next((item for item in area.regions if item.type == 'WINDOW'), None)
+        if region is None:
+            continue
+        try:
+            with context.temp_override(area=area, region=region,
+                                       space_data=area.spaces.active):
+                bpy.ops.view3d.view_selected(use_all_regions=False)
+        except (RuntimeError, TypeError):
+            pass
+        active = context.view_layer.objects.active
+        for selected in list(context.selected_objects):
+            if selected != active:
+                selected.select_set(False)
+        break
+
+
 class MOWAS2_OT_ImportVehicleFolder(bpy.types.Operator):
     """按文件夹完整导入载具 (mdl + 全部 ply/vol)"""
     bl_idname = "gem2.mowas2_import_vehicle_folder"
@@ -1257,6 +1379,7 @@ class MOWAS2_OT_ImportVehicleFolder(bpy.types.Operator):
                 self.report({'ERROR'}, _("vehicle.err.select_import_dir"))
                 return {'CANCELLED'}
             root = import_vehicle_folder(self.directory)
+            _frame_selected_vehicle(context)
             props = context.scene.mowas2_props
             props.report = _("vehicle.info.imported", dir=self.directory, name=root.name)
             self.report({'INFO'}, _("vehicle.info.imported", dir=self.directory, name=root.name))
@@ -1268,40 +1391,89 @@ class MOWAS2_OT_ImportVehicleFolder(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+def _invoke_vehicle_export(operator, context):
+    props = context.scene.mowas2_props
+    if props.output_dir and os.path.isdir(props.output_dir):
+        operator.directory = props.output_dir
+    context.window_manager.fileselect_add(operator)
+    return {'RUNNING_MODAL'}
+
+
+def _execute_vehicle_export(operator, context, target_game):
+    try:
+        if not operator.directory:
+            operator.report({'ERROR'}, _("vehicle.err.select_export_dir"))
+            return {'CANCELLED'}
+        out = export_vehicle_folder(
+            operator.directory, target_game=target_game)
+        props = context.scene.mowas2_props
+        message = _("vehicle.info.exported_target", dir=out,
+                    target=target_game)
+        props.report = message
+        operator.report({'INFO'}, message)
+        return {'FINISHED'}
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        operator.report(
+            {'ERROR'}, _("vehicle.err.export_failed", error=exc))
+        return {'CANCELLED'}
+
+
 class MOWAS2_OT_ExportVehicleFolder(bpy.types.Operator):
-    """导出载具 (自动按骨拆分)"""
+    """Compatibility alias for the former vehicle export operator."""
     bl_idname = "gem2.mowas2_export_vehicle_folder"
-    bl_label = _("vehicle.export.label")
-    bl_description = _("vehicle.export.desc")
+    bl_label = _("vehicle.export_mowas2.label")
+    bl_description = _("vehicle.export_mowas2.desc")
     bl_options = {'REGISTER', 'UNDO'}
 
     directory: bpy.props.StringProperty(subtype='DIR_PATH')
 
     def invoke(self, context, event):
-        props = context.scene.mowas2_props
-        if props.output_dir and os.path.isdir(props.output_dir):
-            self.directory = props.output_dir
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
+        return _invoke_vehicle_export(self, context)
 
     def execute(self, context):
-        try:
-            if not self.directory:
-                self.report({'ERROR'}, _("vehicle.err.select_export_dir"))
-                return {'CANCELLED'}
-            out = export_vehicle_folder(self.directory)
-            props = context.scene.mowas2_props
-            props.report = _("vehicle.info.exported", dir=out)
-            self.report({'INFO'}, _("vehicle.info.exported", dir=out))
-            return {'FINISHED'}
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.report({'ERROR'}, _("vehicle.err.export_failed", error=e))
-            return {'CANCELLED'}
+        return _execute_vehicle_export(self, context, 'MOWAS2')
 
 
-VEHICLE_CLASSES = (MOWAS2_OT_ImportVehicleFolder, MOWAS2_OT_ExportVehicleFolder)
+class GEM2_OT_ExportVehicleToMOWAS2(bpy.types.Operator):
+    """Export PLY/VOL and convert the copied MDL for MOWAS2."""
+    bl_idname = "gem2.export_vehicle_to_mowas2"
+    bl_label = _("vehicle.export_mowas2.label")
+    bl_description = _("vehicle.export_mowas2.desc")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: bpy.props.StringProperty(subtype='DIR_PATH')
+
+    def invoke(self, context, event):
+        return _invoke_vehicle_export(self, context)
+
+    def execute(self, context):
+        return _execute_vehicle_export(self, context, 'MOWAS2')
+
+
+class GEM2_OT_ExportVehicleToGOH(bpy.types.Operator):
+    """Export PLY/VOL and restore preserved GOH MDL syntax when present."""
+    bl_idname = "gem2.export_vehicle_to_goh"
+    bl_label = _("vehicle.export_goh.label")
+    bl_description = _("vehicle.export_goh.desc")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: bpy.props.StringProperty(subtype='DIR_PATH')
+
+    def invoke(self, context, event):
+        return _invoke_vehicle_export(self, context)
+
+    def execute(self, context):
+        return _execute_vehicle_export(self, context, 'GOH')
+
+
+VEHICLE_CLASSES = (
+    MOWAS2_OT_ImportVehicleFolder,
+    MOWAS2_OT_ExportVehicleFolder,
+    GEM2_OT_ExportVehicleToMOWAS2,
+    GEM2_OT_ExportVehicleToGOH,
+)
 
 
 def register():

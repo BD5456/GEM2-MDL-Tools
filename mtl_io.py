@@ -110,7 +110,11 @@ def _search_texture_file(tex_name, search_dirs, prefer_dirs=None):
     basename = os.path.basename(name)
     dirpart = os.path.dirname(name)
 
-    for ext in TEXTURE_EXTENSIONS:
+    existing_extension = os.path.splitext(name)[1].casefold()
+    suffixes = ('',) if existing_extension in {
+        extension.casefold() for extension in TEXTURE_EXTENSIONS
+    } else TEXTURE_EXTENSIONS
+    for ext in suffixes:
         # 1) 优先: 精确路径 + 扩展名
         for base in search_dirs:
             cand = os.path.join(base, name + ext)
@@ -127,7 +131,15 @@ def _search_texture_file(tex_name, search_dirs, prefer_dirs=None):
                 cand = os.path.join(base, dirpart, basename + ext)
                 if os.path.isfile(cand):
                     return cand
-    return None
+
+    # GOH ships base-game textures inside ZIP-compatible PAK archives. Resolve
+    # only the requested member into the local cache instead of unpacking PAKs.
+    try:
+        from .pak_io import resolve_packed_texture
+        return resolve_packed_texture(tex_name, search_dirs)
+    except Exception as exc:
+        print('[PAK] texture lookup failed for %s: %s' % (tex_name, exc))
+        return None
 
 
 def _collect_search_dirs(mtl_path, base_dir):

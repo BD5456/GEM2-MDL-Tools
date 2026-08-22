@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "GEM2 GOH Tools",
+    "name": "GEM2 Engine Tools",
     "author": "BD5456+VegetaBird+Simon",
-    "version": (1, 0, 0),
+    "version": (1, 1, 1),
     "blender": (4, 3, 0),
-    "location": "File > Import/Export > GEM2 PLY",
-    "description": "GOH (Call to Arms - Gates of Hell) PMX/MMD -> GEM2 skin pipeline. GFA custom skeleton based.",
+    "location": "File > Import/Export; 3D View > GEM2 Engine Tools",
+    "description": "GOH/MOWAS2 GEM2 pipeline with FBX export, directional vehicle conversion, and vanilla GOH DEF generation.",
     "category": "Import-Export",
 }
 
@@ -26,7 +26,11 @@ def unregister():
     from . import native_decimate
     from . import mowas2_pipeline
     from . import vehicle_io
-    operators.unregister()
-    native_decimate.unregister()
-    mowas2_pipeline.unregister()
-    vehicle_io.unregister()
+    from . import pak_io
+    for module in (operators, native_decimate, mowas2_pipeline, vehicle_io):
+        try:
+            module.unregister()
+        except RuntimeError:
+            # A simultaneously enabled GEM2 variant may own the same RNA id.
+            pass
+    pak_io.clear_pak_caches()
