@@ -5,6 +5,7 @@ Supports {material simple} and {material bump} variants.
 import os
 import bpy
 from .i18n import _
+from .texture_export import image_reference_stem, resolve_material_image
 
 TEXTURE_EXTENSIONS = ['.dds', '.DDS', '.tga', '.TGA', '.png', '.PNG',
                       '.jpg', '.JPG', '.jpeg', '.JPEG', '.bmp', '.BMP',
@@ -291,10 +292,14 @@ def import_mtl(mtl_path, mat, base_dir):
         principled.inputs['Alpha'].default_value = 1.0
 
     if blend_mode == 'blend':
+        # KKS facial details are large transparent cards over opaque skin.
+        # Match MMD's dithered/hash path instead of Blender's depth-sorted
+        # blended pass, which can show their transparent-black backing as a
+        # rectangular overlay in the viewport.
         if hasattr(mat, 'surface_render_method'):
-            mat.surface_render_method = 'BLENDED'
+            mat.surface_render_method = 'DITHERED'
         if hasattr(mat, 'blend_method'):
-            mat.blend_method = 'BLEND'
+            mat.blend_method = 'HASHED'
     elif blend_mode == 'test':
         if hasattr(mat, 'surface_render_method'):
             mat.surface_render_method = 'DITHERED'
@@ -309,27 +314,63 @@ def import_mtl(mtl_path, mat, base_dir):
     mat['gem2_alpha_ref'] = alpha_ref
 
 
-def export_mtl(filepath, mat, mode='SIMPLE'):
-    """写出 MTL 材质文件"""
+def export_mtl(filepath, mat, mode='SIMPLE', texture_names=None):
+    """Write an MTL using staged texture tokens when supplied.
 
-    def _get_diffuse_name(mat):
-        if not mat.use_nodes:
+    ``texture_names`` is a role-to-stem mapping produced by the shared image
+    stager. Falling back to the resolver keeps standalone callers compatible,
+    while avoiding Blender datablock names such as ``foo.png.001``.
+    """
+
+    def _token(value):
+        if value is None:
             return None
-        for node in mat.node_tree.nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                if node.inputs["Base Color"].links:
-                    img_node = node.inputs["Base Color"].links[0].from_node
-                    if img_node.type == 'TEX_IMAGE' and img_node.image:
-                        return os.path.splitext(img_node.image.name)[0]
-        return None
+        is_ref = isinstance(value, dict)
+        if is_ref:
+            value = value.get('stem')
+        if not value:
+            return None
+        value = os.path.basename(str(value).replace('\\', '/'))
+        # A stager ref already carries an extensionless stem; splitting it
+        # would truncate legitimate names such as ``body.v2``.
+        return value if is_ref else os.path.splitext(value)[0]
 
-    diffuse = _get_diffuse_name(mat) or mat.name
+    def _role_name(role):
+        # Once a stager mapping is supplied it is authoritative. Falling back
+        # to the resolver here can lose an allocated ``_2`` collision suffix
+        # and make the MTL point at a file that was never emitted.
+        if texture_names is not None:
+            if role in texture_names:
+                token = _token(texture_names.get(role))
+                if token:
+                    return token
+            return None
+        image = resolve_material_image(mat, role)
+        return image_reference_stem(image) if image is not None else None
+
+    diffuse = _role_name('diffuse') or mat.name
+    blend_mode = str(mat.get('gem2_blend_mode', 'none') or 'none').lower()
+    if blend_mode not in {'none', 'blend', 'test'}:
+        blend_mode = 'none'
+    try:
+        alpha_ref = int(mat.get('gem2_alpha_ref', 127))
+    except (TypeError, ValueError):
+        alpha_ref = 127
+    alpha_ref = max(0, min(255, alpha_ref))
+
+    def _write_blend(handle):
+        if blend_mode == 'test':
+            handle.write('\t{alpharef %d}\n' % alpha_ref)
+            handle.write('\t{blend test}\n')
+            handle.write('\t{alphatocoverage}\n')
+        else:
+            handle.write('\t{blend %s}\n' % blend_mode)
 
     with open(filepath, "w", encoding="utf-8") as f:
         if mode == 'SIMPLE':
             f.write("{material simple\n")
             f.write('\t{diffuse "' + diffuse + '"}\n')
-            f.write('\t{blend none}\n')
+            _write_blend(f)
             f.write("}\n")
             return
 
@@ -337,24 +378,8 @@ def export_mtl(filepath, mat, mode='SIMPLE'):
         f.write("{material bump\n")
         f.write('\t{diffuse "' + diffuse + '"}\n')
 
-        bump = None
-        specular = None
-        if mat.use_nodes:
-            for node in mat.node_tree.nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    if node.inputs["Normal"].links:
-                        img_node = node.inputs["Normal"].links[0].from_node
-                        if img_node.type == 'NORMAL_MAP' and img_node.inputs["Color"].links:
-                            final_node = img_node.inputs["Color"].links[0].from_node
-                            if final_node.type == 'TEX_IMAGE' and final_node.image:
-                                bump = os.path.splitext(final_node.image.name)[0]
-                        elif img_node.type == 'TEX_IMAGE' and img_node.image:
-                            bump = os.path.splitext(img_node.image.name)[0]
-                    if node.inputs["Specular IOR Level"].links:
-                        img_node = node.inputs["Specular IOR Level"].links[0].from_node
-                        if img_node.type == 'TEX_IMAGE' and img_node.image:
-                            specular = os.path.splitext(img_node.image.name)[0]
-                    break
+        bump = _role_name('bump')
+        specular = _role_name('specular')
 
         f.write('\t{bump "' + (bump if bump else mat.name + '_bp') + '"}\n')
         f.write('\t{specular "' + (specular if specular else mat.name + '_sp') + '"}\n')
@@ -368,5 +393,5 @@ def export_mtl(filepath, mat, mode='SIMPLE'):
                         color = tuple(int(c * 255) for c in col[:3]) + (255,)
                     break
         f.write('\t{color "' + f"{color[0]} {color[1]} {color[2]} {color[3]}" + '"}\n')
-        f.write('\t{blend none}\n')
+        _write_blend(f)
         f.write("}\n")

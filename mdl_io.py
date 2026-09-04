@@ -5,6 +5,7 @@ Matrix34/Position/Orientation metadata, and nested hierarchy.
 """
 import os
 import json
+import re
 import bpy
 from mathutils import Matrix, Vector
 
@@ -166,6 +167,73 @@ def flatten_bones(root_bones):
     return flat
 
 
+def direct_volume_views(content, bone_name):
+    """Return only VolumeView entries directly inside one bone block.
+
+    VolumeViews nested inside LODView or another child block are alternatives,
+    not simultaneously visible multipart geometry, and are intentionally skipped.
+    """
+    header = re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
+        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
+    headers = list(header.finditer(content))
+    if len(headers) != 1:
+        raise RuntimeError(
+            "Expected exactly one MDL bone %r, found %d"
+            % (bone_name, len(headers)))
+    bone_start = headers[0].start()
+    bone_end = find_matching_brace(content, bone_start)
+    if bone_end < 0:
+        raise RuntimeError("Unbalanced MDL bone block: " + str(bone_name))
+
+    view_pattern = re.compile(
+        r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}',
+        re.IGNORECASE)
+    result = []
+    depth = 0
+    in_string = False
+    escaped = False
+    index = bone_start
+    while index <= bone_end:
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char == '{':
+            if depth == 1:
+                match = view_pattern.match(content, index)
+                if match is not None and match.end() <= bone_end + 1:
+                    result.append(match.group('filename'))
+                    index = match.end()
+                    continue
+            depth += 1
+        elif char == '}':
+            depth -= 1
+        index += 1
+    return result
+
+
+def direct_volume_view_map(content):
+    """Return direct, simultaneously visible PLY references for every MDL bone."""
+    root_bones, _mesh_parent = parse_mdl(content)
+    result = {}
+    for bone_name in flatten_bones(root_bones):
+        references = direct_volume_views(content, bone_name)
+        if references:
+            result[bone_name] = references
+    return result
+
+
 def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path,
                    preserve_rest_matrix=False):
     """从根骨骼列表创建 Blender 骨架，返回 arm_obj"""
@@ -277,12 +345,68 @@ def build_armature(mesh_name, root_bones, mesh_parent_name, mdl_path,
     return arm_obj
 
 
+def mesh_parent_local_matrix(arm_obj):
+    """Return the VolumeView attachment matrix in PLY/model space.
+
+    Stored MDL matrices are world frames.  A skinned human PLY is written
+    below the attachment's immediate ancestor, so its local attachment frame is
+    ``inverse(parent_world) * mesh_parent_world``.  This is distinct from the
+    raw matrix emitted into MDL and from Blender's normalized display rest.
+    """
+    if arm_obj is None:
+        return Matrix.Identity(4)
+
+    mesh_parent = str(arm_obj.get('gem2_mesh_parent') or '')
+    raw_value = arm_obj.get('gem2_world_mats')
+    parents_value = arm_obj.get('gem2_parents')
+    if raw_value or parents_value:
+        if not (raw_value and parents_value and mesh_parent):
+            raise ValueError(
+                'Incomplete GEM2 mesh-parent metadata for %s'
+                % getattr(arm_obj, 'name', '<armature>'))
+        try:
+            raw = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+            parents = (json.loads(parents_value)
+                       if isinstance(parents_value, str) else parents_value)
+            if not isinstance(raw, dict) or not isinstance(parents, dict):
+                raise ValueError('raw MDL metadata is not a mapping')
+            if mesh_parent not in raw:
+                raise ValueError(
+                    'mesh parent is absent from gem2_world_mats: ' + mesh_parent)
+            mesh_world = Matrix(raw[mesh_parent])
+            ancestor = parents.get(mesh_parent)
+            if ancestor:
+                if ancestor not in raw:
+                    raise ValueError(
+                        'mesh parent references missing ancestor: ' + str(ancestor))
+                result = Matrix(raw[ancestor]).inverted() @ mesh_world
+            else:
+                result = mesh_world
+            if abs(float(result.to_3x3().determinant())) <= 1.0e-8:
+                raise ValueError('mesh parent attachment matrix is singular')
+            return result
+        except (TypeError, ValueError, KeyError, IndexError, RuntimeError) as exc:
+            raise ValueError(
+                'Invalid GEM2 mesh-parent metadata for %s: %s'
+                % (getattr(arm_obj, 'name', '<armature>'), exc)) from exc
+
+    if arm_obj.get('gem2_human_rest_display_rest'):
+        raise ValueError(
+            'Normalized human display rest requires raw MDL metadata before '
+            'PLY export')
+
+    # Ordinary hand-built rigs have no MDL metadata.  Retain the historical
+    # fallback for those callers; normalized human rigs are rejected above.
+    bone = arm_obj.data.bones.get(mesh_parent or 'skin')
+    return bone.matrix_local.copy() if bone else Matrix.Identity(4)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  MDL EXPORT
 # ═══════════════════════════════════════════════════════════════
 
 def write_mdl_file(filepath, arm_obj, mesh_obj, ply_name):
-    """写出 MDL 骨架文件。返回 skin_world 矩阵"""
+    """写出 MDL 骨架文件；返回 raw MDL mesh-parent world 矩阵。"""
     skin_world = Matrix.Identity(4)
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -294,6 +418,12 @@ def write_mdl_file(filepath, arm_obj, mesh_obj, ply_name):
 
         stored_mats = arm_obj.get('gem2_world_mats')
         stored_parents = arm_obj.get('gem2_parents')
+
+        if (arm_obj.get('gem2_human_rest_display_rest')
+                and not (stored_mats and stored_parents)):
+            raise ValueError(
+                'Normalized human display rest requires the original '
+                'gem2_world_mats and gem2_parents for MDL export')
 
         if stored_mats and stored_parents:
             skin_world = _write_mdl_stored(f, arm_obj, mesh_obj, ply_name)

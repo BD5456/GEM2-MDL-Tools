@@ -42,8 +42,66 @@ PRIMITIVE_VOL_KEY = 'gem2_vehicle_primitive_volume'  # MDL 内嵌 Box/Cylinder
 FOLDER_KEY = 'gem2_vehicle_dir'   # 来源文件夹
 RIGID_MOD_KEY = 'gem2_vehicle_rigid_binding'
 RIGID_MOD_NAME = 'GEM2 Rigid Bone'
+DISPLAY_UNMIRROR_KEY = 'gem2_vehicle_display_unmirror'
+DISPLAY_BASIS_KEY = 'gem2_vehicle_display_basis'
+DISPLAY_MATRIX_KEY = 'gem2_vehicle_display_matrix'
 MATRIX_EPS = 1e-4
+BASIS_EPS = 1e-3
 _FLOAT_RE = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+_DISPLAY_UNMIRROR = Matrix.Diagonal((1.0, -1.0, 1.0, 1.0))
+
+
+def _is_gem_basis_y_mirror(world_mats):
+    """Return whether the root basis uses GEM's conventional Y reflection."""
+    basis = None
+    if world_mats:
+        basis = next((matrix for name, matrix in world_mats.items()
+                      if str(name).casefold() == 'basis'), None)
+    if basis is None:
+        return False
+    for row in range(3):
+        for column in range(3):
+            expected = -1.0 if row == column == 1 else (1.0 if row == column else 0.0)
+            if abs(float(basis[row][column]) - expected) > BASIS_EPS:
+                return False
+    # A basis is a direction transform; any translation belongs to the
+    # vehicle hierarchy and must not affect display-basis detection.
+    return True
+
+
+def _apply_vehicle_display_basis(veh_root, world_mats):
+    """Present GEM's mirrored basis in Blender without changing export space.
+
+    GEM vehicle MDLs conventionally carry a basis Y reflection. Keep every
+    child matrix and its stored home matrix in that native space, and put the
+    inverse display conversion on the shared root instead. The root must stay
+    unapplied: safe export removes it with ``root^-1 @ object_world``.
+    """
+    if not _is_gem_basis_y_mirror(world_mats):
+        return False
+    stored_raw = veh_root.get(DISPLAY_MATRIX_KEY)
+    if stored_raw:
+        try:
+            stored = Matrix(json.loads(stored_raw))
+        except (TypeError, ValueError, IndexError, RuntimeError):
+            raise RuntimeError('vehicle display basis metadata is invalid')
+        if (len(stored) != 4 or
+                any(len(row) != 4 for row in stored)):
+            raise RuntimeError('vehicle display basis metadata is invalid')
+        if (not bool(veh_root.get(DISPLAY_UNMIRROR_KEY)) or
+                str(veh_root.get(DISPLAY_BASIS_KEY) or '') != 'Y_MIRROR'):
+            raise RuntimeError('vehicle display basis metadata is inconsistent')
+        if _matrix_delta(stored, _DISPLAY_UNMIRROR) > MATRIX_EPS:
+            raise RuntimeError('vehicle display basis metadata is inconsistent')
+        # A user may move the whole vehicle root as a scene locator. Do not
+        # overwrite that placement when this idempotent helper is called again.
+        return True
+    veh_root.matrix_world = _DISPLAY_UNMIRROR.copy()
+    veh_root[DISPLAY_UNMIRROR_KEY] = True
+    veh_root[DISPLAY_BASIS_KEY] = 'Y_MIRROR'
+    veh_root[DISPLAY_MATRIX_KEY] = json.dumps(
+        [[float(value) for value in row] for row in _DISPLAY_UNMIRROR])
+    return True
 
 
 def _new_vehicle_collection(host_collection, name, hidden=False):
@@ -512,6 +570,13 @@ def import_vehicle_folder(dirpath):
     visible_parts = [obj for obj in visible_parts if obj is not None]
     for obj in visible_parts:
         obj.select_set(True)
+    # GEM vehicle MDLs conventionally include basis mirrorY. Keep that
+    # transform in native matrices for round-trip export, but present the
+    # complete imported hierarchy in Blender's left/right convention.
+    display_unmirrored = _apply_vehicle_display_basis(veh_root, world_mats)
+    if display_unmirrored:
+        print('[vehicle] GEM basis Y-mirror moved to the display root')
+    bpy.context.view_layer.update()
     bpy.context.view_layer.objects.active = (
         visible_parts[0] if visible_parts else veh_root)
     print('[vehicle] 导入完成: %d 主视图 PLY 实例, 跳过 %d 个旁路 PLY '

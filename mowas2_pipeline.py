@@ -2,19 +2,18 @@
 """
 MOWAS2 PMX→GEM2 自动管线 v2（2026-08 修正版，手动跑通后固化）
 ================================================================
-把 MMD/PMX 模型自动绑骨到 GEM2(MOWAS2) 58 骨士兵骨架并导出单个 .ply。
+把 MMD/PMX 模型自动绑骨到 GEM2(MOWAS2) 58 骨士兵骨架并导出人物资源。
 
 v1 的问题（用户实测反馈 + 修复）：
   1. 旧对齐(GFA 启发式缩放链)对 T-pose 源失效 → "宽体普京"。
      → 改为 Umeyama 刚性相似变换（只旋转+平移+均匀缩放，形状零失真）
        + T-pose 手臂姿态级旋转（绕肩 pivot + roll 迭代）。
-  2. 多 VolumeView 拆分导出 → 游戏内只有身体、脑袋留在地图原点：
-     士兵骨架由 human_anm.ext 动画系统接管，新加的 VolumeView 载体骨
-     无动画数据被重置到原点（minomet 那种多 VolumeView 只适用于静态模型）。
-     → 改回单 VolumeView（原版 skin 骨），一个 .ply。
-  3. 该 PMX 的 UV 逐面独立（每材质 UV 拆分系数 = 1.0：拆分顶点 = 3×面），
-     单 ply 顶点 ≤65535(u16 索引硬限) ⟺ 面 ≤21845。
-     → COLLAPSE 减面（面部顶点 VG 保护 + 迭代 ratio），保留原 UV/贴图/权重。
+  2. 新建 VolumeView 载体骨和直接挂 head 的静态 PLY 都会在人物动画路径中
+     消失。GOH/GFA 可工作结构是：多个 stride-40 蒙皮 PLY 都作为同一个 skin
+     骨的直接 VolumeView；GOH 自动拆分严格复用这一路径，不新增骨。
+  3. Blender UV/自定义法线属于 loop，而 GEM2 使用交错式顶点记录；物理逐面
+     拆点会制造大量无意义副本。同位置顶点只复用稳定游戏权重，法线必须保留
+     每个 loop 的原值，再按最终 40-byte 位置/权重/法线/UV 记录精确去重。
   4. 权重转移丢躯干：该 PMX 躯干权重全在 cf_s_* 补充骨上（主骨只有 0 权重
      条目）→ 必须先跑骨骼铸造（未映射骨权重上卷到最近映射祖先）。
   5. mirror_swap 把 'ik_leftright' 误换名成 'ik_leftleft'（结尾 'right' 命中
@@ -23,22 +22,36 @@ v1 的问题（用户实测反馈 + 修复）：
      改用 evaluated 顶点写回法冻结姿态。
 """
 import bpy
+import ast
+import hashlib
+import heapq
 import os
 import re
 import struct
 import math
 import shutil
 import subprocess
+import tempfile
 import json
+from itertools import combinations
+from datetime import datetime, timezone
 from bpy.app.handlers import persistent
 from mathutils import Matrix, Vector
 
 from .i18n import _
+from .texture_export import (
+    TextureStager,
+    fill_black_alpha,
+    image_file_to_tga,
+    iter_material_images,
+    resolve_material_image,
+    resolved_image_path,
+)
 
 OUT_DEFAULT = os.path.join(os.path.expanduser('~'), 'Desktop')  # 默认输出=用户桌面, 面板可改
 GROUND_Z = -0.07  # 样本 skin 网格脚底高度（贴地基准）
-# GOH 原生 akq_youwu/akq_ming 的透明材质均采用 alpharef 127 + blend test。
-# 默认启用该语义；面板可切回 blend 做对照测试。
+# GOH cutout materials use alpharef 127 + blend test by default. Soft facial
+# overlays (brows/lashes/eyelines/pupils) keep blend/DXT5 to preserve AA alpha.
 GOH_ALPHA_TEST_TRANSPARENT = True
 # ik_updown 对应源 UpperBody2 区域的额外缩放默认关闭，避免改变既有导出；
 # 开启后以 GFA WidthExtraScaling_PerStep**0.5 为自动基准，再乘面板倍率。
@@ -58,6 +71,10 @@ GOH_DIRECT_MMD_WRIST_REANCHOR = False
 # 复制, 短臂 5.38/4.51) 保留在 samples/ 供 GOH_GFA_LONGARM=False 时手动选用。
 GOH_DEFAULT_MDL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'samples', 'goh_skin_gfa.mdl')
+GOH_ROUTE_MDL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'samples', 'goh_skin.mdl')
+MOWAS2_ROUTE_MDL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'samples', 'MOWAS2.mdl')
 
 # E6.13: 有 alpha 通道但游戏内不需要透明的贴图 (用户确认: 脸部贴图不用 alpha)
 EXCLUDE_TRANSPARENT = {'face@cf_m_face_00@alpha'}
@@ -212,126 +229,20 @@ def _tex_has_alpha(img_path, thresh=250):
 
 def png_to_tga(img_path, tga_path, soften=False, fill_black=False,
                 return_profile=False):
-    """PNG → TGA type2 未压缩 BGRA 32bpp (desc=0x08)。
+    """Write the shared GEM2 type-2 BGRA32 TGA representation.
 
-    用 bpy 解码（引擎不读 PNG，但 Blender 可读），numpy 向量化转换，不依赖 PIL。
-    Blender image.pixels 顺序 = 自下而上逐行（TGA 同款原点左下），直接写。
-    与参考 TGA（type2 32bpp desc=0x08）逐字节一致。
-
-    soften=True 时对像素做 alpha 软化（见 TIGHT_ALPHA_SCALE/LIFT 注释）：
-    紧身衣物贴图深黑高 alpha → 压缩 alpha 让皮肤透出。
-
-    fill_black=True (2026-08-18 GOH): KK 系贴图透明区 RGB 纯黑, mtl 用
-    {blend none} 时引擎直接画 RGB → 黑块/半透明。把 alpha<127 像素的 RGB
-    用邻近不透明像素颜色填充 (迭代膨胀), 使 none 类实体材质显示正常。
-    不透明像素不动 (贴图主体零改动)。
-
-    返回 bool：贴图是否有真透明；return_profile=True 时返回包含
-    has_alpha/transparent_ratio/partial_ratio/min_alpha/max_alpha 的字典，
-    供未知材质区分实质镂空与少量抗锯齿边缘。
+    This compatibility entry point keeps the human pipeline API stable while
+    the encoder itself lives in ``texture_export`` for every export route.
     """
-    import numpy as np
-    img = bpy.data.images.load(img_path, check_existing=False)
-    try:
-        w, h = img.size
-        if w <= 0 or h <= 0:
-            raise RuntimeError(_("mowas2.err.texture_bad_size",
-                                 width=w, height=h))
-        px = np.array(img.pixels, dtype=np.float32).reshape(h, w, 4)
-        if soften:
-            px[:, :, 3] = px[:, :, 3] * TIGHT_ALPHA_SCALE
-            if TIGHT_ALPHA_LIFT > 0:
-                lift = (1.0 - px[:, :, 3]) * (TIGHT_ALPHA_LIFT / 255.0)
-                px[:, :, :3] = np.clip(px[:, :, :3] + lift[:, :, None], 0.0, 1.0)
-        if fill_black:
-            _fill_black_alpha(px)
-        # alpha 检测与分布统计 (向量化, 一次扫描; 阈值 250/255≈0.9804)。
-        # partial_ratio 用于区分 GOH 的 test 镂空与 blend 半透明边缘。
-        if img.channels >= 4:
-            alpha = px[:, :, 3]
-            has_alpha = bool((alpha < (250.0 / 255.0)).any())
-            partial = (alpha > (2.0 / 255.0)) & (alpha < (253.0 / 255.0))
-            profile = {
-                'has_alpha': has_alpha,
-                'partial_ratio': float(partial.mean()),
-                'transparent_ratio': float(
-                    (alpha <= (2.0 / 255.0)).mean()),
-                'opaque_ratio': float(
-                    (alpha >= (253.0 / 255.0)).mean()),
-                'min_alpha': float(alpha.min()),
-                'max_alpha': float(alpha.max()),
-            }
-        else:
-            has_alpha = False
-            profile = {'has_alpha': False, 'partial_ratio': 0.0,
-                       'transparent_ratio': 0.0, 'opaque_ratio': 1.0,
-                       'min_alpha': 1.0, 'max_alpha': 1.0}
-        bgra = px[:, :, [2, 1, 0, 3]]
-        data = (bgra * 255.0 + 0.5).astype(np.uint8).tobytes()
-        header = bytes((
-            0, 0, 2,                       # idlen, colormap, type=uncompressed truecolor
-            0, 0, 0, 0, 0,                 # colormap spec
-            0, 0, 0, 0,                    # x/y origin
-            w & 0xFF, (w >> 8) & 0xFF,
-            h & 0xFF, (h >> 8) & 0xFF,
-            32, 0x08,                      # 32bpp, 8 alpha bits
-        ))
-        with open(tga_path, 'wb') as f:
-            f.write(header)
-            f.write(data)
-        return profile if return_profile else has_alpha
-    finally:
-        try:
-            bpy.data.images.remove(img)
-        except Exception:
-            pass
+    return image_file_to_tga(
+        img_path, tga_path, soften=soften, fill_black=fill_black,
+        return_profile=return_profile, alpha_scale=TIGHT_ALPHA_SCALE,
+        alpha_lift=TIGHT_ALPHA_LIFT)
 
 
 def _fill_black_alpha(px, thresh=0.5, max_iter=48):
-    """KK 黑底填充: alpha < thresh 的像素 RGB ← 邻近不透明像素颜色。
-
-    迭代膨胀: 每轮把当前透明像素的 RGB 设为 8 邻域中"上一轮已不透明"
-    像素的均值。最多 max_iter 轮 (1024×1024 每轮 8 次 roll, 48 轮约
-    1-2 秒); 残留 (大面积透明区中心) 取整贴图不透明像素均值兜底。
-    alpha 通道不动 (none 类 mtl 引擎不读 alpha; blend/test 类不调用本函数)。
-    """
-    import numpy as np
-    alpha = px[:, :, 3]
-    mask = alpha < thresh
-    if not mask.any():
-        return
-    rgb = px[:, :, :3].copy()
-    solid = ~mask
-    if not solid.any():
-        # 全透明贴图: 兜底置中性灰 (几乎不会出现)
-        px[:, :, :3] = 0.5
-        return
-    cur = mask.copy()
-    n = 0
-    while cur.any() and n < max_iter:
-        acc = np.zeros_like(rgb)
-        cnt = np.zeros(rgb.shape[:2], dtype=np.float32)
-        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1),
-                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
-            r = np.roll(rgb, dy, axis=0)
-            r = np.roll(r, dx, axis=1)
-            m = np.roll(solid, dy, axis=0)
-            m = np.roll(m, dx, axis=1)
-            acc += r * m[:, :, None]
-            cnt += m
-        ok = cur & (cnt > 0)
-        if not ok.any():
-            break
-        ok_flat = ok
-        rgb[ok_flat] = acc[ok_flat] / cnt[ok_flat][:, None]
-        solid[ok_flat] = True
-        cur[ok_flat] = False
-        n += 1
-    if cur.any():
-        # 残留 (大块透明中心): 用整贴图不透明像素均值
-        mean_rgb = rgb[solid].mean(axis=0) if solid.any() else np.array([0.5, 0.5, 0.5])
-        rgb[cur] = mean_rgb
-    px[:, :, :3] = rgb
+    """Compatibility alias for callers that used the former local helper."""
+    return fill_black_alpha(px, thresh=thresh, max_iter=max_iter)
 
 
 def _is_force_opaque_alpha(name):
@@ -400,7 +311,8 @@ _EYE_LID_LAYER_KW = (
     'eyeslid', 'eye_lid', 'eye lid', 'eyelid', '眼睑', '眼皮',
 )
 _PUPIL_LAYER_EXACT = {
-    'eye', 'eyes', 'eyes+', 'eyes_', 'eyeleft', 'eyeright', '眼', '目',
+    'eye', 'eye_', 'eye+', 'eye_+', 'eye__',
+    'eyes', 'eyes+', 'eyes_', 'eyeleft', 'eyeright', '眼', '目',
 }
 _NECK_ACCESSORY_KW = (
     'neck', 'kubi', 'collar', 'choker', 'necklace', 'neckchain',
@@ -526,10 +438,10 @@ def _classify_mode(diffuse, has_alpha, exclude=EXCLUDE_TRANSPARENT,
                    material_names=None):
     """统一判定一个 diffuse 贴图的最终 mtl blend 模式。
 
-    默认采用 GOH 原生 akq_youwu 的 alpha-test 写法：
+    默认采用 GOH 原生的 alpha-test 写法处理 cutout：
     ``alpharef 127 + blend test + alphatocoverage``，不设置 PLY 0x0002。
-    面板关闭 ``透明材质使用 Alpha Test`` 后，保留旧的 blend/test 分类，
-    便于对照验证；none 仍优先保护身体、鞋和盔甲实体材质。
+    抗锯齿的眉毛、睫毛、眼线和瞳孔始终保留 blend/DXT5；none 仍优先保护
+    身体、鞋和盔甲实体材质。
 
     材质语义优先于 diffuse 文件名。软 alpha 瞳孔必须保留 blend；尤其
     Eyes+/eyeblend 的透明背景不能丢弃，否则共面的眼睛底图会被黑色 RGB
@@ -572,6 +484,14 @@ def _classify_mode(diffuse, has_alpha, exclude=EXCLUDE_TRANSPARENT,
     if _kw_hit(base, ('hair', 'toufa', '髪', '头发', '发', '髮',
                       'bang', 'forelock', 'maegami', 'kami', 'liuhai')):
         return 'none'
+    # Brows, lashes, eyelines, and pupils are soft facial overlays. Their
+    # antialiased source alpha must remain blend/DXT5 even when the global GOH
+    # alpha-test preference is enabled: BC1a turns the edge into a 1-bit cutout
+    # and exposes the KK texture's transparent-black RGB as broken dark seams.
+    # Material semantics cover shared/generic texture filenames as well.
+    if (_is_force_alpha_blend(base)
+            or any(_is_force_alpha_blend(name) for name in material_names)):
+        return 'blend'
     if mode == 'mmd':
         if _kw_hit(base, MMD_TEST_KW):
             return 'test'
@@ -588,8 +508,6 @@ def _classify_mode(diffuse, has_alpha, exclude=EXCLUDE_TRANSPARENT,
         return 'test'
     if _is_force_opaque_alpha(base):
         return 'none'
-    if _is_force_alpha_blend(base):
-        return 'test' if alpha_test else 'blend'
     if _is_force_alpha_test(base):
         return 'test'
     # 未命名但确实带 alpha 的贴图：只有存在实质透明面积时才
@@ -623,7 +541,10 @@ def _needs_soften(base):
             and any(kw.casefold() in base.casefold() for kw in SKIN_TIGHT_KW))
 
 
-_TEXTURE_SOURCE_EXTENSIONS = ('.png', '.tga', '.bmp', '.jpg', '.jpeg', '.dds')
+_TEXTURE_SOURCE_EXTENSIONS = (
+    '.png', '.tga', '.bmp', '.jpg', '.jpeg', '.dds',
+    '.tif', '.tiff', '.webp', '.gif',
+)
 # NVTT is deliberately discovered as an external tool rather than bundled: its
 # SDK license permits distribution only with NVIDIA notices and protective terms.
 _NVTT_EXPORT_CANDIDATES = (
@@ -761,9 +682,10 @@ def _convert_textures(out_sub, texture_format='TGA',
         soften = _needs_soften(base)
         semantic_names = ()
         if material_names_by_diffuse:
-            semantic_names = (material_names_by_diffuse.get(base)
-                              or material_names_by_diffuse.get(base.casefold())
-                              or ())
+            semantic_names = material_names_by_diffuse.get(base)
+            if semantic_names is None:
+                semantic_names = material_names_by_diffuse.get(
+                    base.casefold(), ())
         pupil_consumer = (_is_pupil_layer(base)
                           or any(_is_pupil_layer(name)
                                  for name in semantic_names))
@@ -797,6 +719,10 @@ def _convert_textures(out_sub, texture_format='TGA',
                 blend = 'test'
             plan[base] = blend
             if retained_source:
+                # Re-encode retained TGA sources as the canonical BGRA32
+                # contract; DDS sources stay intact for the requested DDS path.
+                if texture_format == 'TGA':
+                    os.replace(temp_tga, source_path)
                 retained += 1
                 output_label = 'existing ' + texture_format
             elif texture_format == 'DDS':
@@ -844,7 +770,7 @@ def _convert_textures(out_sub, texture_format='TGA',
         elif _is_force_opaque_alpha(diffuse):
             blend = 'none'
         elif _is_force_alpha_blend(diffuse):
-            blend = 'test' if _goh_alpha_test_mode() else 'blend'
+            blend = 'blend'
         elif _is_force_alpha_test(diffuse):
             blend = 'test'
         else:
@@ -967,13 +893,16 @@ def _find_toon_shader_root():
     return None
 
 
-def apply_toon_shader_conversion(out_sub):
+def apply_toon_shader_conversion(out_sub, material_semantics=None):
     """按 GFA ToonShaderConvert 规则将已生成的 MTL 接入 Workshop Toon Shader。
 
     该转换只写 MTL 引用，不复制 ONCL-C 许可覆盖的 shader/贴图资产。当前
     blend/alpharef/alphatocoverage 会被保留；只有 hair 分类按原规则强制 test，
-    并补齐 GOH 所需的 alpharef 127 与 alphatocoverage。
+    并补齐 GOH 所需的 alpharef 127 与 alphatocoverage。眼睛保护必须同时使用
+    清洗后的文件名和原始语义名，否则中文/日文材质名会被清洗成下划线，并因
+    diffuse 文件名含 Eye 而被错误转换成 bump。
     """
+    material_semantics = material_semantics or {}
     counts = {name: 0 for name, _tags in _TOON_DIFFUSE_TAGS}
     converted = 0
     for filename in sorted(os.listdir(out_sub)):
@@ -987,13 +916,16 @@ def apply_toon_shader_conversion(out_sub):
         if not diffuse_match:
             continue
         material_name = os.path.splitext(filename)[0]
+        semantic_name = material_semantics.get(material_name, material_name)
         # GFA keeps the actual eye surfaces on material simple. Converting them
         # to bump/full_specular changes their render path and, together with
         # alpha flags, produces depth/sorting artifacts around the sclera.
-        if (_is_pupil_layer(material_name)
-                or _is_sclera_layer(material_name)
-                or _is_eye_shadow_layer(material_name)
-                or _is_eye_lid_layer(material_name)):
+        eye_names = (material_name, semantic_name)
+        if any(_is_pupil_layer(name)
+               or _is_sclera_layer(name)
+               or _is_eye_shadow_layer(name)
+               or _is_eye_lid_layer(name)
+               for name in eye_names):
             continue
         material_type = _toon_diffuse_type(diffuse_match.group(1))
         if material_type is None:
@@ -1040,6 +972,24 @@ def apply_toon_shader_conversion(out_sub):
           '| dependency:', dependency_root or ('Workshop ' + _TOON_SHADER_WORKSHOP_ID))
     return {'converted': converted, 'groups': counts,
             'dependency_root': dependency_root}
+
+
+def _material_export_two_sided(material, semantic_name=None):
+    """Preserve explicit/PMX double-sided intent except protected eye shells."""
+    if material is None:
+        return False
+    probes = (semantic_name or material.name, material.name)
+    protected_eye = any(
+        _is_pupil_layer(name) or _is_sclera_layer(name)
+        or _is_eye_shadow_layer(name) or _is_eye_lid_layer(name)
+        for name in probes)
+    if protected_eye:
+        return False
+    if 'gem2_two_sided' in material:
+        return bool(material.get('gem2_two_sided'))
+    mmd_material = getattr(material, 'mmd_material', None)
+    return bool(mmd_material and getattr(
+        mmd_material, 'is_double_sided', False))
 
 
 def _validate_eye_material_contract(out_sub, material_semantics,
@@ -1117,10 +1067,12 @@ def _validate_eye_material_contract(out_sub, material_semantics,
 # ═══════════════════════════════════════════════════════════════
 #  PLY 游戏原生 per-vertex 格式（经 medicgirl/skin.ply 字节级校准）
 # ═══════════════════════════════════════════════════════════════
+D3DFVF_XYZ = 0x0002
 D3DFVF_XYZB2 = 0x0008
 D3DFVF_NORMAL = 0x0010
 D3DFVF_TEX1 = 0x0100
 D3DFVF_LASTBETA_UBYTE4 = 0x1000
+GAME_VERTEX_LIMIT = 65535
 MESH_FLAG_TWO_SIDED = 0x0001
 MESH_FLAG_ALPHA = 0x0002
 MESH_FLAG_LIGHT = 0x0004
@@ -1145,6 +1097,49 @@ TGT_VG_ORDER = ['body', 'foot1l', 'foot2l', 'foot3l', 'foot1r', 'foot2r',
                 'hand1l', 'hand2l', 'hand_rot1l', 'head', 'clavicle_right',
                 'hand1r', 'hand2r', 'hand_rot1r', 'palm1r', 'palm2r',
                 'palm3r', 'palm1l', 'palm2l', 'palm3l']
+
+
+def _weighted_skin_group_names(mesh_obj):
+    weighted = set()
+    for vertex in mesh_obj.data.vertices:
+        for assignment in vertex.groups:
+            if float(assignment.weight) > 1.0e-8:
+                if 0 <= assignment.group < len(mesh_obj.vertex_groups):
+                    weighted.add(mesh_obj.vertex_groups[assignment.group].name)
+    return weighted
+
+
+def _export_skin_names(mesh_obj):
+    """Return the effective SKIN order, honoring rest-converter metadata."""
+    current = [group.name for group in mesh_obj.vertex_groups]
+    configured = mesh_obj.get('gem2_skin_order')
+    if isinstance(configured, str):
+        try:
+            configured = json.loads(configured)
+        except (TypeError, ValueError):
+            configured = None
+    if not isinstance(configured, (list, tuple)):
+        return current
+    result = []
+    current_set = set(current)
+    # The hint may intentionally contain the complete destination skeleton;
+    # only groups with positive assignments belong in this mesh's SKIN palette.
+    weighted = _weighted_skin_group_names(mesh_obj)
+    for value in configured:
+        name = str(value)
+        if (name in current_set and name in weighted
+                and name not in result):
+            result.append(name)
+    # Keep newly-added weighted groups, but never put empty helper groups into
+    # a destination SKIN palette merely because Blender retains the group.
+    result.extend(name for name in current
+                  if name not in result and name in weighted)
+    return result
+
+
+def _export_skin_slot_map(mesh_obj):
+    names = _export_skin_names(mesh_obj)
+    return names, {name: index + 1 for index, name in enumerate(names)}
 
 
 def _sanitize_name(name):
@@ -1179,10 +1174,8 @@ def _assert_output_does_not_delete_source_textures(out_sub, mesh):
     for material in mesh.data.materials:
         if not material or not material.use_nodes or not material.node_tree:
             continue
-        for node in material.node_tree.nodes:
-            if node.type != 'TEX_IMAGE' or not node.image or not node.image.filepath:
-                continue
-            source = bpy.path.abspath(node.image.filepath)
+        for image in iter_material_images(material):
+            source = resolved_image_path(image)
             if not source or not os.path.isfile(source):
                 continue
             source_key = os.path.normcase(os.path.abspath(source))
@@ -1210,41 +1203,63 @@ def sanitize_materials():
     return renamed
 
 
-def _material_diffuse_path(mat):
-    """Return the most likely diffuse image path instead of the first image node.
+def _material_diffuse_image(mat):
+    """Return the resolved diffuse image, including packed/generated images."""
+    return resolve_material_image(mat, 'diffuse')
 
-    MMD materials commonly contain diffuse, sphere and toon image nodes. Node
-    iteration order is not a material contract, so score semantic node names and
-    actual color links before falling back to the first readable image.
+
+def _image_has_staging_payload(image):
+    """Return whether an image has a readable file, packed bytes, or pixels."""
+    if image is None:
+        return False
+    packed = getattr(image, 'packed_file', None)
+    if packed is not None:
+        try:
+            if bytes(packed.data):
+                return True
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
+    source = resolved_image_path(image)
+    if source and os.path.isfile(source):
+        return True
+    try:
+        width, height = image.size
+        return bool(getattr(image, 'has_data', False)
+                    and int(width) > 0 and int(height) > 0)
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return False
+
+
+def _stage_pipeline_diffuse(texture_stager, material):
+    """Stage a diffuse image, retaining the legacy no-payload fallback.
+
+    The original one-click PMX exporter ignored stale image paths and emitted the
+    material-name diffuse token. Keep that behavior only when an image has no
+    file, packed payload, or Blender pixel buffer. Real staging failures for
+    exportable images remain fatal.
     """
-    if not mat or not mat.use_nodes or not mat.node_tree:
-        return None
-    candidates = []
-    for order, node in enumerate(mat.node_tree.nodes):
-        if node.type != 'TEX_IMAGE' or not node.image or not node.image.filepath:
-            continue
-        path = bpy.path.abspath(node.image.filepath)
-        if not path or not os.path.isfile(path):
-            continue
-        label = ('%s %s %s' % (node.name, node.label,
-                               node.image.name)).casefold()
-        score = 0
-        if any(key in label for key in ('mmd_base_tex', 'diffuse',
-                                        'albedo', 'base tex', 'base_tex')):
-            score += 100
-        if any(key in label for key in ('toon', 'sphere', 'sph', 'spa',
-                                        'normal', 'bump', 'specular')):
-            score -= 100
-        for link in mat.node_tree.links:
-            if link.from_node is not node:
-                continue
-            target = (link.to_socket.name or '').casefold()
-            if target == 'base color' or 'diffuse' in target:
-                score += 200
-            elif target in {'color', 'texture', 'base texture'}:
-                score += 20
-        candidates.append((score, -order, path))
-    return max(candidates)[2] if candidates else None
+    image = _material_diffuse_image(material)
+    if image is None:
+        return None, None
+    if not _image_has_staging_payload(image):
+        return None, {
+            'material': material.name,
+            'image': image.name,
+            'source': resolved_image_path(image) or '<no filepath>',
+        }
+    return texture_stager.stage(image, source_label=material.name), None
+
+
+def _material_diffuse_path(mat):
+    """Return a readable external diffuse path when one exists.
+
+    Export code uses :func:`_material_diffuse_image` so an empty filepath does
+    not discard a packed or generated Blender image. This path-only helper is
+    retained for diagnostics and compatibility with older callers.
+    """
+    image = _material_diffuse_image(mat)
+    path = resolved_image_path(image)
+    return path if path and os.path.isfile(path) else None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1606,16 +1621,13 @@ def is_source_mirrored(src, tgt):
 FACE_NORMAL_KW = ('face', 'kao', 'skinface', 'skin_face')
 
 
-def _build_game_normals(mesh, loop_tris):
-    """为 UV 拆分后的网格重建面部平滑法线，不改变几何/UV。
+def _build_game_normals(mesh, loop_tris, log=True):
+    """Build per-material face-smoothing overrides without changing topology.
 
-    UV seam split 会把同一空间位置复制成多个顶点；直接读取
-    ``mesh.vertices[i].normal`` 后，这些副本只能看到自己的三角面，二次元
-    脸部在光照下会出现明显的三角形锯齿。这里按材质和空间位置聚合面法线，
-    用面积加权平均写入导出用的临时法线数组。只处理 face/kao 类材质，眼睛、
-    头发和衣物仍沿用原有法线，避免跨部件串光。
+    Non-face loops keep their imported custom normals. Face/kao materials receive
+    an area-weighted normal shared only by coincident vertices in that material,
+    preventing both facial triangle artifacts and cross-material light leakage.
     """
-    normals = [v.normal.copy() for v in mesh.vertices]
     tol = 1e-6
 
     def pos_key(co):
@@ -1624,44 +1636,44 @@ def _build_game_normals(mesh, loop_tris):
                 int(round(float(co.z) / tol)))
 
     accum = {}
-    vertex_mats = {}
+    face_materials = set()
     for tri in loop_tris:
         mi = tri.material_index
         if mi >= len(mesh.materials) or not mesh.materials[mi]:
             continue
-        mat_name = mesh.materials[mi].name.lower()
-        is_face = any(kw in mat_name for kw in FACE_NORMAL_KW)
-        for vi in tri.vertices:
-            vertex_mats.setdefault(vi, set()).add(mi)
-        if not is_face:
+        material = mesh.materials[mi]
+        semantic = str(material.get(
+            'mowas2_material_semantic_name', material.name)).lower()
+        if not any(keyword in semantic for keyword in FACE_NORMAL_KW):
             continue
+        face_materials.add(mi)
         a, b, c = (mesh.vertices[tri.vertices[0]].co,
                    mesh.vertices[tri.vertices[1]].co,
                    mesh.vertices[tri.vertices[2]].co)
         weighted = (b - a).cross(c - a)
         if weighted.length_squared <= 1e-16:
             continue
-        for vi in tri.vertices:
-            key = (mi, pos_key(mesh.vertices[vi].co))
+        for vertex_index in tri.vertices:
+            key = (mi, pos_key(mesh.vertices[vertex_index].co))
             if key in accum:
                 accum[key] += weighted
             else:
                 accum[key] = weighted.copy()
 
-    smoothed = 0
-    for vi in range(len(mesh.vertices)):
-        key_pos = pos_key(mesh.vertices[vi].co)
-        for mi in vertex_mats.get(vi, ()):
-            mat = mesh.materials[mi] if mi < len(mesh.materials) else None
-            if not mat or not any(kw in mat.name.lower() for kw in FACE_NORMAL_KW):
-                continue
-            n = accum.get((mi, key_pos))
-            if n is not None and n.length_squared > 1e-16:
-                normals[vi] = n.normalized()
-                smoothed += 1
-                break
-    print('[normals] face weighted smooth:', smoothed, '/', len(mesh.vertices))
-    return normals
+    overrides = {}
+    for tri in loop_tris:
+        if tri.material_index not in face_materials:
+            continue
+        for vertex_index in tri.vertices:
+            key = (tri.material_index,
+                   pos_key(mesh.vertices[vertex_index].co))
+            normal = accum.get(key)
+            if normal is not None and normal.length_squared > 1e-16:
+                overrides[(tri.material_index, int(vertex_index))] = \
+                    normal.normalized()
+    if log:
+        print('[normals] face weighted overrides:', len(overrides))
+    return overrides
 
 
 def _mesh_parent_local_inverse(arm_obj):
@@ -1716,22 +1728,20 @@ def _mesh_parent_local_inverse(arm_obj):
     raise RuntimeError(_("mowas2.err.mesh_parent_matrix_missing"))
 
 
-def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
-                    two_sided_mats=None, skip_mats=None):
-    """导出游戏原生 per-vertex ply。
+def _build_game_export_data(mesh_obj, arm_obj, skip_mats=None, log=False,
+                            preserve_source_splits=False):
+    """Build the indexed 40-byte records consumed by ``export_ply_game``.
 
-    alpha_mats: 可选 set, 材质名 → 需要 MESH_FLAG_ALPHA(0x0002)。
-    two_sided_mats: 显式需要 MESH_FLAG_TWO_SIDED(0x0001) 的材质名集合。
-    skip_mats: 默认完全不可见的源材质；其 MESH 块、三角形和孤立顶点均不写。
-    GFA 人皮默认均为单面；不能全局开启双面，否则眼白内侧背面也会写深度。
-    alpha_mats 传 None 时用旧关键字兜底 (_material_needs_alpha_flag)。
-    0x0002 位语义经 MOWAS2 13533 个 ply + GOH humanskin 122 个 ply 扫描实证:
-    - blend 半透明材质 → 带 0x0002 (2b/meihong/alice flags 0x0C16/0x0C17,
-      GOH 66 例 0x0C16);
-    - test 镂空材质 → 不带 (GOH 304 例 0x0C15);
-    - none → 不带 (0x0C14)。
+    Coincident source vertices may share one stable skin-weight prefix, but each
+    triangle corner keeps its imported custom loop normal and UV. Reusing the
+    representative vertex normal corrupts layered hair/card shading even when the
+    positions and UVs are identical. This keeps Blender topology untouched while
+    deduplicating only genuinely identical final GEM2 records. Set
+    ``preserve_source_splits`` only for diagnostic exports that must also retain
+    every imported split weight.
     """
     mesh = mesh_obj.data
+    mesh.update()
     mesh.calc_loop_triangles()
     loop_tris = mesh.loop_triangles
     invalid_slots = sorted({
@@ -1743,86 +1753,1082 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
         raise RuntimeError(
             'PLY export has triangles assigned to null material slots: '
             + ', '.join(map(str, invalid_slots)))
+    skin_names, slot_by_name = _export_skin_slot_map(mesh_obj)
+    if len(skin_names) > 254:
+        raise RuntimeError(
+            'PLY export supports at most 254 skin groups plus palette slot 0')
+
     skip_mats = set(skip_mats or ())
     skip_indices = {
-        i for i, mat in enumerate(mesh.materials)
-        if mat and mat.name in skip_mats
+        index for index, material in enumerate(mesh.materials)
+        if material and material.name in skip_mats
     }
     visible_loop_tris = [
         tri for tri in loop_tris if tri.material_index not in skip_indices
     ]
-    game_normals = _build_game_normals(mesh, visible_loop_tris)
+    if not visible_loop_tris:
+        raise RuntimeError('No visible material triangles remain for PLY export')
     uv_layer = mesh.uv_layers.active
     if uv_layer is None:
         raise RuntimeError(_("mowas2.err.no_uv_layer"))
 
-    # Remove only the VolumeView parent's local attachment. The ancestor basis
-    # transform is shared by skeleton and mesh at runtime and must stay in MDL.
+    game_normals = _build_game_normals(mesh, visible_loop_tris, log=log)
     parent_inv, parent_name = _mesh_parent_local_inverse(arm_obj)
     mesh_to_ply = parent_inv @ mesh_obj.matrix_world
     normal_to_ply = mesh_to_ply.to_3x3().inverted().transposed()
-    print('[export] mesh parent:', parent_name, '| mesh_to_ply:', mesh_to_ply)
 
-    v_weights = []
-    for v in mesh.vertices:
-        gs = sorted(v.groups, key=lambda g: -g.weight)[:2]
-        v_weights.append([g for g in gs if g.weight > 1e-6])
+    vertex_positions = [mesh_to_ply @ vertex.co for vertex in mesh.vertices]
+    position_bytes = [pack_fff(pos.x, pos.y, pos.z)
+                      for pos in vertex_positions]
+    if preserve_source_splits:
+        representative_indices = list(range(len(mesh.vertices)))
+    else:
+        representative_by_position = {}
+        representative_indices = []
+        for vertex_index, key in enumerate(position_bytes):
+            representative_indices.append(
+                representative_by_position.setdefault(key, vertex_index))
 
-    # GEM2 的 UV 是 per-vertex，而 Blender 是 per-loop。旧代码把每个 mesh
-    # 顶点的最后一个 loop UV 覆盖到全部面，Faelynn 有 6408 个多 UV 顶点，
-    # 会把约 18.5% 三角形拉到错误纹理位置形成条带。这里按序列化后的
-    # (源顶点, UV) 建索引记录；位置/法线/权重仍从同一源顶点读取。
-    export_records = []
-    record_index = {}
+    vertex_prefixes = []
+    for vertex_index, _vertex in enumerate(mesh.vertices):
+        representative = representative_indices[vertex_index]
+        weight_vertex = mesh.vertices[representative]
+        groups = sorted(weight_vertex.groups,
+                        key=lambda group: -group.weight)[:2]
+        groups = [group for group in groups if group.weight > 1e-6]
+        prefix = bytearray(position_bytes[vertex_index])
+        if not groups:
+            prefix.extend(pack_f(1.0))
+            prefix.extend(pack_BBBB(0, 0, 0, 0))
+        elif len(groups) == 1:
+            group_name = mesh_obj.vertex_groups[groups[0].group].name
+            slot = slot_by_name.get(group_name)
+            if slot is None or slot > 255:
+                raise RuntimeError('PLY skin group index exceeds uint8')
+            prefix.extend(pack_f(1.0))
+            prefix.extend(pack_BBBB(slot, 0, 0, 0))
+        else:
+            group_names = [mesh_obj.vertex_groups[group.group].name
+                           for group in groups[:2]]
+            slots = tuple(slot_by_name.get(name, 0) for name in group_names)
+            if not slots[0] or not slots[1] or max(slots) > 255:
+                raise RuntimeError('PLY skin group index exceeds uint8')
+            total = groups[0].weight + groups[1].weight
+            prefix.extend(pack_f(groups[0].weight / total))
+            prefix.extend(pack_BBBB(slots[0], slots[1], 0, 0))
+        vertex_prefixes.append(bytes(prefix))
+
+    # ── 重合层分类（max-compat 保高光方案）──────────────────────────
+    # 二游/KK 源常把头发/眼睛高光做成"与 base 逐点重合、但用不同贴图(_Dhi/高光hi)
+    # 的第二层贴片"。GEM2 单遍深度渲染下两层同深度 → z-fighting 斑点；导出去重把它
+    # 们塌成同一批记录 → Blender validate 又把高光面当重复删掉（高光丢失）。
+    # 方案：把重合层分两类处理——
+    #   · 同 diffuse 贴图（toufa/toufa_Copy 这类纯复制）→ 删除（无损，纯 z-fight 垃圾）
+    #   · 不同 diffuse 贴图（Hair_D / Hair_Dhi 高光）→ 保留，并沿法线外移极小 shell，
+    #     使其脱离同深度：不再 z-fight、也不被 validate 当重复删 → 高光在游戏内和
+    #     重导入都保住。shell 深度按重合簇内出现次序递增（base=0），避免多层互相打架。
+    from .texture_export import resolve_material_image as _resolve_diffuse
+
+    def _diffuse_stem(material_index):
+        material = mesh.materials[material_index]
+        if not material:
+            return ''
+        try:
+            image = _resolve_diffuse(material, 'diffuse')
+        except Exception:
+            image = None
+        name = image.name if image else ''
+        return os.path.splitext(name)[0].casefold()
+
+    _HL_TOKENS = ('dhi', '高光', 'hi li', 'highlight', 'hilight', '_hi',
+                  'hi2', 'eyehi', 'rim', 'outline', '描边', 'copy')
+
+    def _is_highlight(material_index):
+        material = mesh.materials[material_index]
+        name = (material.name if material else '').casefold()
+        stem = _diffuse_stem(material_index)
+        if name.endswith('+') or name.endswith('+2') or '+' in name:
+            return True
+        return any(token in name or token in stem for token in _HL_TOKENS)
+
+    mat_diffuse = {}
+    mat_is_hl = {}
+    for mi in range(len(mesh.materials)):
+        mat_diffuse[mi] = _diffuse_stem(mi)
+        mat_is_hl[mi] = _is_highlight(mi)
+
+    shell_by_ordinal = {}   # tri ordinal -> shell depth (0 = base, no offset)
+    drop_ordinals = set()   # tri ordinals dropped as pure duplicates
+    if not preserve_source_splits:
+        from collections import defaultdict as _dd
+        clusters = _dd(list)
+        for ordinal, tri in enumerate(visible_loop_tris):
+            gkey = tuple(sorted(
+                (round(vertex_positions[int(v)].x, 4),
+                 round(vertex_positions[int(v)].y, 4),
+                 round(vertex_positions[int(v)].z, 4))
+                for v in tri.vertices))
+            clusters[gkey].append(ordinal)
+        def _discriminator(material_index):
+            # Prefer the diffuse texture stem (真实内容判据). When the texture
+            # cannot be resolved (moved/packed), fall back to the material name
+            # with Blender's ``.001`` dedup suffix stripped, so a highlight is
+            # NEVER wrongly dropped as a pure duplicate — under max-compat, over-
+            # keeping (shelling) is safe, dropping a distinct layer is not.
+            stem = mat_diffuse.get(material_index, '')
+            if stem:
+                return stem
+            material = (mesh.materials[material_index]
+                        if 0 <= material_index < len(mesh.materials) else None)
+            name = (material.name if material else '').casefold()
+            return re.sub(r'\.\d{3}$', '', name)
+
+        for gkey, ordinals in clusters.items():
+            if len(ordinals) < 2:
+                continue
+            ordered = sorted(
+                ordinals,
+                key=lambda o: (1 if mat_is_hl[visible_loop_tris[o].material_index]
+                               else 0,
+                               visible_loop_tris[o].material_index, o))
+            seen_disc = {}
+            next_depth = 0
+            for o in ordered:
+                mi = visible_loop_tris[o].material_index
+                disc = _discriminator(mi)
+                if disc in seen_disc:
+                    drop_ordinals.add(o)      # same real content = pure duplicate
+                    continue
+                seen_disc[disc] = next_depth
+                if next_depth:
+                    shell_by_ordinal[o] = next_depth
+                next_depth += 1
+
+    # Shell offset scaled to model size so it stays sub-pixel visually yet
+    # exceeds the game's depth-buffer resolution to defeat z-fighting.
+    if vertex_positions:
+        xs = [p.x for p in vertex_positions]
+        ys = [p.y for p in vertex_positions]
+        zs = [p.z for p in vertex_positions]
+        diag = max(1e-6, ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2
+                          + (max(zs) - min(zs)) ** 2) ** 0.5)
+    else:
+        diag = 1.0
+    shell_epsilon = diag * 2.0e-4
+
+    vertex_records = []
+    record_positions = []
+    vertex_lookup = {}
     tris_by_mat = [[] for _ in mesh.materials]
-    source_tris_by_mat = [[] for _ in mesh.materials]
-    for tri in visible_loop_tris:
-        out_indices = []
+    removed_faces = 0
+    shell_faces = 0
+    for ordinal, tri in enumerate(visible_loop_tris):
+        if ordinal in drop_ordinals:
+            removed_faces += 1
+            continue
+        depth = shell_by_ordinal.get(ordinal, 0)
+        if depth:
+            shell_faces += 1
+        output_triangle = []
         for loop_index, vertex_index in zip(tri.loops, tri.vertices):
-            uv = uv_layer.data[loop_index].uv.to_tuple()
-            uv_bytes = pack_ff(float(uv[0]), float(uv[1]))
-            key = (int(vertex_index), uv_bytes)
-            out_index = record_index.get(key)
-            if out_index is None:
-                out_index = len(export_records)
-                record_index[key] = out_index
-                export_records.append((int(vertex_index), uv))
-            out_indices.append(out_index)
-        tris_by_mat[tri.material_index].append(tuple(out_indices))
-        source_tris_by_mat[tri.material_index].append(tri)
+            vertex_index = int(vertex_index)
+            fallback_normal = mesh.loops[loop_index].normal
+            source_normal = game_normals.get(
+                (tri.material_index, vertex_index), fallback_normal)
+            normal = normal_to_ply @ source_normal
+            if normal.length_squared > 1e-20:
+                normal.normalize()
+            if depth:
+                offset = normal * (shell_epsilon * depth)
+                pos = vertex_positions[vertex_index] + offset
+                prefix = bytearray(pack_fff(pos.x, pos.y, pos.z))
+                prefix.extend(vertex_prefixes[vertex_index][12:])
+                prefix = bytes(prefix)
+                out_pos = pos
+            else:
+                prefix = vertex_prefixes[vertex_index]
+                out_pos = vertex_positions[vertex_index]
+            uv = uv_layer.data[loop_index].uv
+            record = (prefix
+                      + pack_fff(normal.x, normal.y, normal.z)
+                      + pack_ff(float(uv.x), 1.0 - float(uv.y)))
+            output_index = vertex_lookup.get(record)
+            if output_index is None:
+                output_index = len(vertex_records)
+                vertex_lookup[record] = output_index
+                vertex_records.append(record)
+                record_positions.append(out_pos)
+            output_triangle.append(output_index)
+        tris_by_mat[tri.material_index].append(tuple(output_triangle))
+
+    if log and (removed_faces or shell_faces):
+        print('[export] coincident-layer handling: dropped %d pure-duplicate '
+              'faces (same diffuse), shelled %d highlight faces (different '
+              'diffuse, offset %.5f along normal)'
+              % (removed_faces, shell_faces, shell_epsilon))
+
     active_material_indices = [
-        mi for mi, mat_tris in enumerate(tris_by_mat) if mat_tris
+        index for index, triangles in enumerate(tris_by_mat) if triangles
     ]
+    if log:
+        print('[export] mesh parent:', parent_name, '| mesh_to_ply:', mesh_to_ply)
+        mode = ('source-split diagnostic' if preserve_source_splits
+                else 'compact game')
+        print('[export] exact 40-byte records (%s):' % mode,
+              len(mesh.vertices), 'source ->', len(vertex_records), 'output')
+    return {
+        'mesh': mesh,
+        'mesh_to_ply': mesh_to_ply,
+        'parent_name': parent_name,
+        'skip_indices': skip_indices,
+        'records': vertex_records,
+        'positions': record_positions,
+        'tris_by_mat': tris_by_mat,
+        'active_material_indices': active_material_indices,
+        'skin_names': skin_names,
+    }
+
+
+_AUTO_SPLIT_PREFERRED_KW = (
+    'hair', 'toufa', '髪', '头发', 'ponytail', 'bang', 'braid',
+    'hat', 'helmet', 'ribbon', 'flower', 'ornament', 'accessory',
+)
+_AUTO_SPLIT_BLOCKED_KW = (
+    'face', 'skin', 'body', 'eye', 'mouth', 'tooth', 'teeth', 'tongue',
+    'lash', 'brow', 'neck', 'sclera', 'pupil',
+)
+
+
+def _material_record_sets(export_data):
+    """Return the exact final-record indices referenced by each material."""
+    result = {}
+    for material_index in export_data['active_material_indices']:
+        used = set()
+        for triangle in export_data['tris_by_mat'][material_index]:
+            used.update(triangle)
+        result[material_index] = used
+    return result
+
+
+def _single_bone_for_record_set(records, record_indices, mesh_obj):
+    """Return the sole normalized skin bone used by all compact records."""
+    slot = None
+    one = pack_f(1.0)
+    for record_index in record_indices:
+        record = records[record_index]
+        if len(record) != 40 or record[12:16] != one:
+            return None
+        slots = record[16:20]
+        if not slots[0] or any(slots[1:]):
+            return None
+        if slot is None:
+            slot = slots[0]
+        elif slot != slots[0]:
+            return None
+    if slot is None:
+        return None
+    skin_names = _export_skin_names(mesh_obj)
+    group_index = int(slot) - 1
+    if not 0 <= group_index < len(skin_names):
+        return None
+    return skin_names[group_index]
+
+
+def _auto_split_material_priority(material, record_count):
+    semantic = str(material.get(
+        'mowas2_material_semantic_name', material.name)).casefold()
+    preferred = 0 if any(key.casefold() in semantic
+                         for key in _AUTO_SPLIT_PREFERRED_KW) else 1
+    return preferred, -int(record_count), semantic
+
+
+def _auto_split_mdl_content(arm_obj):
+    mdl_path = str(arm_obj.get('gem2_mdl_path') or '') if arm_obj else ''
+    if not mdl_path or not os.path.isfile(mdl_path):
+        mdl_path = GOH_DEFAULT_MDL
+    if not mdl_path or not os.path.isfile(mdl_path):
+        return None
+    with open(mdl_path, 'rb') as handle:
+        raw = handle.read()
+    try:
+        return raw.decode('gbk')
+    except UnicodeDecodeError:
+        return raw.decode('utf-8', errors='replace')
+
+
+def _plan_game_auto_split_single_bone_legacy(
+        mesh_obj, arm_obj, skip_mats=None, log=False, mdl_content=None):
+    """Plan one lossless skinned material partition for an over-limit human.
+
+    Only materials whose final compact records all normalize to the same single
+    animation bone are eligible. The selected records remain stride-40 skinned
+    data and are referenced by a second direct VolumeView on the existing mesh
+    parent, matching working GOH/GFA multipart human assets.
+    """
+    export_data = _build_game_export_data(
+        mesh_obj, arm_obj, skip_mats=skip_mats, log=False)
+    records = export_data['records']
+    total_records = len(records)
+    base = {
+        'required': total_records > GAME_VERTEX_LIMIT,
+        'available': False,
+        'total_records': total_records,
+    }
+    if total_records <= GAME_VERTEX_LIMIT:
+        if log:
+            print('[auto-split] not required:', total_records,
+                  '<=', GAME_VERTEX_LIMIT)
+        return base
+
+    if mdl_content is None:
+        mdl_content = _auto_split_mdl_content(arm_obj)
+    if not mdl_content:
+        if log:
+            print('[auto-split] target MDL is unavailable for attachment preflight')
+        return base
+    mesh_parent_name = str(arm_obj.get('gem2_mesh_parent') or '')
+    if not mesh_parent_name:
+        if log:
+            print('[auto-split] mesh parent metadata is unavailable')
+        return base
+    try:
+        mdl_content = _strip_generated_auto_split_attachments(
+            mdl_content, mesh_parent_name)
+        _append_additional_direct_volume_view(
+            mdl_content, mesh_parent_name, '__auto_split_probe__.ply')
+    except (RuntimeError, ValueError) as exc:
+        if log:
+            print('[auto-split] mesh-parent view preflight failed:', exc)
+        return base
+
+    mesh = export_data['mesh']
+    record_sets = _material_record_sets(export_data)
+    active_indices = list(export_data['active_material_indices'])
+    eligible_by_bone = {}
+    for material_index in active_indices:
+        material = mesh.materials[material_index]
+        semantic = str(material.get(
+            'mowas2_material_semantic_name', material.name)).casefold()
+        if (not any(key.casefold() in semantic
+                    for key in _AUTO_SPLIT_PREFERRED_KW)
+                and any(key.casefold() in semantic
+                        for key in _AUTO_SPLIT_BLOCKED_KW)):
+            continue
+        bone_name = _single_bone_for_record_set(
+            records, record_sets[material_index], mesh_obj)
+        if not bone_name or bone_name not in arm_obj.data.bones:
+            continue
+        eligible_by_bone.setdefault(bone_name, []).append(material_index)
+
+    def build_plan(selected, bone_name):
+        selected = set(selected)
+        part_records = set()
+        body_records = set()
+        part_triangles = 0
+        body_triangles = 0
+        for material_index in active_indices:
+            triangles = export_data['tris_by_mat'][material_index]
+            if material_index in selected:
+                part_records.update(record_sets[material_index])
+                part_triangles += len(triangles)
+            else:
+                body_records.update(record_sets[material_index])
+                body_triangles += len(triangles)
+        if (not selected or not part_records or not body_records
+                or len(part_records) > GAME_VERTEX_LIMIT
+                or len(body_records) > GAME_VERTEX_LIMIT):
+            return None
+        material_indices = sorted(selected)
+        return {
+            **base,
+            'available': True,
+            'bone_name': bone_name,
+            'material_indices': material_indices,
+            'material_names': [mesh.materials[index].name
+                               for index in material_indices],
+            'body_records': len(body_records),
+            'part_records': len(part_records),
+            'body_triangles': body_triangles,
+            'part_triangles': part_triangles,
+        }
+
+    solutions = []
+    for bone_name, material_indices in eligible_by_bone.items():
+        ordered = sorted(
+            material_indices,
+            key=lambda index: _auto_split_material_priority(
+                mesh.materials[index], len(record_sets[index])))
+        attempts = 0
+        found_for_bone = False
+        # Exact subset search for normal character material counts. A bounded
+        # search prevents pathological custom files with hundreds of slots from
+        # turning an export into an unbounded combinatorial operation.
+        for size in range(1, len(ordered) + 1):
+            for selected in combinations(ordered, size):
+                attempts += 1
+                if attempts > 20000:
+                    break
+                candidate = build_plan(selected, bone_name)
+                if candidate:
+                    preferred_count = sum(
+                        _auto_split_material_priority(
+                            mesh.materials[index], len(record_sets[index]))[0]
+                        == 0 for index in selected)
+                    score = (
+                        size, -preferred_count,
+                        -candidate['part_records'],
+                        tuple(mesh.materials[index].name.casefold()
+                              for index in selected),
+                    )
+                    solutions.append((score, candidate))
+                    found_for_bone = True
+            if found_for_bone or attempts > 20000:
+                break
+        if found_for_bone:
+            continue
+        # Bounded-search fallback: try prefixes under both the semantic and
+        # largest-record orderings before declaring this owner bone unusable.
+        fallback_orders = (
+            ordered,
+            sorted(ordered, key=lambda index: -len(record_sets[index])),
+        )
+        seen_subsets = set()
+        for fallback in fallback_orders:
+            selected = []
+            for material_index in fallback:
+                selected.append(material_index)
+                key = tuple(sorted(selected))
+                if key in seen_subsets:
+                    continue
+                seen_subsets.add(key)
+                candidate = build_plan(selected, bone_name)
+                if candidate:
+                    preferred_count = sum(
+                        _auto_split_material_priority(
+                            mesh.materials[index], len(record_sets[index]))[0]
+                        == 0 for index in selected)
+                    score = (
+                        len(selected), -preferred_count,
+                        -candidate['part_records'],
+                        tuple(mesh.materials[index].name.casefold()
+                              for index in selected),
+                    )
+                    solutions.append((score, candidate))
+                    break
+
+    if not solutions:
+        if log:
+            print('[auto-split] no safe single-bone material partition for',
+                  total_records, 'records')
+        return base
+
+    plan = None
+    active_names = {
+        index: mesh.materials[index].name for index in active_indices
+    }
+    base_skip_mats = set(skip_mats or ())
+    for _score, candidate in sorted(solutions, key=lambda item: item[0]):
+        selected_indices = set(candidate['material_indices'])
+        selected_names = set(candidate['material_names'])
+        body_skip_mats = base_skip_mats | selected_names
+        part_skip_mats = base_skip_mats | {
+            name for index, name in active_names.items()
+            if index not in selected_indices
+        }
+        body_data = _build_game_export_data(
+            mesh_obj, arm_obj, skip_mats=body_skip_mats, log=False)
+        part_data = _build_game_export_data(
+            mesh_obj, arm_obj, skip_mats=part_skip_mats, log=False)
+        body_count = len(body_data['records'])
+        part_count = len(part_data['records'])
+        if (not body_count or not part_count
+                or body_count > GAME_VERTEX_LIMIT
+                or part_count > GAME_VERTEX_LIMIT):
+            continue
+        plan = dict(candidate)
+        plan['body_records'] = body_count
+        plan['part_records'] = part_count
+        plan['body_triangles'] = sum(
+            len(body_data['tris_by_mat'][index])
+            for index in body_data['active_material_indices'])
+        plan['part_triangles'] = sum(
+            len(part_data['tris_by_mat'][index])
+            for index in part_data['active_material_indices'])
+        plan['body_skip_mats'] = sorted(body_skip_mats)
+        plan['part_skip_mats'] = sorted(part_skip_mats)
+        plan['attachment_bone'] = mesh_parent_name
+        break
+    if plan is None:
+        if log:
+            print('[auto-split] candidate skinned output still exceeds the limit')
+        return base
+    if log:
+        print('[auto-split] selected:', plan['material_names'],
+              '| owner bone:', plan['bone_name'],
+              '| direct views on:', plan['attachment_bone'],
+              '| body:', plan['body_records'],
+              '| part:', plan['part_records'],
+              '| total source:', total_records)
+    return plan
+
+
+def _auto_split_material_role(material):
+    """Return the soft placement role for one visible material."""
+    semantic = str(material.get(
+        'mowas2_material_semantic_name', material.name)).casefold()
+    protected_unicode = ('脸', '顔', '目', '眼', '瞳', '肌', '口', '嘴',
+                         '牙', '齿', '歯', '舌', '眉', '睫')
+    if (any(keyword.casefold() in semantic
+            for keyword in _AUTO_SPLIT_BLOCKED_KW)
+            or any(keyword in semantic for keyword in protected_unicode)
+            or _is_pupil_layer(semantic)
+            or _is_sclera_layer(semantic)
+            or _is_eye_shadow_layer(semantic)
+            or _is_eye_lid_layer(semantic)):
+        return 'protected'
+    preferred_unicode = ('马尾', '馬尾', '辫', '辮', '发饰', '髮飾',
+                         '头饰', '頭飾')
+    if (any(keyword.casefold() in semantic
+            for keyword in _AUTO_SPLIT_PREFERRED_KW)
+            or any(keyword in semantic for keyword in preferred_unicode)):
+        return 'preferred'
+    return 'neutral'
+
+
+def _make_game_export_part(export_data, assignment):
+    """Build one local-index PLY payload from immutable global records.
+
+    ``assignment`` stores ``(source_triangle_ordinal, global_triangle)`` items by
+    material. Records are copied byte-for-byte and only their u16 indices are
+    remapped. A material may appear in several parts, matching working GOH/GFA
+    multipart human assets.
+    """
+    source_records = export_data['records']
+    source_positions = export_data['positions']
+    mesh = export_data['mesh']
+    ordered_by_material = {}
+    used_records = set()
+    for material_index, items in assignment.items():
+        ordered = sorted(items, key=lambda item: item[0])
+        triangles = [tuple(item[1]) for item in ordered]
+        if not triangles:
+            continue
+        ordered_by_material[material_index] = triangles
+        for triangle in triangles:
+            used_records.update(triangle)
+    if not used_records:
+        raise RuntimeError('Auto-split produced an empty PLY part')
+    global_indices = [index for index in range(len(source_records))
+                      if index in used_records]
+    local_index = {global_index: index
+                   for index, global_index in enumerate(global_indices)}
+    tris_by_mat = [[] for _ in mesh.materials]
+    for material_index, triangles in ordered_by_material.items():
+        tris_by_mat[material_index] = [
+            tuple(local_index[index] for index in triangle)
+            for triangle in triangles
+        ]
+    active_indices = [index for index, triangles in enumerate(tris_by_mat)
+                      if triangles]
+    return {
+        'mesh': mesh,
+        'mesh_to_ply': export_data['mesh_to_ply'],
+        'parent_name': export_data['parent_name'],
+        'skip_indices': set(export_data.get('skip_indices', ())),
+        'records': [source_records[index] for index in global_indices],
+        'positions': [source_positions[index] for index in global_indices],
+        'tris_by_mat': tris_by_mat,
+        'active_material_indices': active_indices,
+        'global_record_indices': global_indices,
+    }
+
+
+def _partition_game_export_data(export_data, limit=GAME_VERTEX_LIMIT):
+    """Pack finalized skinned triangles into deterministic u16-safe parts.
+
+    Whole materials are kept together whenever possible. If a material alone is
+    too large, its triangles are distributed atomically while retaining their
+    stable source order inside every emitted MESH block. Placement uses the
+    incremental unique-record cost; protected face/body/eye materials prefer the
+    main part and hair/accessories prefer later parts, but those are soft rules.
+    """
+    records = export_data['records']
+    mesh = export_data['mesh']
+    active_indices = list(export_data['active_material_indices'])
+    if not records or not active_indices:
+        raise RuntimeError('Auto-split has no visible finalized geometry')
+    if limit < 3 or limit > 0xFFFF:
+        raise ValueError('Invalid GEM2 auto-split record limit: %r' % limit)
+
+    material_items = {}
+    material_records = {}
+    for material_index in active_indices:
+        items = [(ordinal, tuple(triangle))
+                 for ordinal, triangle in enumerate(
+                     export_data['tris_by_mat'][material_index])]
+        material_items[material_index] = items
+        used = set()
+        for _ordinal, triangle in items:
+            used.update(triangle)
+        material_records[material_index] = used
+
+    role_rank = {'protected': 0, 'neutral': 1, 'preferred': 2}
+    roles = {index: _auto_split_material_role(mesh.materials[index])
+             for index in active_indices}
+    ordered_materials = sorted(
+        active_indices,
+        key=lambda index: (role_rank[roles[index]],
+                           -len(material_records[index]), index))
+
+    def new_part():
+        if len(parts) >= 100:
+            raise RuntimeError(
+                'Auto-split needs more than 100 PLY files; simplify the model')
+        part = {'records': set(), 'assignment': {}}
+        parts.append(part)
+        return len(parts) - 1
+
+    def placement_score(part_index, record_set, role):
+        part = parts[part_index]
+        added = len(record_set - part['records'])
+        new_count = len(part['records']) + added
+        if new_count > limit:
+            return None
+        if role == 'protected':
+            role_penalty = 0 if part_index == 0 else 1
+        elif role == 'preferred':
+            role_penalty = 0 if part_index != 0 else 1
+        else:
+            role_penalty = 0
+        # Reuse existing records before considering bin fullness; this minimizes
+        # duplicated boundary records and preserves capacity for connected data.
+        return role_penalty, added, limit - new_count, part_index
+
+    def place_items(part_index, material_index, items, record_set):
+        part = parts[part_index]
+        part['records'].update(record_set)
+        part['assignment'].setdefault(material_index, []).extend(items)
+
+    parts = []
+    new_part()  # Stable main file.
+    for material_index in ordered_materials:
+        items = material_items[material_index]
+        record_set = material_records[material_index]
+        role = roles[material_index]
+        if len(record_set) <= limit:
+            candidates = []
+            for part_index in range(len(parts)):
+                score = placement_score(part_index, record_set, role)
+                if score is not None:
+                    candidates.append((score, part_index))
+            if not candidates:
+                part_index = new_part()
+            else:
+                _score, part_index = min(candidates)
+            place_items(part_index, material_index, items, record_set)
+            continue
+
+        # Oversized single material: fill each candidate part by repeatedly
+        # selecting the remaining triangle with the fewest missing records. Four
+        # lazy heaps (cost 0..3) are updated through record adjacency, avoiding an
+        # O(triangle^2) search while keeping connected/overlapping faces together.
+        item_by_ordinal = {ordinal: (ordinal, triangle)
+                           for ordinal, triangle in items}
+        triangle_records = {
+            ordinal: set(triangle) for ordinal, triangle in items
+        }
+        record_to_ordinals = {}
+        for ordinal, record_ids in triangle_records.items():
+            for record_id in record_ids:
+                record_to_ordinals.setdefault(record_id, []).append(ordinal)
+        remaining = set(item_by_ordinal)
+
+        def fill_part(part_index):
+            part = parts[part_index]
+            missing = {
+                ordinal: len(triangle_records[ordinal] - part['records'])
+                for ordinal in remaining
+            }
+            heaps = [[] for _ in range(4)]
+            for ordinal, cost in missing.items():
+                heapq.heappush(heaps[cost], ordinal)
+            placed = 0
+            while remaining:
+                capacity = limit - len(part['records'])
+                chosen = None
+                for cost in range(min(3, capacity) + 1):
+                    heap = heaps[cost]
+                    while heap and (heap[0] not in remaining
+                                    or missing.get(heap[0]) != cost):
+                        heapq.heappop(heap)
+                    if heap:
+                        chosen = heapq.heappop(heap)
+                        break
+                if chosen is None:
+                    break
+                new_records = triangle_records[chosen] - part['records']
+                if len(new_records) > capacity:
+                    raise RuntimeError(
+                        'Auto-split incremental-cost queue exceeded capacity')
+                remaining.remove(chosen)
+                part['assignment'].setdefault(material_index, []).append(
+                    item_by_ordinal[chosen])
+                part['records'].update(new_records)
+                placed += 1
+                for record_id in new_records:
+                    for neighbor in record_to_ordinals.get(record_id, ()):
+                        if neighbor not in remaining:
+                            continue
+                        old_cost = missing[neighbor]
+                        if old_cost <= 0:
+                            continue
+                        new_cost = old_cost - 1
+                        missing[neighbor] = new_cost
+                        heapq.heappush(heaps[new_cost], neighbor)
+            return placed
+
+        if role == 'preferred':
+            existing_order = list(range(1, len(parts))) + [0]
+        else:
+            existing_order = list(range(len(parts)))
+        for part_index in existing_order:
+            if not remaining:
+                break
+            fill_part(part_index)
+        while remaining:
+            part_index = new_part()
+            if not fill_part(part_index):
+                raise RuntimeError(
+                    'Auto-split could not place an atomic triangle')
+
+    parts = [part for part in parts if part['assignment']]
+    if not parts:
+        raise RuntimeError('Auto-split did not assign any triangles')
+
+    # Prove exact triangle ownership before local index remapping. Ordinals are
+    # unique within a material even when duplicate triangles exist geometrically.
+    for material_index in active_indices:
+        assigned = sorted(
+            ordinal
+            for part in parts
+            for ordinal, _triangle in part['assignment'].get(material_index, ()))
+        expected = list(range(len(material_items[material_index])))
+        if assigned != expected:
+            raise RuntimeError(
+                'Auto-split lost or duplicated triangles for material %s'
+                % mesh.materials[material_index].name)
+
+    payloads = [_make_game_export_part(export_data, part['assignment'])
+                for part in parts]
+    for payload in payloads:
+        if not payload['records'] or len(payload['records']) > limit:
+            raise RuntimeError('Auto-split emitted an invalid record count')
+    return payloads
+
+
+def _plan_game_auto_split(mesh_obj, arm_obj, skip_mats=None, log=False,
+                          mdl_content=None, entity_name=None,
+                          record_limit=GAME_VERTEX_LIMIT):
+    """Plan lossless GOH multipart PLY output from finalized records."""
+    record_limit = int(record_limit)
+    if record_limit < 3 or record_limit > GAME_VERTEX_LIMIT:
+        raise ValueError('Split record limit must be between 3 and 65535')
+    export_data = _build_game_export_data(
+        mesh_obj, arm_obj, skip_mats=skip_mats, log=False)
+    total_records = len(export_data['records'])
+    total_triangles = sum(
+        len(export_data['tris_by_mat'][index])
+        for index in export_data['active_material_indices'])
+    base = {
+        'required': total_records > record_limit,
+        'available': False,
+        'record_limit': record_limit,
+        'total_records': total_records,
+        'total_triangles': total_triangles,
+    }
+    if total_records <= record_limit:
+        if log:
+            print('[auto-split] not required:', total_records,
+                  '<=', record_limit)
+        return base
+
+    if mdl_content is None:
+        mdl_content = _auto_split_mdl_content(arm_obj)
+    mesh_parent_name = str(arm_obj.get('gem2_mesh_parent') or '')
+    if not mdl_content or not mesh_parent_name:
+        if log:
+            print('[auto-split] target MDL/mesh-parent metadata unavailable')
+        return base
+    try:
+        probe = _strip_generated_auto_split_attachments(
+            mdl_content, mesh_parent_name, entity_name=entity_name)
+        _append_additional_direct_volume_view(
+            probe, mesh_parent_name, '__auto_split_probe__.ply')
+    except (RuntimeError, ValueError) as exc:
+        if log:
+            print('[auto-split] mesh-parent view preflight failed:', exc)
+        return base
+
+    payloads = _partition_game_export_data(export_data, limit=record_limit)
+    if len(payloads) < 2:
+        return base
+    summaries = []
+    for index, payload in enumerate(payloads):
+        triangles = sum(len(payload['tris_by_mat'][material_index])
+                        for material_index in payload['active_material_indices'])
+        summaries.append({
+            'index': index,
+            'records': len(payload['records']),
+            'triangles': triangles,
+            'material_indices': list(payload['active_material_indices']),
+            'material_names': [
+                payload['mesh'].materials[material_index].name
+                for material_index in payload['active_material_indices']],
+        })
+    written_records = sum(item['records'] for item in summaries)
+    plan = {
+        **base,
+        'available': True,
+        'attachment_bone': mesh_parent_name,
+        'parts': payloads,
+        'part_summaries': summaries,
+        'written_records': written_records,
+        'duplicated_boundary_records': written_records - total_records,
+        # Compatibility fields for existing callers/logs.
+        'body_records': summaries[0]['records'],
+        'part_records': summaries[1]['records'],
+        'body_triangles': summaries[0]['triangles'],
+        'part_triangles': summaries[1]['triangles'],
+    }
+    if sum(item['triangles'] for item in summaries) != total_triangles:
+        raise RuntimeError('Auto-split triangle total changed during planning')
+    if log:
+        print('[auto-split] %d finalized records -> %d direct skin views'
+              % (total_records, len(payloads)))
+        for summary in summaries:
+            print('[auto-split] part %02d: %dv/%dt | %s'
+                  % (summary['index'], summary['records'],
+                     summary['triangles'], summary['material_names']))
+        print('[auto-split] duplicated boundary records:',
+              plan['duplicated_boundary_records'])
+    return plan
+
+
+def _bone_world_matrix(arm_obj, bone_name):
+    """Return one stored MDL rest bone matrix in Blender world space."""
+    raw_mats = arm_obj.get('gem2_world_mats') if arm_obj else None
+    try:
+        world_mats = json.loads(raw_mats) if isinstance(raw_mats, str) else raw_mats
+        rows = world_mats.get(bone_name) if world_mats else None
+        if rows:
+            matrix = arm_obj.matrix_world @ Matrix(rows)
+            if abs(matrix.to_3x3().determinant()) > 1e-8:
+                return matrix
+    except Exception as exc:
+        raise RuntimeError(
+            'Invalid stored MDL matrix for split bone %r: %s'
+            % (bone_name, exc)) from exc
+    raise RuntimeError(
+        'Missing usable stored MDL matrix for split bone: ' + bone_name)
+
+
+def _build_game_rigid_export_data(mesh_obj, arm_obj, material_indices,
+                                  bone_name, log=False):
+    """Build exact 32-byte position/normal/UV records in one bone's space."""
+    mesh = mesh_obj.data
+    mesh.update()
+    mesh.calc_loop_triangles()
+    selected = {int(index) for index in material_indices}
+    if not selected:
+        raise RuntimeError('Rigid split export has no selected materials')
+    invalid = sorted(index for index in selected
+                     if not 0 <= index < len(mesh.materials)
+                     or mesh.materials[index] is None)
+    if invalid:
+        raise RuntimeError('Rigid split export has invalid material slots: '
+                           + ', '.join(map(str, invalid)))
+    visible_loop_tris = [
+        tri for tri in mesh.loop_triangles if tri.material_index in selected
+    ]
+    if not visible_loop_tris:
+        raise RuntimeError('Rigid split export has no triangles')
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None:
+        raise RuntimeError(_("mowas2.err.no_uv_layer"))
+
+    game_normals = _build_game_normals(mesh, visible_loop_tris, log=log)
+    bone_world = _bone_world_matrix(arm_obj, bone_name)
+    mesh_to_ply = bone_world.inverted() @ mesh_obj.matrix_world
+    linear_determinant = mesh_to_ply.to_3x3().determinant()
+    if abs(linear_determinant) <= 1e-8:
+        raise RuntimeError('Rigid split transform is singular: ' + bone_name)
+    # GEM's established output reverses Blender winding for a proper transform.
+    # A reflected bone-local transform already flips handedness, so reversing it
+    # again would invert culling relative to the transformed vertex normals.
+    reverse_winding = linear_determinant > 0.0
+    normal_to_ply = mesh_to_ply.to_3x3().inverted().transposed()
+    vertex_positions = [mesh_to_ply @ vertex.co for vertex in mesh.vertices]
+    position_bytes = [pack_fff(pos.x, pos.y, pos.z)
+                      for pos in vertex_positions]
+    parent_inverse, _parent_name = _mesh_parent_local_inverse(arm_obj)
+    mesh_to_skinned_ply = parent_inverse @ mesh_obj.matrix_world
+    representative_keys = []
+    for vertex in mesh.vertices:
+        position = mesh_to_skinned_ply @ vertex.co
+        representative_keys.append(pack_fff(position.x, position.y, position.z))
+    representative_by_position = {}
+    representatives = []
+    for vertex_index, key in enumerate(representative_keys):
+        representatives.append(
+            representative_by_position.setdefault(key, vertex_index))
+
+    records = []
+    positions = []
+    lookup = {}
+    tris_by_mat = [[] for _ in mesh.materials]
+    for tri in visible_loop_tris:
+        output_triangle = []
+        for loop_index, vertex_index in zip(tri.loops, tri.vertices):
+            vertex_index = int(vertex_index)
+            representative = representatives[vertex_index]
+            fallback_normal = mesh.vertices[representative].normal
+            source_normal = game_normals.get(
+                (tri.material_index, vertex_index), fallback_normal)
+            normal = normal_to_ply @ source_normal
+            if normal.length_squared > 1e-20:
+                normal.normalize()
+            uv = uv_layer.data[loop_index].uv
+            record = (position_bytes[vertex_index]
+                      + pack_fff(normal.x, normal.y, normal.z)
+                      + pack_ff(float(uv.x), 1.0 - float(uv.y)))
+            output_index = lookup.get(record)
+            if output_index is None:
+                output_index = len(records)
+                lookup[record] = output_index
+                records.append(record)
+                positions.append(vertex_positions[vertex_index])
+            output_triangle.append(output_index)
+        tris_by_mat[tri.material_index].append(tuple(output_triangle))
+    active_material_indices = [
+        index for index, triangles in enumerate(tris_by_mat) if triangles
+    ]
+    if log:
+        print('[auto-split] rigid bone:', bone_name,
+              '| materials:', [mesh.materials[index].name
+                               for index in active_material_indices],
+              '| records:', len(records),
+              '| winding:', 'reversed' if reverse_winding else 'reflected-native')
+    return {
+        'mesh': mesh,
+        'mesh_to_ply': mesh_to_ply,
+        'bone_name': bone_name,
+        'reverse_winding': reverse_winding,
+        'records': records,
+        'positions': positions,
+        'tris_by_mat': tris_by_mat,
+        'active_material_indices': active_material_indices,
+    }
+
+
+def _game_export_vertex_count(mesh_obj, arm_obj, skip_mats=None,
+                              preserve_source_splits=False):
+    """Return the real single-PLY vertex count without changing mesh topology."""
+    return len(_build_game_export_data(
+        mesh_obj, arm_obj, skip_mats=skip_mats,
+        preserve_source_splits=preserve_source_splits)['records'])
+
+
+def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
+                    two_sided_mats=None, skip_mats=None,
+                    preserve_source_splits=False, prepared_data=None):
+    """导出游戏原生 per-vertex ply。
+
+    alpha_mats: 可选 set, 材质名 → 需要 MESH_FLAG_ALPHA(0x0002)。
+    two_sided_mats: 显式需要 MESH_FLAG_TWO_SIDED(0x0001) 的材质名集合。
+    skip_mats: 默认完全不可见的源材质；其 MESH 块、三角形和孤立顶点均不写。
+    preserve_source_splits: 诊断模式；保留完整 split 权重/loop 法线，默认关闭。
+    prepared_data: 自动多 PLY 分区生成的冻结记录；只重映射局部 u16 索引，
+    不重新计算位置、权重、法线或 UV。
+    GFA 人皮默认均为单面；不能全局开启双面，否则眼白内侧背面也会写深度。
+    alpha_mats 传 None 时用旧关键字兜底 (_material_needs_alpha_flag)。
+    0x0002 位语义经 MOWAS2 13533 个 ply + GOH humanskin 122 个 ply 扫描实证:
+    - blend 半透明材质 → 带 0x0002 (2b/meihong/alice flags 0x0C16/0x0C17,
+      GOH 66 例 0x0C16);
+    - test 镂空材质 → 不带 (GOH 304 例 0x0C15);
+    - none → 不带 (0x0C14)。
+    """
+    if prepared_data is None:
+        export_data = _build_game_export_data(
+            mesh_obj, arm_obj, skip_mats=skip_mats, log=True,
+            preserve_source_splits=preserve_source_splits)
+    else:
+        if skip_mats or preserve_source_splits:
+            raise ValueError(
+                'prepared_data cannot be combined with skip/diagnostic options')
+        export_data = prepared_data
+        print('[export] writing immutable auto-split payload:',
+              len(export_data['records']), 'records')
+    mesh = export_data['mesh']
+    skip_indices = export_data['skip_indices']
+    export_records = export_data['records']
+    record_positions = export_data['positions']
+    tris_by_mat = export_data['tris_by_mat']
+    active_material_indices = export_data['active_material_indices']
     if skip_indices:
         skipped = [mesh.materials[i].name for i in sorted(skip_indices)]
         print('[export] skipped invisible materials:', skipped)
-    if not active_material_indices:
-        raise RuntimeError('No visible material triangles remain for PLY export')
-    if len(export_records) > 65535:
+    if len(export_records) > GAME_VERTEX_LIMIT:
         raise RuntimeError(_(
             "mowas2.err.unique_vertex_limit",
             vertices=len(export_records)))
-    print('[export] indexed vertex+UV records:', len(mesh.vertices), '->',
-          len(export_records))
+
+    skin_names = _export_skin_names(mesh_obj)
+    skin_name_bytes = []
+    for group_name in skin_names:
+        try:
+            encoded = group_name.encode('ascii')
+        except UnicodeEncodeError as exc:
+            raise RuntimeError('PLY skin group name is not ASCII: ' + group_name) from exc
+        if not encoded or len(encoded) >= 128:
+            raise RuntimeError(
+                'PLY skin group name must contain 1-127 ASCII bytes: ' + group_name)
+        skin_name_bytes.append(encoded)
+    if len(skin_name_bytes) > 254:
+        raise RuntimeError(
+            'PLY full palette supports at most 254 skin groups, found %d'
+            % len(skin_name_bytes))
+    material_name_bytes = {}
+    for material_index in active_material_indices:
+        material = mesh.materials[material_index]
+        material_name = material.name if material else 'mat%d' % material_index
+        try:
+            encoded = (material_name + '.mtl').encode('ascii')
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(
+                'PLY material name is not ASCII: ' + material_name) from exc
+        if not encoded or len(encoded) >= 128:
+            raise RuntimeError(
+                'PLY material name must contain at most 123 ASCII bytes: '
+                + material_name)
+        material_name_bytes[material_index] = encoded
 
     with open(filepath, 'wb') as f:
         f.write(b'EPLY')
-        bounds = [mesh_to_ply @ mesh.vertices[source_index].co
-                  for source_index, _uv in export_records]
-        bb0 = Vector((min(v.x for v in bounds), min(v.y for v in bounds),
-                      min(v.z for v in bounds)))
-        bb1 = Vector((max(v.x for v in bounds), max(v.y for v in bounds),
-                      max(v.z for v in bounds)))
+        bb0 = Vector((min(v.x for v in record_positions),
+                      min(v.y for v in record_positions),
+                      min(v.z for v in record_positions)))
+        bb1 = Vector((max(v.x for v in record_positions),
+                      max(v.y for v in record_positions),
+                      max(v.z for v in record_positions)))
         f.write(b'BNDS')
         f.write(pack_fff(*bb0))
         f.write(pack_fff(*bb1))
 
         f.write(b'SKIN')
-        f.write(pack_I(len(mesh_obj.vertex_groups)))
-        for vg in mesh_obj.vertex_groups:
-            nb = vg.name.encode('ascii')
-            f.write(pack_B(len(nb)))
-            f.write(nb)
+        f.write(pack_I(len(skin_names)))
+        for name_bytes in skin_name_bytes:
+            f.write(pack_B(len(name_bytes)))
+            f.write(name_bytes)
 
         tri_start = 0
         for mi in active_material_indices:
@@ -1845,16 +2851,16 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
             if needs_alpha:
                 mesh_flags |= MESH_FLAG_ALPHA
             f.write(pack_I(mesh_flags))
-            mtl_name = mat_name + '.mtl'
-            f.write(pack_B(len(mtl_name)))
-            f.write(mtl_name.encode('ascii'))
+            mtl_name_bytes = material_name_bytes[mi]
+            f.write(pack_B(len(mtl_name_bytes)))
+            f.write(mtl_name_bytes)
             # ── 权重索引修复(问题4: 麻花+没脑袋根因) ──
             # 游戏约定: 权重字节 = 该 MESH palette 的槽位(0=无骨),
             # palette 值 = 1 基 SKIN 列表索引。zaomiao/medicgirl/vanilla 均如此
             # (zaomiao: byte4→palette[4]=5→SKIN[4]=foot1r; byte13→basis; byte24→head)。
             # 旧写法把 0 基 SKIN 索引直接当字节 + palette 缺前导 0 → 全错位。
             # 这里写全量 palette(所有骨骼 1 基 + 前导 0), 字节 = group+1, 与 vanilla 同款。
-            palette_full = [0] + [u + 1 for u in range(len(mesh_obj.vertex_groups))]
+            palette_full = [0] + [u + 1 for u in range(len(skin_names))]
             f.write(pack_B(len(palette_full)))
             f.write(bytes(palette_full))
 
@@ -1862,26 +2868,8 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
         f.write(pack_I(len(export_records)))
         f.write(pack_H(40))
         f.write(b'\x07\x00')
-        for source_index, uv in export_records:
-            v = mesh.vertices[source_index]
-            pos = mesh_to_ply @ v.co
-            f.write(pack_fff(pos.x, pos.y, pos.z))
-            gs = v_weights[source_index]
-            if not gs:
-                f.write(pack_f(1.0))
-                f.write(pack_BBBB(0, 0, 0, 0))
-            elif len(gs) == 1:
-                f.write(pack_f(1.0))
-                f.write(pack_BBBB(gs[0].group + 1, 0, 0, 0))
-            else:
-                w0 = gs[0].weight / (gs[0].weight + gs[1].weight)
-                f.write(pack_f(w0))
-                f.write(pack_BBBB(gs[0].group + 1, gs[1].group + 1, 0, 0))
-            n = (normal_to_ply @ game_normals[source_index]).normalized()
-            f.write(pack_fff(n.x, n.y, n.z))
-            u, vv = uv
-            f.write(pack_f(u))
-            f.write(pack_f(1.0 - vv))
+        for record in export_records:
+            f.write(record)
 
         f.write(b'INDX')
         f.write(pack_I(sum(len(tris_by_mat[mi])
@@ -1897,7 +2885,107 @@ def export_ply_game(filepath, mesh_obj, arm_obj, alpha_mats=None,
     return {'materials': written_materials,
             'triangles': written_triangles,
             'vertices': len(export_records),
-            'indices': written_triangles * 3}
+            'indices': written_triangles * 3,
+            'skin_names': [name.decode('ascii') for name in skin_name_bytes],
+            'record_sha256': hashlib.sha256(
+                b''.join(export_records)).hexdigest()}
+
+
+def export_ply_game_rigid(filepath, mesh_obj, arm_obj, material_indices,
+                          bone_name, alpha_mats=None, two_sided_mats=None):
+    """Write a static stride-32 PLY attached directly to an existing MDL bone."""
+    export_data = _build_game_rigid_export_data(
+        mesh_obj, arm_obj, material_indices, bone_name, log=True)
+    mesh = export_data['mesh']
+    records = export_data['records']
+    positions = export_data['positions']
+    tris_by_mat = export_data['tris_by_mat']
+    active_material_indices = export_data['active_material_indices']
+    reverse_winding = export_data['reverse_winding']
+    if len(records) > GAME_VERTEX_LIMIT:
+        raise RuntimeError(_(
+            "mowas2.err.unique_vertex_limit", vertices=len(records)))
+
+    material_name_bytes = {}
+    for material_index in active_material_indices:
+        material_name = mesh.materials[material_index].name
+        try:
+            encoded = (material_name + '.mtl').encode('ascii')
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(
+                'Rigid split material name is not ASCII: ' + material_name) from exc
+        if not encoded or len(encoded) >= 128:
+            raise RuntimeError(
+                'Rigid split material name has invalid length: ' + material_name)
+        material_name_bytes[material_index] = encoded
+
+    if positions:
+        xs = [position.x for position in positions]
+        ys = [position.y for position in positions]
+        zs = [position.z for position in positions]
+        bounds_min = (min(xs), min(ys), min(zs))
+        bounds_max = (max(xs), max(ys), max(zs))
+    else:
+        bounds_min = bounds_max = (0.0, 0.0, 0.0)
+
+    with open(filepath, 'wb') as handle:
+        handle.write(b'EPLY')
+        handle.write(b'BNDS')
+        handle.write(pack_fff(*bounds_min))
+        handle.write(pack_fff(*bounds_max))
+        triangle_start = 0
+        for material_index in active_material_indices:
+            triangles = tris_by_mat[material_index]
+            material_name = mesh.materials[material_index].name
+            handle.write(b'MESH')
+            handle.write(pack_I(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1))
+            handle.write(pack_I(triangle_start))
+            handle.write(pack_I(len(triangles)))
+            triangle_start += len(triangles)
+            flags = MESH_FLAG_LIGHT | MESH_FLAG_MATERIAL
+            if two_sided_mats and material_name in two_sided_mats:
+                flags |= MESH_FLAG_TWO_SIDED
+            needs_alpha = (material_name in alpha_mats
+                           if alpha_mats is not None
+                           else _material_needs_alpha_flag(material_name))
+            if needs_alpha:
+                flags |= MESH_FLAG_ALPHA
+            handle.write(pack_I(flags))
+            encoded = material_name_bytes[material_index]
+            handle.write(pack_B(len(encoded)))
+            handle.write(encoded)
+
+        handle.write(b'VERT')
+        handle.write(pack_I(len(records)))
+        handle.write(pack_H(32))
+        handle.write(b'\x07\x00')
+        for record in records:
+            handle.write(record)
+        handle.write(b'INDX')
+        triangle_count = sum(len(tris_by_mat[index])
+                             for index in active_material_indices)
+        handle.write(pack_I(triangle_count * 3))
+        for material_index in active_material_indices:
+            for triangle in tris_by_mat[material_index]:
+                if reverse_winding:
+                    handle.write(pack_HHH(
+                        triangle[0], triangle[2], triangle[1]))
+                else:
+                    handle.write(pack_HHH(
+                        triangle[0], triangle[1], triangle[2]))
+
+    written_materials = [mesh.materials[index].name
+                         for index in active_material_indices]
+    written_triangles = sum(len(tris_by_mat[index])
+                            for index in active_material_indices)
+    return {
+        'materials': written_materials,
+        'triangles': written_triangles,
+        'vertices': len(records),
+        'indices': written_triangles * 3,
+        'bone_name': bone_name,
+        'winding': 'reversed' if reverse_winding else 'reflected-native',
+    }
 
 
 def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
@@ -1923,7 +3011,8 @@ def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
     p += 4
     bone_count = struct.unpack_from('<I', data, p)[0]
     p += 4
-    require(bone_count < 4096, 'Exported PLY has an invalid SKIN count')
+    require(bone_count <= 254, 'Exported PLY has an invalid SKIN count')
+    parsed_skin_names = []
     for _index in range(bone_count):
         require(p < len(data), 'Exported PLY has a truncated SKIN name')
         name_len = data[p]
@@ -1931,10 +3020,11 @@ def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
         require(0 < name_len < 128 and p + name_len <= len(data),
                 'Exported PLY has an invalid SKIN name')
         try:
-            data[p:p + name_len].decode('ascii')
+            skin_name = data[p:p + name_len].decode('ascii')
         except UnicodeDecodeError as exc:
             raise RuntimeError(
                 'Exported PLY has a non-ASCII SKIN name: ' + filepath) from exc
+        parsed_skin_names.append(skin_name)
         p += name_len
 
     rows = []
@@ -1960,6 +3050,10 @@ def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
         p += 1
         require(p + palette_count <= len(data),
                 'Exported PLY has a truncated MESH palette')
+        palette = data[p:p + palette_count]
+        expected_palette = bytes(range(bone_count + 1))
+        require(palette == expected_palette,
+                'Exported PLY MESH palette differs from full 1-based SKIN map')
         p += palette_count
         rows.append({
             'name': name[:-4], 'fvf': fvf, 'tri_start': tri_start,
@@ -1984,6 +3078,17 @@ def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
             'Exported PLY INDX byte count does not reach EOF: ' + filepath)
     indices = (struct.unpack_from('<%dH' % index_count, data, index_pos + 8)
                if index_count else ())
+    expected_skin_names = expected_written.get('skin_names')
+    if (expected_skin_names is not None
+            and parsed_skin_names != list(expected_skin_names)):
+        raise RuntimeError(
+            'Exported PLY SKIN order differs from the writer result')
+    expected_record_sha = expected_written.get('record_sha256')
+    if expected_record_sha is not None:
+        record_bytes = data[vert_pos + 12:index_pos]
+        if hashlib.sha256(record_bytes).hexdigest() != expected_record_sha:
+            raise RuntimeError(
+                'Exported PLY VERT records differ from the immutable payload')
 
     parsed_materials = [row['name'] for row in rows]
     expected_materials = list(expected_written.get('materials', ()))
@@ -2063,6 +3168,102 @@ def _validate_exported_ply_contract(filepath, out_sub, hidden_mats,
           % (len(rows), expected_start, vert_count, index_count))
     return {'meshes': len(rows), 'triangles': expected_start,
             'vertices': vert_count, 'indices': index_count}
+
+
+def _validate_exported_rigid_ply_contract(
+        filepath, out_sub, alpha_mats, two_sided_mats, expected_written):
+    """Verify the static stride-32 contract used by automatic split parts."""
+    with open(filepath, 'rb') as handle:
+        data = handle.read()
+
+    def require(condition, message):
+        if not condition:
+            raise RuntimeError(message + ': ' + filepath)
+
+    require(data[:4] == b'EPLY', 'Rigid split PLY has no EPLY header')
+    require(data[4:8] == b'BNDS' and len(data) >= 32,
+            'Rigid split PLY has no valid BNDS block')
+    position = 32
+    require(data[position:position + 4] != b'SKIN',
+            'Rigid split PLY unexpectedly contains SKIN')
+    rows = []
+    while data[position:position + 4] == b'MESH':
+        position += 4
+        require(position + 17 <= len(data),
+                'Rigid split PLY has a truncated MESH')
+        fvf, triangle_start, triangle_count, flags = struct.unpack_from(
+            '<IIII', data, position)
+        position += 16
+        name_length = data[position]
+        position += 1
+        require(0 < name_length < 128
+                and position + name_length <= len(data),
+                'Rigid split PLY has an invalid material name')
+        name = data[position:position + name_length].decode('ascii')
+        position += name_length
+        require(name.endswith('.mtl'),
+                'Rigid split PLY material lacks .mtl')
+        rows.append({
+            'name': name[:-4], 'fvf': fvf,
+            'tri_start': triangle_start, 'tri_count': triangle_count,
+            'flags': flags,
+        })
+
+    require(data[position:position + 4] == b'VERT'
+            and position + 12 <= len(data),
+            'Rigid split PLY has no valid VERT block')
+    vertex_count = struct.unpack_from('<I', data, position + 4)[0]
+    stride = struct.unpack_from('<H', data, position + 8)[0]
+    require(stride == 32 and data[position + 10:position + 12] == b'\x07\x00',
+            'Rigid split PLY has an unexpected VERT layout')
+    index_position = position + 12 + vertex_count * stride
+    require(index_position + 8 <= len(data)
+            and data[index_position:index_position + 4] == b'INDX',
+            'Rigid split PLY has no valid INDX block')
+    index_count = struct.unpack_from('<I', data, index_position + 4)[0]
+    require(index_position + 8 + index_count * 2 == len(data),
+            'Rigid split PLY INDX does not reach EOF')
+    indices = (struct.unpack_from('<%dH' % index_count,
+                                  data, index_position + 8)
+               if index_count else ())
+
+    require([row['name'] for row in rows]
+            == list(expected_written.get('materials', ())),
+            'Rigid split PLY material order differs from writer result')
+    expected_fvf = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1
+    expected_start = 0
+    for row in rows:
+        require(row['fvf'] == expected_fvf,
+                'Rigid split PLY has an unexpected FVF')
+        require(row['tri_start'] == expected_start,
+                'Rigid split PLY has a non-contiguous triangle span')
+        expected_start += row['tri_count']
+        require(os.path.isfile(os.path.join(
+                    out_sub, row['name'] + '.mtl')),
+                'Rigid split PLY references a missing MTL')
+        expected_flags = MESH_FLAG_LIGHT | MESH_FLAG_MATERIAL
+        if row['name'] in alpha_mats:
+            expected_flags |= MESH_FLAG_ALPHA
+        if row['name'] in two_sided_mats:
+            expected_flags |= MESH_FLAG_TWO_SIDED
+        require(row['flags'] == expected_flags,
+                'Rigid split PLY has unexpected MESH flags')
+
+    require(expected_start == expected_written.get('triangles'),
+            'Rigid split PLY triangle count differs from writer result')
+    require(vertex_count == expected_written.get('vertices'),
+            'Rigid split PLY vertex count differs from writer result')
+    require(index_count == expected_written.get('indices')
+            == expected_start * 3,
+            'Rigid split PLY index count differs from writer result')
+    require(not indices or max(indices) < vertex_count,
+            'Rigid split PLY contains an out-of-range index')
+    require(len(set(indices)) == vertex_count,
+            'Rigid split PLY contains unreferenced VERT records')
+    print('[ply-contract:rigid] meshes=%d triangles=%d vertices=%d indices=%d'
+          % (len(rows), expected_start, vertex_count, index_count))
+    return {'meshes': len(rows), 'triangles': expected_start,
+            'vertices': vertex_count, 'indices': index_count}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5467,31 +6668,14 @@ def _protected_region_verts(me, arm=None, protect_face=True,
     return protect, info
 
 
-def _uv_split_count_sim(me):
-    """在 mesh 副本上真实执行与 uv_seam_split 相同的 UV 拆分, 返回拆分后顶点数。
+def _indexed_export_vertex_count(mesh_obj, arm_obj, skip_mats=None):
+    """Return the exact final-record count used by the single-PLY writer.
 
-    用副本仿真保证与真实 uv_seam_split 完全一致 —— KK 类模型 ~77% 的边是
-    UV seam, split_edges 连锁分裂使最终顶点数 ≫ (顶点,UV) 组合数,
-    (顶点,UV) 组合公式不可靠。减面循环用它做 u16 顶点硬约束的判据。
+    This is read-only: UV, normal and weight boundaries are represented by the
+    serialized record key instead of destructive ``split_edges`` operations.
     """
-    import bmesh as bm_mod
-    tmp = me.copy()
-    bm = bm_mod.new()
-    bm.from_mesh(tmp)
-    uvl = bm.loops.layers.uv.active
-    if uvl is None:
-        n = len(bm.verts)
-    else:
-        seams = [e for e in bm.edges if len(e.link_loops) == 2
-                 and e.link_loops[0][uvl].uv != e.link_loops[1][uvl].uv]
-        bm_mod.ops.split_edges(bm, edges=seams)
-        n = len(bm.verts)
-    bm.free()
-    try:
-        bpy.data.meshes.remove(tmp)
-    except Exception:
-        pass
-    return n
+    return _game_export_vertex_count(
+        mesh_obj, arm_obj, skip_mats=skip_mats)
 
 
 def depoke_tight_clothing(mesh, margin=None):
@@ -5694,8 +6878,8 @@ def depoke_tight_clothing(mesh, margin=None):
     return moved
 
 
-def decimate_global(mesh, target_faces=21000, arm=None,
-                    protect_face=True, protect_tight=True):
+def decimate_global(mesh, target_faces=None, arm=None,
+                    protect_face=True, protect_tight=True, skip_mats=None):
     """E6.18+: 全局 COLLAPSE 减面 (skill v2 原方案) —— 替代分离-减面-合并。
 
     分离方案 (decimate_to_target, E6.11) 在 KK 类模型 (非流形边多/重复顶点多)
@@ -5711,7 +6895,7 @@ def decimate_global(mesh, target_faces=21000, arm=None,
           * 脸/五官完全不变 (不再出现脸上减面三角);
           * 紧身衣物壳零位移 → 不再因减面位移戳进皮肤 (修破皮);
        arm 传入目标骨架用于几何头部兜底 (材质没匹配脸时)。
-    4. 全局 COLLAPSE 迭代减到 target (u16 索引 → 总顶点 ≤65535 ⟺ 面 ≤~21845)。
+    4. 全局 COLLAPSE 迭代，直到面数目标和最终唯一属性记录 ≤65535 同时满足。
 
     返回最终面数。适用于所有模型 (老 MMD 模型同样有效)。
     """
@@ -5719,6 +6903,9 @@ def decimate_global(mesh, target_faces=21000, arm=None,
     # 1. 多用户 data → 单用户 (幽灵共享引用, users 计数不可靠)
     mesh.data = mesh.data.copy()
     me = mesh.data
+    if target_faces is None:
+        target_faces = len(me.polygons)
+    target_faces = max(1, int(target_faces))
 
     # 2. 预清理: 重复顶点 (KK 模型大量 1e-6 近距对) + 删孤立/退化几何
     bm = bm_mod.new()
@@ -5766,7 +6953,7 @@ def decimate_global(mesh, target_faces=21000, arm=None,
         return vg
 
     # 3. 全局 COLLAPSE 迭代 (data 已单用户, 不再复制)
-    #    E6.25: 硬约束 = 面数 ≤ target 且"真实 UV 拆分(副本仿真)"顶点 ≤ 65535
+    #    硬约束 = 面数 ≤ target 且最终 40-byte 属性记录 ≤ 65535
     #    (u16 索引上限)。收敛检测: 连续 2 轮面数不再下降 → 保护集逐级降级
     #    (脸周 1 环 → 紧身衣物壳), 尽量达成目标。
     UV_LIMIT = 65535
@@ -5803,13 +6990,14 @@ def decimate_global(mesh, target_faces=21000, arm=None,
     stall = 0
     while guard < 20:
         if f <= target_faces:
-            est = _uv_split_count_sim(me)
-            print('[decimate] faces %d <= target %d | uv-split(sim) %d (limit %d)'
+            est = _indexed_export_vertex_count(mesh, arm, skip_mats=skip_mats)
+            print('[decimate] faces %d <= target %d | indexed records %d (limit %d)'
                   % (f, target_faces, est, UV_LIMIT))
             if est <= UV_LIMIT:
                 break
-            # 面数达标但拆分后超限 → 继续微减 (每轮 ~5%)
-            ratio = 0.95
+            # 面数达标但最终属性记录仍超限：按实际超限比例做最小减面，
+            # 额外留 0.5% 缓冲，避免固定 5% 对临界模型过度处理。
+            ratio = max(0.5, min(0.995, (UV_LIMIT / est) * 0.995))
         else:
             ratio = max(0.3, (target_faces / max(1, f)) ** 0.5)
         bpy.ops.object.modifier_add(type='DECIMATE')
@@ -5863,8 +7051,8 @@ def decimate_global(mesh, target_faces=21000, arm=None,
               % n_poke)
     except Exception as _e:
         print('[decimate] 破皮修复跳过 (%r)' % _e)
-    est_final = _uv_split_count_sim(me)
-    print('[decimate] final: %d faces, uv-split(sim) %d (limit %d)'
+    est_final = _indexed_export_vertex_count(mesh, arm, skip_mats=skip_mats)
+    print('[decimate] final: %d faces, indexed records %d (limit %d)'
           % (f, est_final, UV_LIMIT))
     return f
 
@@ -5881,8 +7069,8 @@ def decimate_to_target(mesh, target_faces=21845, hand_ratio=0.7,
     - 手部 (palm*/hand_rot1* 顶点组的面, 含手指): 单独减面到 hand_ratio
       —— 实测旧版手部 3920→943 面 (76% 被削) = 手指被削/手掌塌陷根因;
     - 手铐 (acs_m_hand_cuffs): 小配件, 完全保护;
-    - 主体: COLLAPSE 减面到 target 余量 (u16 索引全局单块 VERT/INDX
-      → 总顶点 ≤65535 ⟺ 面 ≤~21845);
+    - 主体: COLLAPSE 减面到 target 余量；单块 VERT/INDX 仍按最终唯一
+      位置/权重/法线/UV 记录检查 u16 上限 65535；
     - 合并 + 边界吸附 (snap_dist) + remove_doubles(1e-7)。
 
     分离顺序 (关键): separate(type='SELECTED') 会把全部选中面放进同一个
@@ -6057,7 +7245,7 @@ def decimate_to_target(mesh, target_faces=21845, hand_ratio=0.7,
             print('[decimate] body after ratio %.3f: %d (target %d)' % (r, f, body_target))
         guard += 1
     # E6.18: KK 类模型非流形边多 (千咲 24822 条) → COLLAPSE 有减面极限 (~3万面),
-    #     即使达不到 target_faces 也接受 (顶点硬限 65535 由 uv_seam_split 后检查)。
+    #     即使达不到 target_faces 也接受 (最终属性记录的 u16 硬限随后检查)。
     print('[decimate] body final:', f, '(target', body_target, ', KK limit ~30k)')
 
     # 3) 合并 + 边界吸附去重
@@ -6115,22 +7303,6 @@ def decimate_to_target(mesh, target_faces=21845, hand_ratio=0.7,
         pass
     print('[decimate] stats:', stats)
     return len(me.polygons)
-
-
-def uv_seam_split(mesh):
-    """按 UV seam 拆分顶点（游戏 per-vertex 格式要求每顶点唯一 UV）。"""
-    import bmesh as bm_mod
-    me = mesh.data
-    bm = bm_mod.new()
-    bm.from_mesh(me)
-    uvl = bm.loops.layers.uv.active
-    seams = [e for e in bm.edges if len(e.link_loops) == 2
-             and e.link_loops[0][uvl].uv != e.link_loops[1][uvl].uv]
-    bm_mod.ops.split_edges(bm, edges=seams)
-    bm.to_mesh(me)
-    bm.free()
-    me.update()
-    return len(me.vertices)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -6214,68 +7386,431 @@ def _reimport_source(pmx_path, keep_tgt):
     for o in list(bpy.data.objects):
         if o.type == 'MESH':
             bpy.data.objects.remove(o, do_unlink=True)
-    src, mesh = import_pmx(pmx_path)
+    snapshot = _effective_mmd_import_snapshot(bpy.context.scene)
+    src, mesh = import_pmx(
+        pmx_path,
+        preset_name=snapshot['preset'],
+        preset_settings=snapshot['settings'],
+        preset_path=snapshot['preset_path'],
+        preset_sha256=snapshot['preset_sha256'])
     root = src.parent if src.parent else src
     return src, mesh, root
 
 
 def resolve_scene():
-    """源=骨骼最多的骨架；目标=带 gem2_world_mats 的 GEM2 骨架；网格=绑在源上的 mesh。
-
-    健壮化（2026 面板化）：允许 1 个骨架（只有源）+ 已冻结/未绑定网格的中间状态，
-    报错信息改为面向普通用户的中文提示。"""
-    arms = sorted([o for o in bpy.context.scene.objects if o.type == 'ARMATURE'],
-                  key=lambda a: len(a.data.bones))
+    """Resolve source, destination and mesh strictly within the active scene."""
+    scene = bpy.context.scene
+    scene_objects = list(scene.objects)
+    arms = sorted([obj for obj in scene_objects if obj.type == 'ARMATURE'],
+                  key=lambda arm: len(arm.data.bones))
     if not arms:
         raise RuntimeError(_("mowas2.err.scene_no_armature"))
-    tagged_targets = [a for a in arms if a.get('gem2_world_mats')]
-    named_target = bpy.data.objects.get('skin_Armature')
-    tgt = (named_target if named_target in tagged_targets
-           else (tagged_targets[0] if tagged_targets else None))
+    tagged_targets = [arm for arm in arms if arm.get('gem2_world_mats')]
+    props = getattr(scene, 'mowas2_props', None)
+    requested_path = _human_rest_path(getattr(props, 'mdl_path', ''))
+    path_targets = [arm for arm in tagged_targets
+                    if requested_path and _human_rest_armature_path(arm) == requested_path]
+    named_target = next((obj for obj in scene_objects
+                         if obj.name == 'skin_Armature'), None)
+    tgt = (path_targets[0] if path_targets else
+           (named_target if named_target in tagged_targets else
+            (tagged_targets[0] if tagged_targets else None)))
+
+    converted = [obj for obj in scene_objects
+                 if obj.type == 'MESH'
+                 and _human_rest_conversion_marked(obj)]
+    active = bpy.context.view_layer.objects.active
+    mesh = active if active in converted else None
+    if mesh is None and converted:
+        selected = [obj for obj in converted if obj.select_get()]
+        if len(selected) == 1:
+            mesh = selected[0]
+        elif len(converted) == 1:
+            mesh = converted[0]
     src = None
-    if len(arms) >= 2:
+    if mesh is not None:
+        metadata = _human_rest_conversion_metadata(mesh)
+        target_name = metadata.get('destination_armature', '')
+        source_name = metadata.get('source_armature', '')
+        target_by_meta = next((obj for obj in scene_objects
+                               if obj.name == target_name
+                               and obj.type == 'ARMATURE'), None)
+        source_by_meta = next((obj for obj in scene_objects
+                               if obj.name == source_name
+                               and obj.type == 'ARMATURE'), None)
+        if target_by_meta is not None:
+            tgt = target_by_meta
+        if source_by_meta is not None:
+            src = source_by_meta
+
+    # Human conversion keeps a converted duplicate in the same scene for
+    # comparison. PMX commands should prefer the untouched source mesh when it
+    # is available; otherwise the explicit guard below rejects the converted
+    # result instead of mutating its normalized destination rest.
+    if mesh is not None and mesh in converted:
+        untouched = [obj for obj in scene_objects
+                     if obj.type == 'MESH'
+                     and not _human_rest_conversion_marked(obj)]
+        bound_untouched = [obj for obj in untouched
+                           if src is not None and any(
+                               mod.type == 'ARMATURE' and mod.object is src
+                               for mod in obj.modifiers)]
+        selected_untouched = [obj for obj in untouched if obj.select_get()]
+        mesh = (active if active in untouched else
+                (max(bound_untouched, key=lambda obj: len(obj.data.vertices))
+                 if bound_untouched else
+                 (max(selected_untouched, key=lambda obj: len(obj.data.vertices))
+                  if selected_untouched else None)))
+
+    if src is None and len(arms) >= 2:
         tgt = tgt if tgt else arms[0]
-        candidates = [a for a in arms if a != tgt]
+        candidates = [arm for arm in arms if arm is not tgt]
         src = max(candidates, key=lambda arm: len(arm.data.bones))
-    elif len(arms) == 1:
+    elif src is None and len(arms) == 1:
         if tgt is None:
             raise RuntimeError(_("mowas2.err.scene_no_target"))
         src = arms[0]
-    mesh = None
-    if src is not None:
-        for o in bpy.data.objects:
-            if o.type == 'MESH':
-                for mod in o.modifiers:
-                    if mod.type == 'ARMATURE' and mod.object == src:
-                        mesh = o
-                        break
-                if mesh:
-                    break
+
+    if mesh is None and src is not None:
+        bound = [obj for obj in scene_objects if obj.type == 'MESH'
+                 and not _human_rest_conversion_marked(obj)
+                 and any(mod.type == 'ARMATURE' and mod.object is src
+                         for mod in obj.modifiers)]
+        if bound:
+            mesh = max(bound, key=lambda obj: len(obj.data.vertices))
     if mesh is None:
-        # 已冻结/已绑定到目标的网格：找最大的 MESH（排除刚体小件）
-        big = [o for o in bpy.data.objects if o.type == 'MESH'
-               and len(o.data.vertices) > 500]
+        # 已冻结/已绑定到目标的网格：找当前场景中最大的未转换 MESH。
+        big = [obj for obj in scene_objects if obj.type == 'MESH'
+               and not _human_rest_conversion_marked(obj)
+               and len(obj.data.vertices) > 500]
         if big:
-            mesh = max(big, key=lambda o: len(o.data.vertices))
+            mesh = max(big, key=lambda obj: len(obj.data.vertices))
+    if mesh is None and converted:
+        # Leave the converted result visible to the explicit guard in the PMX
+        # entry points when no untouched comparison mesh exists.
+        mesh = max(converted, key=lambda obj: len(obj.data.vertices))
     if mesh is None:
         raise RuntimeError(_("mowas2.err.scene_no_mesh"))
     root = src.parent if src and src.parent else src
     return src, tgt, mesh, root
 
 
-def import_pmx(filepath, types=None):
-    """步骤1：mmd_tools 导入 PMX。返回 (arm_obj, mesh_obj)。"""
-    types = types or {'MESH', 'ARMATURE', 'PHYSICS', 'DISPLAY', 'MORPHS'}
-    bpy.ops.mmd_tools.import_model(
-        filepath=filepath,
-        types=types,
-        scale=1.0,
-        rename_bones=True,
-        dictionary='INTERNAL',
-        clean_model=True,
-        remove_doubles=True,
-        fix_ik_links=True,
-    )
+_MMD_PIPELINE_PRESET = '__PIPELINE__'
+_MMD_RECOMMENDED_PRESET = 'gem2_goh_mowas2_lossless'
+_MMD_SCENE_PRESET_KEY = 'gem2_mmd_import_preset'
+_MMD_SCENE_SETTINGS_KEY = 'gem2_mmd_import_settings_json'
+_MMD_SCENE_PATH_KEY = 'gem2_mmd_import_preset_path'
+_MMD_SCENE_SHA256_KEY = 'gem2_mmd_import_preset_sha256'
+_MMD_IMPORT_FIELDS = {
+    'types', 'scale', 'clean_model', 'remove_doubles',
+    'import_adduv2_as_vertex_colors', 'fix_bone_order', 'fix_ik_links',
+    'ik_loop_factor', 'apply_bone_fixed_axis', 'rename_bones',
+    'use_underscore', 'dictionary', 'bone_disp_mode', 'use_mipmap',
+    'sph_blend_factor', 'spa_blend_factor', 'log_level', 'save_log',
+}
+_MMD_IMPORT_DEFAULTS = {
+    # Match the shared operator preset. Source seam vertices and custom normals
+    # stay intact; the GEM2 exporter performs exact final-record deduplication.
+    'types': ['ARMATURE', 'MESH'],
+    'scale': 1.0,
+    'clean_model': True,
+    'remove_doubles': False,
+    'import_adduv2_as_vertex_colors': False,
+    'fix_bone_order': True,
+    'fix_ik_links': True,
+    'ik_loop_factor': 5,
+    'apply_bone_fixed_axis': False,
+    'rename_bones': True,
+    'use_underscore': True,
+    'dictionary': 'INTERNAL',
+    'bone_disp_mode': 'OCTAHEDRAL',
+    'use_mipmap': True,
+    'sph_blend_factor': 1.0,
+    'spa_blend_factor': 1.0,
+    'log_level': 'INFO',
+    'save_log': False,
+}
+_mmd_preset_item_cache = []
+
+
+def _mmd_preset_directories():
+    directories = []
+    try:
+        directories.extend(bpy.utils.preset_paths(
+            os.path.join('operator', 'mmd_tools.import_model')))
+    except Exception:
+        pass
+    scripts_dir = bpy.utils.user_resource('SCRIPTS')
+    config_dir = bpy.utils.user_resource('CONFIG')
+    for root in (scripts_dir, config_dir):
+        if root:
+            directories.append(os.path.join(
+                root, 'presets', 'operator', 'mmd_tools.import_model'))
+    output = []
+    for value in directories:
+        path = os.path.abspath(value)
+        if path not in output and os.path.isdir(path):
+            output.append(path)
+    return output
+
+
+def list_mmd_import_presets():
+    output = {}
+    for directory in _mmd_preset_directories():
+        try:
+            names = sorted(os.listdir(directory), key=str.casefold)
+        except OSError:
+            continue
+        for filename in names:
+            if filename.endswith('.py'):
+                output.setdefault(filename[:-3], os.path.join(directory, filename))
+    return output
+
+
+def _mmd_import_preset_items(_self, context):
+    global _mmd_preset_item_cache
+    paths = list_mmd_import_presets()
+    ordered = []
+    recommended_path = paths.get(_MMD_RECOMMENDED_PRESET)
+    if recommended_path:
+        ordered.append((_MMD_RECOMMENDED_PRESET,
+                        'GEM2 GOH + MOWAS2 Lossless', recommended_path))
+    ordered.append((_MMD_PIPELINE_PRESET, 'Pipeline defaults',
+                    'Built-in lossless PMX pipeline settings'))
+    for name, path in sorted(paths.items(), key=lambda item: item[0].casefold()):
+        if name != _MMD_RECOMMENDED_PRESET:
+            ordered.append((name, name, path))
+    scene = getattr(context, 'scene', None)
+    captured_name = str(scene.get(_MMD_SCENE_PRESET_KEY, '') if scene else '')
+    known = {item[0] for item in ordered}
+    if captured_name == 'Pipeline defaults':
+        captured_name = _MMD_PIPELINE_PRESET
+    if captured_name and captured_name not in known:
+        ordered.append((captured_name, captured_name,
+                        'Captured immutable preset snapshot'))
+    _mmd_preset_item_cache = ordered
+    return _mmd_preset_item_cache
+
+
+def _validate_mmd_import_settings(values):
+    if not isinstance(values, dict):
+        raise ValueError('MMD import settings must be a mapping')
+    unknown = sorted(set(values) - _MMD_IMPORT_FIELDS)
+    if unknown:
+        raise ValueError('Unsupported MMD import settings: ' + ', '.join(unknown))
+    settings = dict(_MMD_IMPORT_DEFAULTS)
+    settings.update(values)
+    types = settings.get('types')
+    allowed_types = {'MESH', 'ARMATURE', 'PHYSICS', 'DISPLAY', 'MORPHS'}
+    if not isinstance(types, (list, tuple, set)) or not types:
+        raise ValueError('MMD import types must be a nonempty collection')
+    types = sorted(set(types))
+    if any(not isinstance(value, str) or value not in allowed_types
+           for value in types):
+        raise ValueError('MMD import types contain an unsupported value')
+    settings['types'] = types
+    bool_fields = {
+        'clean_model', 'remove_doubles', 'import_adduv2_as_vertex_colors',
+        'fix_bone_order', 'fix_ik_links', 'apply_bone_fixed_axis',
+        'rename_bones', 'use_underscore', 'use_mipmap', 'save_log',
+    }
+    for field in bool_fields:
+        if type(settings[field]) is not bool:
+            raise ValueError(field + ' must be true or false')
+    for field, minimum, maximum in (
+            ('scale', 0.0001, 100.0),
+            ('sph_blend_factor', -100.0, 100.0),
+            ('spa_blend_factor', -100.0, 100.0)):
+        value = settings[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(float(value)) \
+                or not minimum <= float(value) <= maximum:
+            raise ValueError(field + ' is outside its supported range')
+        settings[field] = float(value)
+    loop_factor = settings['ik_loop_factor']
+    if isinstance(loop_factor, bool) or not isinstance(loop_factor, int) \
+            or not 1 <= loop_factor <= 100:
+        raise ValueError('ik_loop_factor must be an integer from 1 to 100')
+    for field in ('dictionary', 'bone_disp_mode', 'log_level'):
+        value = settings[field]
+        if not isinstance(value, str) or not value:
+            raise ValueError(field + ' must be a nonempty identifier')
+    if settings['log_level'] not in {'DEBUG', 'INFO', 'WARNING', 'ERROR'}:
+        raise ValueError('Unsupported MMD import log level')
+    if settings['bone_disp_mode'] not in {
+            'OCTAHEDRAL', 'STICK', 'BBONE', 'ENVELOPE', 'WIRE'}:
+        raise ValueError('Unsupported MMD bone display mode')
+    return settings
+
+
+def _validate_pipeline_mmd_invariants(settings):
+    """Reject presets that irreversibly damage the GEM2 source contract."""
+    problems = []
+    required_types = {'MESH', 'ARMATURE'}
+    if not required_types.issubset(set(settings['types'])):
+        problems.append('types must include MESH and ARMATURE')
+    if not settings['clean_model']:
+        problems.append('clean_model must be enabled')
+    if settings['remove_doubles']:
+        problems.append('remove_doubles must be disabled (preserve UV/normal seams)')
+    if not settings['fix_bone_order']:
+        problems.append('fix_bone_order must be enabled')
+    if not settings['fix_ik_links']:
+        problems.append('fix_ik_links must be enabled')
+    if settings['apply_bone_fixed_axis']:
+        problems.append('apply_bone_fixed_axis must be disabled')
+    if not settings['rename_bones']:
+        problems.append('rename_bones must be enabled')
+    if not settings['use_underscore']:
+        problems.append('use_underscore must be enabled (Arm_L/Leg_L contract)')
+    if settings['dictionary'] != 'INTERNAL':
+        problems.append("dictionary must be 'INTERNAL'")
+    if problems:
+        raise ValueError(
+            'Selected MMD preset is incompatible with the GEM2 pipeline: '
+            + '; '.join(problems)
+            + '. Select GEM2 GOH + MOWAS2 Lossless.')
+    return settings
+
+
+def _parse_mmd_import_preset(path):
+    with open(path, 'rb') as handle:
+        raw = handle.read(64 * 1024 + 1)
+    if len(raw) > 64 * 1024:
+        raise ValueError('MMD import preset is unexpectedly large')
+    try:
+        tree = ast.parse(raw.decode('utf-8-sig'), filename=path, mode='exec')
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise ValueError('Invalid MMD import preset: ' + path) from exc
+    if sum(1 for _ in ast.walk(tree)) > 500:
+        raise ValueError('MMD import preset is too complex')
+    values = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == 'op'):
+            continue
+        if target.attr not in _MMD_IMPORT_FIELDS:
+            raise ValueError('Unsupported MMD preset property: ' + target.attr)
+        try:
+            values[target.attr] = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError) as exc:
+            raise ValueError('MMD preset property is not a literal: '
+                             + target.attr) from exc
+    if not values:
+        raise ValueError('MMD import preset has no supported settings')
+    return _validate_mmd_import_settings(values), raw
+
+
+def mmd_import_preset_snapshot(preset_name):
+    preset_name = str(preset_name or _MMD_PIPELINE_PRESET)
+    if preset_name in (_MMD_PIPELINE_PRESET, 'Pipeline defaults'):
+        settings = _validate_mmd_import_settings(_MMD_IMPORT_DEFAULTS)
+        return {
+            'preset': 'Pipeline defaults', 'preset_path': '',
+            'preset_sha256': '', 'settings': settings,
+        }
+    path = list_mmd_import_presets().get(preset_name)
+    if not path:
+        raise FileNotFoundError('MMD import preset not found: ' + preset_name)
+    settings, raw = _parse_mmd_import_preset(path)
+    return {
+        'preset': preset_name, 'preset_path': path,
+        'preset_sha256': hashlib.sha256(raw).hexdigest(),
+        'settings': settings,
+    }
+
+
+def _normalized_mmd_preset_name(value):
+    value = str(value or _MMD_PIPELINE_PRESET)
+    return 'Pipeline defaults' if value == _MMD_PIPELINE_PRESET else value
+
+
+def _validated_mmd_import_snapshot(value):
+    if not isinstance(value, dict):
+        raise ValueError('MMD import snapshot must be a mapping')
+    preset = _normalized_mmd_preset_name(value.get('preset'))
+    preset_path = str(value.get('preset_path') or '')
+    preset_sha256 = str(value.get('preset_sha256') or '')
+    if preset_sha256 and (len(preset_sha256) != 64
+                          or any(ch not in '0123456789abcdefABCDEF'
+                                 for ch in preset_sha256)):
+        raise ValueError('MMD import preset SHA-256 is invalid')
+    return {
+        'preset': preset,
+        'preset_path': preset_path,
+        'preset_sha256': preset_sha256.casefold(),
+        'settings': _validate_mmd_import_settings(value.get('settings')),
+    }
+
+
+def _store_mmd_import_snapshot(scene, snapshot):
+    snapshot = _validated_mmd_import_snapshot(snapshot)
+    scene[_MMD_SCENE_PRESET_KEY] = snapshot['preset']
+    scene[_MMD_SCENE_PATH_KEY] = snapshot['preset_path']
+    scene[_MMD_SCENE_SHA256_KEY] = snapshot['preset_sha256']
+    scene[_MMD_SCENE_SETTINGS_KEY] = json.dumps(
+        snapshot['settings'], ensure_ascii=False, sort_keys=True)
+    return snapshot
+
+
+def _stored_mmd_import_snapshot(scene):
+    stored = scene.get(_MMD_SCENE_SETTINGS_KEY, '')
+    if not stored:
+        return None
+    try:
+        settings = json.loads(stored)
+        return _validated_mmd_import_snapshot({
+            'preset': scene.get(_MMD_SCENE_PRESET_KEY, 'Pipeline defaults'),
+            'preset_path': scene.get(_MMD_SCENE_PATH_KEY, ''),
+            'preset_sha256': scene.get(_MMD_SCENE_SHA256_KEY, ''),
+            'settings': settings,
+        })
+    except (TypeError, ValueError):
+        return None
+
+
+def _effective_mmd_import_snapshot(scene, props=None):
+    props = props or getattr(scene, 'mowas2_props', None)
+    selected = _normalized_mmd_preset_name(
+        getattr(props, 'mmd_import_preset', _MMD_PIPELINE_PRESET))
+    stored = _stored_mmd_import_snapshot(scene)
+    if stored is not None and stored['preset'] == selected:
+        return stored
+    return _store_mmd_import_snapshot(
+        scene, mmd_import_preset_snapshot(selected))
+
+
+def import_pmx(filepath, types=None, preset_name=None, preset_settings=None,
+               preset_path='', preset_sha256=''):
+    """步骤1：按已验证的 MMD Tools 预设导入 PMX。返回 (arm_obj, mesh_obj)。"""
+    scene = bpy.context.scene
+    if preset_settings is None and preset_name is None:
+        snapshot = _effective_mmd_import_snapshot(scene)
+    elif preset_settings is None:
+        snapshot = _validated_mmd_import_snapshot(
+            mmd_import_preset_snapshot(preset_name))
+    else:
+        snapshot = _validated_mmd_import_snapshot({
+            'preset': preset_name or 'Captured settings',
+            'preset_path': preset_path,
+            'preset_sha256': preset_sha256,
+            'settings': preset_settings,
+        })
+    settings = dict(snapshot['settings'])
+    if types is not None:
+        settings['types'] = sorted(set(types))
+    snapshot['settings'] = _validate_pipeline_mmd_invariants(
+        _validate_mmd_import_settings(settings))
+    snapshot = _store_mmd_import_snapshot(scene, snapshot)
+    settings = snapshot['settings']
+    operator_settings = dict(settings)
+    operator_settings['types'] = set(operator_settings['types'])
+    operator_settings['filepath'] = filepath
+    bpy.ops.mmd_tools.import_model(**operator_settings)
     arms = [o for o in bpy.data.objects if o.type == 'ARMATURE']
     arm = max(arms, key=lambda a: len(a.data.bones)) if arms else None
     big = [o for o in bpy.data.objects if o.type == 'MESH'
@@ -6287,52 +7822,648 @@ def import_pmx(filepath, types=None):
     return arm, mesh
 
 
-def rebuild_frame0_rest(tgt):
-    """帧0 rest 重建（E6 Step A 的轻量版）。
+def _legacy_pose_is_identity(tgt):
+    identity = Matrix.Identity(4)
+    for pose_bone in tgt.pose.bones:
+        delta = max(abs(float(pose_bone.matrix_basis[row][column]
+                          - identity[row][column]))
+                    for row in range(4) for column in range(4))
+        if delta > 1.0e-5:
+            raise RuntimeError(
+                'Cannot rebuild PMX rest while target is posed: ' + tgt.name)
 
-    .mdl 骨架 rest 在 y 上镜像（basis mirrorY = diag(1,-1,1) 空间），而 .anm 帧0
-    （绑定空间，gb_com 官方人模同款）是**无镜像空间**。手动流程每次先跑 Step A 把
-    skin_Armature rest 重建为帧0（foot1l y=+2.17），新流程直接用 mdl rest
-    （foot1l y=-2.165）→ is_source_mirrored 误判 → 对齐 180° 消歧转反 → 前后反。
 
-    这里对骨架整体做 Y 翻转（世界坐标左乘 diag(1,-1,1)），等价于去掉 basis mirrorY，
-    验证与帧0参照偏差：body 0.0024 / hand1l 0.054 / palm3r 0.03 / foot1l 0.16（medicgirl
-    与 idle_stand_1 动画文件的微小资产差异，可接受）。打上 mowas2_frame0_rest 标记，
-    避免重复翻转（重复左乘会翻回去）。
+def _legacy_rest_from_raw_metadata(tgt):
+    """Restore the historical PMX display rest from retained MDL data.
+
+    Some files were opened with the short-lived normalized human display
+    implementation. Their raw matrices are still intact, so reconstruct the
+    exact old ``mdl_io`` edit-bone state before applying the legacy Y mirror.
     """
-    if tgt.get('mowas2_frame0_rest'):
-        return
-    MIR = Matrix.Diagonal((1.0, -1.0, 1.0, 1.0))
-    bpy.context.view_layer.objects.active = tgt
-    bpy.ops.object.mode_set(mode='EDIT')
+    raw_value = tgt.get('gem2_world_mats')
+    parent_value = tgt.get('gem2_parents')
+    if not raw_value or not parent_value:
+        raise RuntimeError(
+            'Cannot restore legacy PMX rest without raw MDL metadata: '
+            + tgt.name)
     try:
-        for eb in tgt.data.edit_bones:
-            eb.matrix = MIR @ eb.matrix
+        decoded_matrices = json.loads(raw_value)
+        parents = json.loads(parent_value)
+        if not isinstance(decoded_matrices, dict) or not isinstance(parents, dict):
+            raise TypeError('raw MDL metadata is not a bone mapping')
+        raw_matrices = {name: Matrix(value)
+                        for name, value in decoded_matrices.items()}
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            'Invalid raw MDL metadata on target: ' + tgt.name) from exc
+
+    edit_names = {bone.name for bone in tgt.data.bones}
+    raw_names = set(raw_matrices)
+    if edit_names != raw_names:
+        missing = sorted(raw_names - edit_names)
+        extra = sorted(edit_names - raw_names)
+        raise RuntimeError(
+            'Target bones do not match retained MDL metadata (%s; %s): %s'
+            % ('missing=' + ','.join(missing) if missing else 'no missing',
+               'extra=' + ','.join(extra) if extra else 'no extra', tgt.name))
+    unknown_parent_keys = set(parents) - raw_names
+    missing_parent_keys = raw_names - set(parents)
+    if unknown_parent_keys or missing_parent_keys:
+        details = []
+        if missing_parent_keys:
+            details.append('missing=' + ','.join(sorted(missing_parent_keys)))
+        if unknown_parent_keys:
+            details.append('unknown=' + ','.join(sorted(unknown_parent_keys)))
+        raise RuntimeError(
+            'Raw MDL parent map does not cover target bones (%s): %s'
+            % (';'.join(details), tgt.name))
+    for name, parent_name in parents.items():
+        if parent_name and parent_name not in raw_names:
+            raise RuntimeError(
+                'Raw MDL parent is missing for %s: %s' % (name, parent_name))
+
+    if getattr(tgt, 'mode', 'OBJECT') != 'OBJECT':
+        raise RuntimeError(
+            'Cannot rebuild PMX rest outside Object mode: ' + tgt.name)
+    _legacy_pose_is_identity(tgt)
+    previous_active = bpy.context.view_layer.objects.active
+    previous_selected = list(bpy.context.selected_objects)
+    rest_module = _human_rest_module()
+    try:
+        for obj in previous_selected:
+            obj.select_set(False)
+        tgt.select_set(True)
+        bpy.context.view_layer.objects.active = tgt
+        rest_module._mode_set_for_armature(tgt, 'EDIT')
+        try:
+            edit_bones = tgt.data.edit_bones
+            for edit_bone in edit_bones:
+                edit_bone.use_connect = False
+                edit_bone.parent = None
+            for name, matrix in raw_matrices.items():
+                edit_bones[name].matrix = matrix
+            for name, parent_name in parents.items():
+                if parent_name and parent_name != name:
+                    edit_bones[name].parent = edit_bones[parent_name]
+                    edit_bones[name].use_connect = False
+            # Match mdl_io.build_armature(preserve_rest_matrix=False) exactly.
+            for edit_bone in edit_bones:
+                if edit_bone.children:
+                    edit_bone.tail = list(edit_bone.children)[0].head.copy()
+                else:
+                    x_axis = edit_bone.matrix.col[0].xyz
+                    if x_axis.length < 0.001:
+                        x_axis = Vector((1.0, 0.0, 0.0))
+                    edit_bone.tail = (edit_bone.head
+                                      + x_axis.normalized() * 0.2)
+            mirror = Matrix.Diagonal((1.0, -1.0, 1.0, 1.0))
+            for edit_bone in edit_bones:
+                edit_bone.matrix = mirror @ edit_bone.matrix
+        finally:
+            rest_module._mode_set_for_armature(tgt, 'OBJECT')
+        bpy.context.view_layer.update()
     finally:
-        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            if tgt.mode != 'OBJECT':
+                rest_module._mode_set_for_armature(tgt, 'OBJECT')
+        except (AttributeError, RuntimeError):
+            pass
+        for obj in list(bpy.context.selected_objects):
+            try:
+                obj.select_set(False)
+            except (ReferenceError, RuntimeError):
+                pass
+        for obj in previous_selected:
+            try:
+                if bpy.context.scene.objects.get(obj.name) is not None:
+                    obj.select_set(True)
+            except (AttributeError, ReferenceError, RuntimeError):
+                pass
+        try:
+            bpy.context.view_layer.objects.active = (
+                previous_active if previous_active is not None
+                and bpy.context.scene.objects.get(previous_active.name) is not None
+                else None)
+        except (AttributeError, ReferenceError, RuntimeError):
+            bpy.context.view_layer.objects.active = None
+
+
+def _legacy_mirror_current_rest(tgt):
+    """Apply the original uniform Y mirror to a fresh target."""
+    if getattr(tgt, 'mode', 'OBJECT') != 'OBJECT':
+        raise RuntimeError(
+            'Cannot rebuild PMX rest outside Object mode: ' + tgt.name)
+    _legacy_pose_is_identity(tgt)
+    previous_active = bpy.context.view_layer.objects.active
+    previous_selected = list(bpy.context.selected_objects)
+    rest_module = _human_rest_module()
+    mirror = Matrix.Diagonal((1.0, -1.0, 1.0, 1.0))
+    try:
+        for obj in previous_selected:
+            obj.select_set(False)
+        tgt.select_set(True)
+        bpy.context.view_layer.objects.active = tgt
+        rest_module._mode_set_for_armature(tgt, 'EDIT')
+        try:
+            for edit_bone in tgt.data.edit_bones:
+                edit_bone.matrix = mirror @ edit_bone.matrix
+        finally:
+            rest_module._mode_set_for_armature(tgt, 'OBJECT')
+        bpy.context.view_layer.update()
+    finally:
+        try:
+            if tgt.mode != 'OBJECT':
+                rest_module._mode_set_for_armature(tgt, 'OBJECT')
+        except (AttributeError, RuntimeError):
+            pass
+        for obj in list(bpy.context.selected_objects):
+            try:
+                obj.select_set(False)
+            except (ReferenceError, RuntimeError):
+                pass
+        for obj in previous_selected:
+            try:
+                if bpy.context.scene.objects.get(obj.name) is not None:
+                    obj.select_set(True)
+            except (AttributeError, ReferenceError, RuntimeError):
+                pass
+        try:
+            bpy.context.view_layer.objects.active = (
+                previous_active if previous_active is not None
+                and bpy.context.scene.objects.get(previous_active.name) is not None
+                else None)
+        except (AttributeError, ReferenceError, RuntimeError):
+            bpy.context.view_layer.objects.active = None
+
+
+def rebuild_frame0_rest(tgt):
+    """Restore the historical PMX/GFA frame-0 rest convention.
+
+    This is deliberately the legacy path: ``mdl_io`` creates raw MDL bones,
+    tails are aimed at their first child, and one uniform Y mirror is applied.
+    Human rest conversion uses ``rebuild_human_display_rest`` instead; the two
+    display conventions are not interchangeable for PMX alignment/GFA. A
+    human-only target marker is rejected here rather than silently remirrored.
+    """
+    # Only a target carrying both the human marker and the legacy marker is
+    # treated as a transiently polluted PMX target. A human-only marker is an
+    # intentional normalized display contract and must never be remirrored.
+    if (not tgt.get('gem2_human_rest_display_rest')
+            and tgt.get('gem2_frame0_rest_mode') == 'human_normalized'):
+        raise RuntimeError(
+            'Target has an unstable human rest mode marker without the stable '
+            'display marker; refusing to mirror it: ' + tgt.name)
+    if tgt.get('gem2_human_rest_display_rest'):
+        if not tgt.get('mowas2_frame0_rest'):
+            raise RuntimeError(
+                'Target is an intentional human normalized-rest rig; refusing '
+                'to replace it with the legacy PMX display: ' + tgt.name)
+        _legacy_rest_from_raw_metadata(tgt)
+        for key in ('gem2_human_rest_display_rest',
+                    'gem2_human_rest_display_version',
+                    'gem2_human_rest_raw_rest',
+                    'gem2_frame0_rest_mode'):
+            try:
+                del tgt[key]
+            except KeyError:
+                pass
+    elif tgt.get('mowas2_frame0_rest'):
+        return {'legacy': True, 'reused': True, 'bones': len(tgt.data.bones)}
+    elif tgt.get('gem2_frame0_rest_mode'):
+        raise RuntimeError(
+            'Target has an unstable rest mode marker without a stable display '
+            'marker; refusing to mirror it: ' + tgt.name)
+    else:
+        _legacy_mirror_current_rest(tgt)
     tgt['mowas2_frame0_rest'] = True
-    print('[frame0] target rest rebuilt (Y-mirror removed):', tgt.name)
+    print('[frame0] target rest rebuilt (legacy Y-mirror):', tgt.name)
+    return {'legacy': True, 'reused': False, 'bones': len(tgt.data.bones)}
 
 
-def build_target_from_mdl(mdl_path, name='skin_Armature'):
-    """步骤2：从 GOH 皮肤 .mdl 构建目标骨架（GFA 定制 58 骨）。
-    返回 armature 对象（带 gem2_world_mats 等属性）。
-    rebuild_frame0_rest 必须保留 —— GOH 皮肤 mdl 的 rest 同样在 basis
-    mirrorY 空间 (实测: 不 rebuild 时左右手反, hand_rot1l 落到 -Y 侧),
-    与 MOWAS2 同款约定, 需要 Y 镜像转正。"""
+def rebuild_human_display_rest(tgt, mark_raw=False):
+    """Opt-in normalized display rest for the dedicated human converter."""
+    rest = _human_rest_module()
+    graph = rest.graph_from_armature(tgt)
+    report = rest.apply_human_display_rest(tgt, graph, mark_raw=mark_raw)
+    print('[human] target rest rebuilt from normalized MDL:',
+          tgt.name, 'max_delta=', report.get('max_delta', 0.0))
+    return report
+
+
+def _ensure_legacy_frame0_rest(tgt):
+    """Make a PMX pipeline target use the historical display convention."""
+    if tgt is None:
+        return None
+    if (tgt.get('gem2_human_rest_display_rest')
+            or tgt.get('gem2_frame0_rest_mode')
+            or not tgt.get('mowas2_frame0_rest')):
+        return rebuild_frame0_rest(tgt)
+    return {'legacy': True, 'reused': True, 'bones': len(tgt.data.bones)}
+
+
+def build_target_from_mdl(mdl_path, name='skin_Armature',
+                          preserve_rest_matrix=False, rebuild_display=False):
+    """Build a target with an explicit legacy or human display convention.
+
+    ``rebuild_display=False`` is the PMX/GFA-compatible default and applies
+    the historical uniform Y mirror.  Human rest conversion passes
+    ``preserve_rest_matrix=True, rebuild_display=True`` to opt into normalized
+    Blender display frames while raw MDL metadata remains authoritative.
+    """
     from . import mdl_io
     with open(mdl_path, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()
     root_bones, mesh_parent_name = mdl_io.parse_mdl(content)
-    tgt = mdl_io.build_armature('skin', root_bones, mesh_parent_name, mdl_path)
+    tgt = mdl_io.build_armature(
+        'skin', root_bones, mesh_parent_name, mdl_path,
+        preserve_rest_matrix=preserve_rest_matrix)
     tgt.name = name
-    rebuild_frame0_rest(tgt)   # 必需: 转正左右手 (mirrorY → 帧0 空间)
+    if rebuild_display:
+        rebuild_human_display_rest(tgt, mark_raw=True)
+    else:
+        rebuild_frame0_rest(tgt)
     tgt.select_set(True)
     bpy.context.view_layer.objects.active = tgt
     return tgt
 
 
-def _ensure_bundled_target_variant(src, tgt, mesh, root, pmx_path=None):
+def _human_rest_module():
+    from . import human_rest_convert
+    return human_rest_convert
+
+
+def _human_rest_same_object(left, right):
+    if left is right:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        return int(left.as_pointer()) == int(right.as_pointer())
+    except (AttributeError, TypeError, ValueError, ReferenceError):
+        return False
+
+
+def _human_rest_conversion_marked(obj):
+    """Treat even an empty/corrupt conversion record as a guarded result."""
+    try:
+        return obj is not None and obj.get('gem2_human_rest_conversion') is not None
+    except (AttributeError, ReferenceError, RuntimeError):
+        return False
+
+
+def _human_rest_path(value):
+    if not value:
+        return ''
+    return os.path.normcase(os.path.abspath(bpy.path.abspath(str(value))))
+
+
+def _human_rest_armature_path(armature):
+    return _human_rest_path(armature.get('gem2_mdl_path') if armature else '')
+
+
+def _human_rest_unique_name(base):
+    if bpy.data.objects.get(base) is None:
+        return base
+    index = 1
+    while bpy.data.objects.get('%s.%03d' % (base, index)) is not None:
+        index += 1
+    return '%s.%03d' % (base, index)
+
+
+def _human_rest_mesh_candidates(scene, source_armature=None):
+    candidates = []
+    for obj in scene.objects:
+        if obj.type != 'MESH' or not obj.vertex_groups:
+            continue
+        arm_mods = [modifier for modifier in obj.modifiers
+                    if modifier.type == 'ARMATURE' and modifier.object]
+        if source_armature is not None:
+            if any(_human_rest_same_object(modifier.object, source_armature)
+                   for modifier in arm_mods):
+                candidates.append(obj)
+        elif arm_mods:
+            candidates.append(obj)
+    return sorted(candidates, key=lambda obj: (-len(obj.data.vertices), obj.name.casefold()))
+
+
+def _human_rest_convert_available(context):
+    try:
+        scene = context.scene
+        props = getattr(scene, 'mowas2_props', None)
+        path = _human_rest_path(getattr(props, 'mdl_path', ''))
+        if not path or not os.path.isfile(path):
+            return False
+        active = getattr(context.view_layer.objects, 'active', None)
+        mesh_hint = active if active is not None and active.type == 'MESH' else None
+        if mesh_hint is not None:
+            armature_modifiers = [modifier for modifier in mesh_hint.modifiers
+                                  if modifier.type == 'ARMATURE'
+                                  and modifier.object]
+            if len(armature_modifiers) != 1:
+                return False
+        source = _human_rest_find_source(scene, mesh_hint)
+        human_rest = _human_rest_module()
+        if (source.mode != 'OBJECT'
+                or not human_rest._pose_is_identity(source)):
+            return False
+        meshes = _human_rest_find_meshes(scene, source, active=active)
+        if any(mesh.mode != 'OBJECT' or mesh.data.users > 1
+               or sum(1 for modifier in mesh.modifiers
+                      if modifier.type == 'ARMATURE') != 1
+               for mesh in meshes):
+            return False
+        return True
+    except Exception:
+        # Blender calls poll while contexts and partially-registered scene
+        # properties are changing; an unavailable button is safer than a UI
+        # exception or an implicit all-mesh conversion.
+        return False
+
+
+def _human_rest_export_available(context):
+    try:
+        mesh = _human_rest_converted_mesh(context.scene)
+        _human_rest_target_for_mesh(context.scene, mesh)
+        return True
+    except Exception:
+        return False
+
+
+def _human_rest_find_source(scene, mesh=None, explicit_name=''):
+    if explicit_name:
+        source = next((obj for obj in scene.objects
+                       if obj.name == explicit_name), None)
+        if source is None or source.type != 'ARMATURE':
+            raise RuntimeError('Human rest source armature not found: ' + explicit_name)
+        return source
+    if mesh is not None:
+        targets = [modifier.object for modifier in mesh.modifiers
+                   if modifier.type == 'ARMATURE' and modifier.object
+                   and modifier.object.type == 'ARMATURE']
+        unique = []
+        for target in targets:
+            if not any(_human_rest_same_object(target, item)
+                       for item in unique):
+                unique.append(target)
+        if len(unique) == 1:
+            return unique[0]
+        metadata = _human_rest_conversion_metadata(mesh)
+        previous_destination = metadata.get('destination_armature', '')
+        if previous_destination:
+            tagged = next((obj for obj in scene.objects
+                           if obj.name == previous_destination
+                           and obj.type == 'ARMATURE'
+                           and obj.get('gem2_world_mats')), None)
+            if tagged is not None and not unique:
+                return tagged
+            if tagged is not None and any(
+                    _human_rest_same_object(tagged, item) for item in unique):
+                return tagged
+        if len(unique) > 1:
+            tagged = [arm for arm in unique if arm.get('gem2_world_mats')]
+            if len(tagged) == 1:
+                return tagged[0]
+            raise RuntimeError('Mesh has multiple possible source armatures')
+    selected = [obj for obj in scene.objects
+                if obj.type == 'ARMATURE' and obj.select_get()]
+    tagged = [obj for obj in selected if obj.get('gem2_world_mats')]
+    if len(tagged) == 1:
+        return tagged[0]
+    tagged = [obj for obj in scene.objects
+              if obj.type == 'ARMATURE' and obj.get('gem2_world_mats')]
+    if len(tagged) == 1:
+        return tagged[0]
+    raise RuntimeError('Select a GEM2 human mesh or source armature')
+
+
+def _human_rest_mesh_bound_to(mesh, armature):
+    return any(modifier.type == 'ARMATURE'
+               and _human_rest_same_object(modifier.object, armature)
+               for modifier in mesh.modifiers)
+
+
+def _human_rest_find_meshes(scene, source_armature, explicit_name='', active=None):
+    if explicit_name:
+        mesh = next((obj for obj in scene.objects
+                     if obj.name == explicit_name), None)
+        if mesh is None or mesh.type != 'MESH':
+            raise RuntimeError('Human rest mesh not found: ' + explicit_name)
+        if not _human_rest_mesh_bound_to(mesh, source_armature):
+            raise RuntimeError(
+                'Human rest mesh is not bound to the selected source armature: '
+                + explicit_name)
+        return [mesh]
+    if active is not None and active.type == 'MESH':
+        if _human_rest_mesh_bound_to(active, source_armature):
+            return [active]
+    selected = [obj for obj in scene.objects
+                if obj.type == 'MESH' and obj.select_get()
+                and _human_rest_mesh_bound_to(obj, source_armature)]
+    if selected:
+        return sorted(selected, key=lambda obj: obj.name.casefold())
+    meshes = _human_rest_mesh_candidates(scene, source_armature)
+    if not meshes:
+        raise RuntimeError('No mesh bound to the selected source armature')
+    if len(meshes) > 1:
+        raise RuntimeError(
+            'Select one or more human meshes bound to the source armature')
+    return meshes
+
+
+def _human_rest_target_usable(armature):
+    """Accept raw rigs and repairable native legacy human targets."""
+    if armature is None or armature.type != 'ARMATURE':
+        return False
+    # A legacy marker without raw MDL data is a pure PMX display rig and cannot
+    # be repaired safely. Native human .blend files may retain the marker while
+    # keeping the complete raw contract; the conversion path rebuilds them.
+    if (armature.get('mowas2_frame0_rest')
+            and not armature.get('gem2_human_rest_display_rest')):
+        from . import human_rest_convert
+        return human_rest_convert.has_raw_mdl_contract(armature)
+    return True
+
+
+def _human_rest_find_target(scene, mdl_path, source_armature):
+    expected = _human_rest_path(mdl_path)
+    candidates = [obj for obj in scene.objects
+                  if obj.type == 'ARMATURE'
+                  and not _human_rest_same_object(obj, source_armature)
+                  and obj.get('gem2_world_mats')
+                  and _human_rest_target_usable(obj)
+                  and _human_rest_armature_path(obj) == expected]
+    if not candidates:
+        return None
+    selected = [obj for obj in candidates if obj.select_get()]
+    return (selected[0] if selected else
+            sorted(candidates, key=lambda obj: obj.name.casefold())[0])
+
+
+def _human_rest_duplicate_mesh(mesh, scene):
+    data = mesh.data.copy()
+    duplicate = mesh.copy()
+    duplicate.data = data
+    duplicate.name = _human_rest_unique_name(mesh.name + '_converted')
+    scene.collection.objects.link(duplicate)
+    duplicate.matrix_world = mesh.matrix_world.copy()
+    duplicate.select_set(False)
+    return duplicate
+
+
+def _human_rest_restore_selection(scene, selected, active):
+    try:
+        for obj in scene.objects:
+            obj.select_set(False)
+        for obj in selected:
+            if scene.objects.get(obj.name) is not None:
+                obj.select_set(True)
+        if active is not None and scene.objects.get(active.name) is not None:
+            bpy.context.view_layer.objects.active = active
+        else:
+            bpy.context.view_layer.objects.active = None
+    except (AttributeError, ReferenceError, RuntimeError):
+        pass
+
+
+def convert_human_rest_scene(scene, mdl_path, mesh_name='',
+                             source_armature_name='', target_armature_name='',
+                             duplicate_mesh=False, exact_reverse=True):
+    """Convert imported GEM2 human meshes without invoking the PMX pipeline."""
+    if not mdl_path or not os.path.isfile(bpy.path.abspath(str(mdl_path))):
+        raise RuntimeError('Destination human MDL not found: ' + str(mdl_path))
+    original_active = bpy.context.view_layer.objects.active
+    original_selected = [obj for obj in scene.objects if obj.select_get()]
+    active = original_active
+    mesh_hint = (next((obj for obj in scene.objects if obj.name == mesh_name), None)
+                 if mesh_name else
+                 (active if active and active.type == 'MESH'
+                  and scene.objects.get(active.name) is not None else None))
+    source = _human_rest_find_source(scene, mesh_hint, source_armature_name)
+    meshes = _human_rest_find_meshes(scene, source, mesh_name, active=active)
+    destination_path = _human_rest_path(mdl_path)
+    source_path = _human_rest_armature_path(source)
+    if source_path and destination_path == source_path:
+        raise RuntimeError(
+            'Mesh is already bound to the destination armature: ' + source.name)
+    for mesh in meshes:
+        metadata = _human_rest_conversion_metadata(mesh)
+        if (_human_rest_path(metadata.get('destination_mdl', ''))
+                == destination_path
+                and metadata.get('destination_armature') == source.name):
+            raise RuntimeError(
+                'Mesh is already in the destination rest space: ' + mesh.name)
+    module = _human_rest_module()
+    # A legacy PMX target is a different display contract. Do not silently
+    # rewrite it when a user invokes the human converter on the wrong scene.
+    module._assert_human_display_source(source, 'Source armature')
+    # Imported PLY coordinates are already in normalized model space. Repair
+    # raw source bones from metadata before any mesh math so Pose Mode and the
+    # affine transfer use the same rest frame.
+    source_graph = module.graph_from_armature(source)
+    target = None
+    created_target = False
+    if target_armature_name:
+        target = next((obj for obj in scene.objects
+                       if obj.name == target_armature_name), None)
+        if target is None or target.type != 'ARMATURE':
+            raise RuntimeError('Human rest target armature not found: ' + target_armature_name)
+        if _human_rest_same_object(target, source):
+            raise RuntimeError('Human rest source and target armatures must differ')
+        if not _human_rest_target_usable(target):
+            raise RuntimeError(
+                'Target armature uses a frame-0 display rest; build a raw-rest target')
+        target_path = _human_rest_armature_path(target)
+        if target_path != _human_rest_path(mdl_path):
+            raise RuntimeError(
+                'Target armature MDL does not match destination: ' + target.name)
+    else:
+        target = _human_rest_find_target(scene, mdl_path, source)
+    if target is None:
+        target = build_target_from_mdl(
+            bpy.path.abspath(str(mdl_path)),
+            name=_human_rest_unique_name('skin_Armature'),
+            preserve_rest_matrix=True,
+            rebuild_display=True)
+        target['gem2_human_rest_raw_rest'] = True
+        created_target = True
+
+    # Existing targets may have been built by the old project-then-mirror
+    # implementation.  Rebuild from raw MDL data every time; the helper is
+    # idempotent and never overwrites gem2_world_mats.
+    target_graph = module.graph_from_armature(target)
+    source_display_report = module.apply_human_display_rest(
+        source, source_graph)
+    target_display_report = module.apply_human_display_rest(
+        target, target_graph, mark_raw=True)
+    target['gem2_human_rest_raw_rest'] = True
+
+    converted_meshes = []
+    originals = []
+    try:
+        for mesh in meshes:
+            if duplicate_mesh:
+                duplicate = _human_rest_duplicate_mesh(mesh, scene)
+                converted_meshes.append(duplicate)
+                originals.append(duplicate)
+            else:
+                converted_meshes.append(mesh)
+        route = _infer_export_route(str(mdl_path))
+        preferred_order = (module.skin_order_for_route(route)
+                           if route in {'GOH', 'MOWAS2'} else None)
+        report = module.convert_meshes(
+            converted_meshes, source, target,
+            source_graph=source_graph,
+            destination_graph=target_graph,
+            preferred_skin_order=preferred_order,
+            exact_reverse=exact_reverse,
+            _prepare_display=False)
+        report.update({
+            'source_display_max_delta': source_display_report.get('max_delta', 0.0),
+            'destination_display_max_delta': target_display_report.get('max_delta', 0.0),
+        })
+    except Exception:
+        if created_target and target is not None:
+            try:
+                data = target.data
+                bpy.data.objects.remove(target, do_unlink=True)
+                if data.users == 0:
+                    bpy.data.armatures.remove(data)
+            except (ReferenceError, RuntimeError):
+                pass
+        for duplicate in originals:
+            try:
+                data = duplicate.data
+                bpy.data.objects.remove(duplicate, do_unlink=True)
+                if data.users == 0:
+                    bpy.data.meshes.remove(data)
+            except (ReferenceError, RuntimeError):
+                pass
+        _human_rest_restore_selection(scene, original_selected, original_active)
+        raise
+
+    for obj in scene.objects:
+        obj.select_set(False)
+    for mesh in converted_meshes:
+        mesh.select_set(True)
+    bpy.context.view_layer.objects.active = converted_meshes[0]
+    try:
+        scene.mowas2_props.mdl_path = bpy.path.abspath(str(mdl_path))
+        inferred = _infer_export_route(mdl_path)
+        if inferred != 'CUSTOM':
+            scene.mowas2_props.export_route = inferred
+    except (AttributeError, RuntimeError):
+        pass
+    report.update({
+        'source_armature': source.name,
+        'destination_armature': target.name,
+        'mesh_names': [mesh.name for mesh in converted_meshes],
+        'duplicated': bool(duplicate_mesh),
+    })
+    return report
+
+
+def _ensure_bundled_target_variant(src, tgt, mesh, root, pmx_path=None,
+                                    force_short=False):
     """Keep the bundled target skeleton consistent with the long-arm toggle.
 
     Older scenes often keep ``samples/goh_skin.mdl`` even after the long-arm
@@ -6341,11 +8472,14 @@ def _ensure_bundled_target_variant(src, tgt, mesh, root, pmx_path=None):
     so fitting to it visibly recesses the hand into the forearm. Only replace
     the two known bundled templates; an explicitly selected custom MDL is never
     changed. Frozen meshes must be rebuilt from their PMX rather than stretched.
+    ``force_short`` is used by the explicit GOH route so programmatic callers
+    without registered scene properties still get the route reference target.
     """
     short_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               'samples', 'goh_skin.mdl')
     long_path = GOH_DEFAULT_MDL
-    desired = long_path if _goh_gfa_longarm() else short_path
+    desired = (short_path if force_short
+               else (long_path if _goh_gfa_longarm() else short_path))
     current = tgt.get('gem2_mdl_path') if tgt else None
     if not current:
         return src, tgt, mesh, root, False
@@ -6380,6 +8514,36 @@ def _ensure_bundled_target_variant(src, tgt, mesh, root, pmx_path=None):
     return src, tgt, mesh, root, True
 
 
+def _assert_legacy_pmx_scene(mesh, target=None):
+    """Keep PMX alignment from mutating a human-conversion scene."""
+    if _human_rest_conversion_marked(mesh):
+        raise RuntimeError(
+            'This mesh is a human-rest conversion result; use the dedicated '
+            'human export operator instead of PMX alignment')
+    if (target is not None
+            and target.get('gem2_human_rest_display_rest')
+            and not target.get('mowas2_frame0_rest')):
+        raise RuntimeError(
+            'The selected target uses the human normalized rest; use the '
+            'human conversion/export path instead of PMX alignment')
+    if target is None:
+        return
+    scene = bpy.context.scene
+    for candidate in scene.objects:
+        if candidate.type != 'MESH' \
+                or not _human_rest_conversion_marked(candidate):
+            continue
+        references_target = any(
+            modifier.type == 'ARMATURE'
+            and _human_rest_same_object(modifier.object, target)
+            for modifier in candidate.modifiers)
+        if references_target:
+            raise RuntimeError(
+                'The selected target armature is used by a human-rest '
+                'conversion result; export that result separately before '
+                'running PMX alignment')
+
+
 def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     """仅对齐：把源模型整体刚性拟合到目标骨架（头/身/腿摆好、贴地、手臂垂落）。
     不绑骨、不减面、不导出 —— 供面板【步骤3 摆好头身腿】使用。
@@ -6389,12 +8553,13 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     if not output_dir:
         output_dir = OUT_DEFAULT
     src, tgt, mesh, root = resolve_scene()
+    _assert_legacy_pmx_scene(mesh, tgt)
     src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
         src, tgt, mesh, root, pmx_path=pmx_path)
-    # 旧场景兼容：目标骨架若缺就绪标记 → 执行 rebuild (mirrorY 转正,
-    # GOH 皮肤 mdl 同款约定, 实测必需否则左右手反)。
-    if tgt is not None and not tgt.get('mowas2_frame0_rest'):
-        rebuild_frame0_rest(tgt)
+    # 旧场景兼容：PMX 管线始终使用历史 frame-0 显示约定；若场景曾被
+    # 临时 human-normalized 版本污染，从保留的 raw MDL 元数据恢复。
+    if tgt is not None:
+        _ensure_legacy_frame0_rest(tgt)
     if mesh.get('mowas2_frozen'):
         if _align_options_changed(mesh, src):
             if not pmx_path or not os.path.isfile(pmx_path):
@@ -6499,23 +8664,492 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     return snap
 
 
-def export_all(mesh, tgt, output_dir=None, skin_name='skin',
-               texture_format='TGA', nvtt_path=None, toon_shader=True):
-    """导出 ply/mdl/mtl，并按用户选择生成 TGA 或 DDS 贴图。
+def _route_target_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_export_route_target(export_route, target_mdl):
+    route = str(export_route or 'CUSTOM')
+    if route not in {'GOH', 'MOWAS2', 'CUSTOM'}:
+        raise ValueError('Unsupported export route: ' + route)
+    if route == 'CUSTOM':
+        return route
+    expected = GOH_ROUTE_MDL if route == 'GOH' else MOWAS2_ROUTE_MDL
+    if not target_mdl or not os.path.isfile(target_mdl):
+        raise FileNotFoundError('Route target MDL not found: ' + str(target_mdl))
+    if not os.path.isfile(expected):
+        raise FileNotFoundError('Bundled route reference not found: ' + expected)
+    same_path = os.path.normcase(os.path.abspath(target_mdl)) == \
+        os.path.normcase(os.path.abspath(expected))
+    if not same_path and _route_target_sha256(target_mdl) != _route_target_sha256(expected):
+        raise ValueError('%s route target does not match its reference skeleton' % route)
+    return route
+
+
+def _replace_direct_bone_volume_view(content, bone_name, ply_filename):
+    """Replace the direct VolumeView on one named bone, ignoring descendants."""
+    from .core import find_matching_brace
+
+    header = re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
+        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
+    matches = list(header.finditer(content))
+    if len(matches) != 1:
+        raise RuntimeError(
+            'Expected exactly one MDL bone %r, found %d'
+            % (bone_name, len(matches)))
+    bone_start = matches[0].start()
+    bone_end = find_matching_brace(content, bone_start)
+    if bone_end < 0:
+        raise RuntimeError('Unbalanced MDL bone block: ' + str(bone_name))
+
+    view_pattern = re.compile(
+        r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}', re.IGNORECASE)
+    direct_matches = []
+    depth = 0
+    in_string = False
+    escaped = False
+    index = bone_start
+    while index <= bone_end:
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char == '{':
+            if depth == 1:
+                match = view_pattern.match(content, index)
+                if match is not None and match.end() <= bone_end + 1:
+                    direct_matches.append(match)
+                    index = match.end()
+                    continue
+            depth += 1
+        elif char == '}':
+            depth -= 1
+        index += 1
+
+    if not direct_matches:
+        raise RuntimeError(
+            'Expected a direct VolumeView on MDL bone %r, found none'
+            % bone_name)
+    # The first direct view is the mesh parent's primary payload. Preserve any
+    # additional user-authored views; exact exporter-owned splitNN views are
+    # reconciled separately by entity basename before this replacement.
+    match = direct_matches[0]
+    start, end = match.span('filename')
+    return content[:start] + str(ply_filename) + content[end:]
+
+
+def _append_direct_bone_volume_view(content, bone_name, ply_filename):
+    """Append one direct VolumeView to an existing animation bone."""
+    from .core import find_matching_brace
+
+    filename = str(ply_filename)
+    if not filename or any(char in filename for char in ('"', '\r', '\n')):
+        raise ValueError('Invalid split VolumeView filename: ' + filename)
+    header = re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
+        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
+    matches = list(header.finditer(content))
+    if len(matches) != 1:
+        raise RuntimeError(
+            'Expected exactly one MDL split bone %r, found %d'
+            % (bone_name, len(matches)))
+    bone_start = matches[0].start()
+    bone_end = find_matching_brace(content, bone_start)
+    if bone_end < 0:
+        raise RuntimeError('Unbalanced MDL split bone block: ' + str(bone_name))
+
+    direct_views = 0
+    first_direct_child = None
+    view_pattern = re.compile(
+        r'\{\s*VolumeView\s+"[^"]*"\s*\}', re.IGNORECASE)
+    child_pattern = re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"',
+        re.IGNORECASE)
+    depth = 0
+    in_string = False
+    escaped = False
+    index = bone_start
+    while index <= bone_end:
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char == '{':
+            if depth == 1:
+                match = view_pattern.match(content, index)
+                if match is not None and match.end() <= bone_end + 1:
+                    direct_views += 1
+                    index = match.end()
+                    continue
+                if (first_direct_child is None
+                        and child_pattern.match(content, index) is not None):
+                    first_direct_child = index
+            depth += 1
+        elif char == '}':
+            depth -= 1
+        index += 1
+    if direct_views:
+        raise RuntimeError(
+            'Auto-split bone %r already owns %d direct VolumeView(s)'
+            % (bone_name, direct_views))
+
+    anchor = first_direct_child if first_direct_child is not None else bone_end
+    line_start = content.rfind('\n', 0, anchor) + 1
+    anchor_indent = content[line_start:anchor]
+    if anchor_indent.strip():
+        raise RuntimeError('Cannot determine MDL indentation for split bone: '
+                           + str(bone_name))
+    newline = '\r\n' if '\r\n' in content else '\n'
+    child_indent = (anchor_indent if first_direct_child is not None
+                    else anchor_indent + '\t')
+    insertion = (child_indent + '{VolumeView "' + filename + '"}'
+                 + newline)
+    return content[:line_start] + insertion + content[line_start:]
+
+
+def _direct_volume_view_matches(content, bone_name):
+    """Return one bone span and its direct VolumeView matches."""
+    from .core import find_matching_brace
+
+    header = re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
+        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
+    headers = list(header.finditer(content))
+    if len(headers) != 1:
+        raise RuntimeError(
+            'Expected exactly one MDL bone %r, found %d'
+            % (bone_name, len(headers)))
+    bone_start = headers[0].start()
+    bone_end = find_matching_brace(content, bone_start)
+    if bone_end < 0:
+        raise RuntimeError('Unbalanced MDL bone block: ' + str(bone_name))
+
+    view_pattern = re.compile(
+        r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}',
+        re.IGNORECASE)
+    direct_views = []
+    depth = 0
+    in_string = False
+    escaped = False
+    index = bone_start
+    while index <= bone_end:
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char == '{':
+            if depth == 1:
+                match = view_pattern.match(content, index)
+                if match is not None and match.end() <= bone_end + 1:
+                    direct_views.append(match)
+                    index = match.end()
+                    continue
+            depth += 1
+        elif char == '}':
+            depth -= 1
+        index += 1
+    return bone_start, bone_end, direct_views
+
+
+def _append_additional_direct_volume_view(content, bone_name, ply_filename):
+    """Append another skinned PLY view to the existing mesh-parent bone."""
+    filename = str(ply_filename)
+    if not filename or any(char in filename for char in ('"', '\r', '\n')):
+        raise ValueError('Invalid split VolumeView filename: ' + filename)
+    _bone_start, _bone_end, direct_views = _direct_volume_view_matches(
+        content, bone_name)
+    if not direct_views:
+        raise RuntimeError(
+            'Expected a base VolumeView on MDL mesh parent %r, found none'
+            % bone_name)
+    if any(match.group('filename').casefold() == filename.casefold()
+           for match in direct_views):
+        raise RuntimeError('Split VolumeView already exists: ' + filename)
+
+    # Append after the current final direct view so split01..splitNN retain their
+    # deterministic file/draw order across repeated insertions.
+    anchor = direct_views[-1]
+    line_start = content.rfind('\n', 0, anchor.start()) + 1
+    indent = content[line_start:anchor.start()]
+    if indent.strip():
+        raise RuntimeError(
+            'Cannot determine mesh-parent VolumeView indentation: '
+            + str(bone_name))
+    newline = '\r\n' if '\r\n' in content else '\n'
+    insertion = newline + indent + '{VolumeView "' + filename + '"}'
+    return content[:anchor.end()] + insertion + content[anchor.end():]
+
+
+def _append_skinned_split_carrier(content, mesh_parent_name, carrier_name,
+                                   ply_filename):
+    """Clone the main mesh-parent bone as a sibling skinned PLY carrier."""
+    from .core import find_matching_brace
+
+    source_name = str(mesh_parent_name)
+    carrier_name = str(carrier_name)
+    filename = str(ply_filename)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', carrier_name):
+        raise ValueError('Invalid split carrier bone name: ' + carrier_name)
+    if not filename or any(char in filename for char in ('"', '\r', '\n')):
+        raise ValueError('Invalid split VolumeView filename: ' + filename)
+
+    def bone_header(name):
+        return re.compile(
+            r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"(?P<name>'
+            + re.escape(name) + r')"', re.IGNORECASE)
+
+    source_matches = list(bone_header(source_name).finditer(content))
+    if len(source_matches) != 1:
+        raise RuntimeError(
+            'Expected exactly one MDL mesh-parent bone %r, found %d'
+            % (source_name, len(source_matches)))
+    if bone_header(carrier_name).search(content) is not None:
+        raise RuntimeError('MDL split carrier already exists: ' + carrier_name)
+
+    source_match = source_matches[0]
+    source_start = source_match.start()
+    source_end = find_matching_brace(content, source_start)
+    if source_end < 0:
+        raise RuntimeError('Unbalanced MDL mesh-parent block: ' + source_name)
+    source_block = content[source_start:source_end + 1]
+    relative_header_end = source_match.end() - source_start
+    if re.search(
+            r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"',
+            source_block[relative_header_end:], re.IGNORECASE):
+        raise RuntimeError(
+            'Cannot clone a mesh-parent carrier with child bones: '
+            + source_name)
+
+    name_start, name_end = source_match.span('name')
+    name_start -= source_start
+    name_end -= source_start
+    carrier_block = (source_block[:name_start] + carrier_name
+                     + source_block[name_end:])
+    carrier_block = _replace_direct_bone_volume_view(
+        carrier_block, carrier_name, filename)
+
+    line_start = content.rfind('\n', 0, source_start) + 1
+    indent = content[line_start:source_start]
+    if indent.strip():
+        raise RuntimeError(
+            'Cannot determine MDL mesh-parent indentation: ' + source_name)
+    newline = '\r\n' if '\r\n' in content else '\n'
+    insertion = newline + indent + carrier_block
+    return content[:source_end + 1] + insertion + content[source_end + 1:]
+
+
+def _strip_generated_split_carrier(content, mesh_parent_name):
+    """Remove an exact carrier clone made by the auto-split exporter."""
+    from .core import find_matching_brace
+
+    source_name = str(mesh_parent_name)
+    carrier_name = source_name + '_split01'
+
+    def bone_header(name):
+        return re.compile(
+            r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"(?P<name>'
+            + re.escape(name) + r')"', re.IGNORECASE)
+
+    carrier_matches = list(bone_header(carrier_name).finditer(content))
+    if not carrier_matches:
+        return content
+    if len(carrier_matches) != 1:
+        raise RuntimeError(
+            'Expected at most one generated split carrier %r, found %d'
+            % (carrier_name, len(carrier_matches)))
+    source_matches = list(bone_header(source_name).finditer(content))
+    if len(source_matches) != 1:
+        raise RuntimeError(
+            'Cannot verify split carrier without one mesh-parent bone %r'
+            % source_name)
+
+    def bone_block(match):
+        start = match.start()
+        end = find_matching_brace(content, start)
+        if end < 0:
+            raise RuntimeError('Unbalanced MDL bone block: ' + match.group('name'))
+        return start, end, content[start:end + 1]
+
+    source_start, source_end, source_block = bone_block(source_matches[0])
+    carrier_start, carrier_end, carrier_block = bone_block(carrier_matches[0])
+    between = content[source_end + 1:carrier_start]
+    if (source_start == carrier_start or source_end >= carrier_start
+            or between.strip()):
+        raise RuntimeError('Generated split carrier is not adjacent to the mesh parent')
+    nested_bone = re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"',
+        re.IGNORECASE)
+    if (nested_bone.search(source_block[source_matches[0].end() - source_start:])
+            or nested_bone.search(
+                carrier_block[carrier_matches[0].end() - carrier_start:])):
+        raise RuntimeError('Generated split carrier verification requires leaf bones')
+
+    view_pattern = re.compile(
+        r'(\{\s*VolumeView\s+")[^"]*("\s*\})', re.IGNORECASE)
+
+    def normalize(block, name):
+        header = bone_header(name)
+        normalized, header_count = header.subn('{bone "__carrier__"', block,
+                                               count=1)
+        normalized, view_count = view_pattern.subn(
+            r'\1__view__.ply\2', normalized)
+        if header_count != 1 or view_count != 1:
+            raise RuntimeError(
+                'Generated split carrier verification requires one direct view')
+        return normalized
+
+    if normalize(source_block, source_name) != normalize(carrier_block, carrier_name):
+        raise RuntimeError(
+            'MDL bone %r exists but is not an exact generated carrier clone'
+            % carrier_name)
+
+    line_start = content.rfind('\n', 0, carrier_start) + 1
+    if content[line_start:carrier_start].strip():
+        raise RuntimeError(
+            'Cannot determine generated split carrier indentation')
+    remove_end = carrier_end + 1
+    if content.startswith('\r\n', remove_end):
+        remove_end += 2
+    elif content.startswith('\n', remove_end):
+        remove_end += 1
+    return content[:line_start] + content[remove_end:]
+
+
+def _strip_generated_direct_split_volume_view(
+        content, mesh_parent_name, entity_name=None):
+    """Remove only this entity's generated direct split PLY views."""
+    if not entity_name:
+        return content
+    _bone_start, _bone_end, direct_views = _direct_volume_view_matches(
+        content, mesh_parent_name)
+    split_pattern = re.compile(
+        re.escape(str(entity_name)) + r'_split\d+\.ply', re.IGNORECASE)
+    generated = [
+        match for match in direct_views
+        if split_pattern.fullmatch(match.group('filename'))
+    ]
+    for match in reversed(generated):
+        line_start = content.rfind('\n', 0, match.start()) + 1
+        if content[line_start:match.start()].strip():
+            raise RuntimeError(
+                'Cannot determine generated direct split view indentation')
+        remove_end = match.end()
+        if content.startswith('\r\n', remove_end):
+            remove_end += 2
+        elif content.startswith('\n', remove_end):
+            remove_end += 1
+        content = content[:line_start] + content[remove_end:]
+    return content
+
+
+def _strip_generated_auto_split_attachments(
+        content, mesh_parent_name, entity_name=None):
+    """Remove only attachments that can be proven to be plug-in generated."""
+    try:
+        content = _strip_generated_split_carrier(content, mesh_parent_name)
+    except RuntimeError as exc:
+        # A similarly named user bone is not exporter-owned. Preserve it instead
+        # of making an unrelated single-file export impossible.
+        print('[auto-split] preserving unverified legacy carrier:', exc)
+    return _strip_generated_direct_split_volume_view(
+        content, mesh_parent_name, entity_name=entity_name)
+
+
+_ACTIVE_ENTITY_EXPORTS = set()
+
+
+def _missing_export_artifact_in_exception(exc, out_sub):
+    """Return the missing generated path when an exception chain contains one."""
+    output_key = os.path.normcase(os.path.abspath(out_sub))
+    current = exc
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, FileNotFoundError) and current.filename:
+            missing_path = os.path.abspath(str(current.filename))
+            try:
+                inside_output = os.path.commonpath(
+                    (output_key, os.path.normcase(missing_path))) == output_key
+            except ValueError:
+                inside_output = False
+            if inside_output:
+                return missing_path
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _export_all_once(mesh, tgt, output_dir=None, skin_name='skin',
+                     texture_format='TGA', nvtt_path=None, toon_shader=True,
+                     export_route=None, auto_split_over_limit=False,
+                     split_record_limit=GAME_VERTEX_LIMIT,
+                     split_plan_hint=None):
+    """导出 PLY/MDL/MTL，并按用户选择生成 TGA 或 DDS 贴图。
 
     skin_name: 游戏 Entity 资源名；输出 <name>/<name>.def/.mdl/.ply。
+    auto_split_over_limit: GOH/MOWAS2 按记录上限将冻结数据无损分区到多个蒙皮 PLY。
+    split_record_limit: 每个 PLY 的用户自定义最终记录上限，硬上限为 65535。
+    split_plan_hint: run_full 在同一调用中生成的冻结规划，避免重复遍历大网格。
 
-    E6.29 抽为独立函数 —— 网格已完成绑定/减面/UV拆分后, 可不重跑全流程
+    E6.29 抽为独立函数 —— 网格已完成绑定/可选减面后, 可不重跑全流程
     单独重做导出 (bind_and_transfer 不幂等: 重复调用会叠第二个 Armature
     修改器且按 PMX 组名读不到权重 → 已处理网格上严禁重跑 run_full)。
     """
     if not output_dir:
         output_dir = OUT_DEFAULT
+    split_record_limit = int(split_record_limit)
+    if split_record_limit < 3 or split_record_limit > GAME_VERTEX_LIMIT:
+        raise ValueError('Split record limit must be between 3 and 65535')
     skin_name = _validate_entity_name(skin_name)
     texture_format = str(texture_format or 'TGA').upper()
     if texture_format not in {'TGA', 'DDS'}:
         raise ValueError(_("mowas2.err.texture_format_unsupported",
                            format=texture_format))
+    target_mdl = str(tgt.get('gem2_mdl_path') or '')
+    route = export_route or _infer_export_route(target_mdl)
+    route = _validate_export_route_target(route, target_mdl)
+    if route == 'MOWAS2' and toon_shader:
+        print('[route:MOWAS2] ToonShader forced off')
+        toon_shader = False
+    multipart_enabled = bool(
+        auto_split_over_limit and route in {'GOH', 'MOWAS2'})
+    if auto_split_over_limit and not multipart_enabled:
+        print('[auto-split] disabled for route %s: direct multipart skin views '
+              'are verified only for GOH and MOWAS2' % route)
     if texture_format == 'DDS':
         _tool_kind, nvtt_path = _find_nvtt_tool(nvtt_path)
         print('[8.5] DDS tool:', _tool_kind, nvtt_path)
@@ -6551,20 +9185,32 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
             hidden_alpha[mat.name] = alpha
     if hidden_mats:
         print('[materials] skip static alpha=0:', sorted(hidden_alpha.items()))
-    # Match GFA's single-sided humanskin contract. Exceptional cloth/hair may
-    # opt in explicitly without making closed eye/sclera shells two-sided.
+    # Preserve PMX double-sided intent. Closed eye/sclera layers retain their
+    # dedicated single-sided contract unless the user explicitly overrides it.
     two_sided_mats = {
         mat.name for mat in mesh.data.materials
-        if mat and bool(mat.get('gem2_two_sided', False))
+        if mat and _material_export_two_sided(
+            mat, material_semantics.get(mat.name, mat.name))
     }
+    if two_sided_mats:
+        print('[materials] two-sided:', sorted(two_sided_mats))
     out_sub = _entity_output_dir(output_dir, skin_name)
     _assert_output_does_not_delete_source_textures(out_sub, mesh)
     os.makedirs(out_sub, exist_ok=True)
-    # 清理旧材质与贴图，避免切换 TGA/DDS 后两个扩展名同时存在。
+    # 材质/贴图沿用旧清理流程；旧 split PLY 延迟到新 PLY+MDL 全部验证并
+    # 写成后再删，避免中途失败让旧 MDL 指向已被提前删除的拆件。
+    stale_split_paths = []
     for _f in os.listdir(out_sub):
+        stale_split_ply = re.fullmatch(
+            re.escape(skin_name) + r'_split\d+\.ply', _f,
+            re.IGNORECASE)
+        cleanup_path = os.path.join(out_sub, _f)
+        if stale_split_ply:
+            stale_split_paths.append(cleanup_path)
+            continue
         if _f.lower().endswith(('.mtl', '.tga', '.dds', '.png', '.bmp',
-                                '.jpg', '.jpeg')):
-            cleanup_path = os.path.join(out_sub, _f)
+                                '.jpg', '.jpeg', '.tif', '.tiff', '.webp',
+                                '.gif')):
             try:
                 os.remove(cleanup_path)
             except OSError as exc:
@@ -6586,19 +9232,19 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
     with open(mdl_src, 'rb') as f:
         raw = f.read()
     try:
-        content = raw.decode('gbk')
+        mdl_content = raw.decode('gbk')
     except UnicodeDecodeError:
-        content = raw.decode('utf-8', errors='replace')
-    # Preserve the target MDL verbatim except for the VolumeView filename.
-    # export_ply_game removes only that node's local attachment; basis/body
-    # ancestor transforms remain here so mesh and skeleton receive them once.
-    content, volume_count = re.subn(
-        r'\{VolumeView "[^"]*"\}',
-        '{VolumeView "%s.ply"}' % skin_name, content, count=1)
-    if volume_count != 1:
-        raise RuntimeError(_("mowas2.err.volume_view_missing"))
-    with open(os.path.join(out_sub, skin_name + '.mdl'), 'wb') as f:
-        f.write(content.encode('gbk', errors='replace'))
+        mdl_content = raw.decode('utf-8', errors='replace')
+    # Preserve the target MDL verbatim except for the exact mesh-parent view.
+    # A global first-match regex can replace a rigid accessory or nested LODView
+    # that happens to appear before the skinned human mesh.
+    mesh_parent_name = str(tgt.get('gem2_mesh_parent') or '')
+    if not mesh_parent_name:
+        raise RuntimeError(_("mowas2.err.mesh_parent_matrix_missing"))
+    mdl_content = _strip_generated_auto_split_attachments(
+        mdl_content, mesh_parent_name, entity_name=skin_name)
+    mdl_content = _replace_direct_bone_volume_view(
+        mdl_content, mesh_parent_name, skin_name + '.ply')
     with open(os.path.join(out_sub, skin_name + '.def'), 'w', encoding='utf-8') as f:
         f.write('{game_entity\n\t{Extension "%s.mdl"}\n}\n' % skin_name)
 
@@ -6607,21 +9253,32 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
     # 不能依赖 TEX_IMAGE 的迭代顺序。
     mat_diffuse = {}   # 材质名 -> diffuse 贴图名(去扩展名), 供 ply alpha_mats
     material_names_by_diffuse = {}
+    texture_stager = TextureStager(out_sub)
+    missing_diffuse_fallbacks = []
     for mat in mesh.data.materials:
         if not mat or mat.name in hidden_mats:
             continue
-        tex = _material_diffuse_path(mat)
-        diffuse = os.path.splitext(os.path.basename(tex))[0] if tex else mat.name
+        try:
+            texture_ref, missing_diffuse = _stage_pipeline_diffuse(
+                texture_stager, mat)
+        except Exception as exc:
+            raise RuntimeError(
+                'Failed to stage diffuse texture for %s: %s' %
+                (mat.name, exc)) from exc
+        if missing_diffuse is not None:
+            missing_diffuse_fallbacks.append(missing_diffuse)
+        diffuse = (texture_ref['stem']
+                   if texture_ref is not None else mat.name)
         semantic_name = material_semantics.get(mat.name, mat.name)
         mat_diffuse[mat.name] = diffuse
-        material_names_by_diffuse.setdefault(diffuse, []).append(semantic_name)
+        bucket = material_names_by_diffuse.setdefault(diffuse, [])
+        bucket.append(semantic_name)
         with open(os.path.join(out_sub, mat.name + '.mtl'), 'w', encoding='utf-8') as f:
             f.write('{material simple\n\t{diffuse "%s"}\n\t{blend none}\n}\n' % (diffuse,))
-        if tex:
-            dest = os.path.join(out_sub, os.path.basename(tex))
-            if not os.path.isfile(dest):
-                shutil.copyfile(tex, dest)
 
+    if missing_diffuse_fallbacks:
+        print('[tex] legacy fallback for unavailable diffuse images:',
+              missing_diffuse_fallbacks)
     print('[8] exported ->', out_sub)
 
     # 8.5 用户可选内置 TGA 或外部 NVTT DDS；两者复用完全相同的 alpha
@@ -6644,8 +9301,8 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
               '| mode:', mode,
               '| alpha:', 'test' if _goh_alpha_test_mode() else 'blend-aware')
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        # The operator boundary prints the final traceback once. Keeping this
+        # layer quiet also prevents a recovered export retry from looking fatal.
         raise RuntimeError(_(
             "mowas2.err.texture_export_failed", format=texture_format,
             error=exc)) from exc
@@ -6677,7 +9334,8 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
     print('[8.55] material alpha plan:', sorted(material_plan.items()))
 
     if toon_shader:
-        apply_toon_shader_conversion(out_sub)
+        apply_toon_shader_conversion(
+            out_sub, material_semantics=material_semantics)
     else:
         print('[toon] disabled: keep material simple')
     _validate_eye_material_contract(
@@ -6692,43 +9350,267 @@ def export_all(mesh, tgt, output_dir=None, skin_name='skin',
                   if blend == 'blend'}
     if plan:
         print('[8.6] alpha MESH (MESH_FLAG_ALPHA):', sorted(alpha_mats))
-    ply_path = os.path.join(out_sub, skin_name + '.ply')
-    expected_written = export_ply_game(
-        ply_path, mesh, tgt,
-        alpha_mats=alpha_mats,
-        two_sided_mats=two_sided_mats,
-        skip_mats=hidden_mats)
-    _validate_exported_ply_contract(
-        ply_path, out_sub, hidden_mats, alpha_mats, two_sided_mats,
-        material_semantics, mat_diffuse, expected_written)
+    split_plan = {
+        'required': False, 'available': False, 'total_records': None,
+    }
+    prepared_parts = None
+    part_filenames = [skin_name + '.ply']
+    if multipart_enabled:
+        mesh_data = mesh.data
+        try:
+            mesh_data_key = mesh_data.as_pointer()
+        except (AttributeError, RuntimeError, ReferenceError):
+            mesh_data_key = id(mesh_data)
+
+        def _same_mesh_data(value):
+            try:
+                return value.as_pointer() == mesh_data_key
+            except (AttributeError, RuntimeError, ReferenceError):
+                return value is mesh_data
+
+        reusable_hint = bool(
+            split_plan_hint and split_plan_hint.get('available')
+            and split_plan_hint.get('record_limit') == split_record_limit
+            and split_plan_hint.get('attachment_bone') == mesh_parent_name
+            and all(_same_mesh_data(part.get('mesh'))
+                    for part in split_plan_hint.get('parts', ())))
+        if reusable_hint:
+            split_plan = split_plan_hint
+            print('[auto-split] reusing frozen run_full plan:',
+                  len(split_plan['parts']), 'parts')
+        else:
+            split_plan = _plan_game_auto_split(
+                mesh, tgt, skip_mats=hidden_mats, log=True,
+                mdl_content=mdl_content, entity_name=skin_name,
+                record_limit=split_record_limit)
+        if split_plan['required'] and not split_plan['available']:
+            raise RuntimeError(_(
+                "mowas2.err.auto_split_unavailable",
+                vertices=split_plan['total_records']))
+        if split_plan['available']:
+            prepared_parts = split_plan['parts']
+            part_filenames.extend(
+                '%s_split%02d.ply' % (skin_name, index)
+                for index in range(1, len(prepared_parts)))
+            for split_filename in part_filenames[1:]:
+                mdl_content = _append_additional_direct_volume_view(
+                    mdl_content, mesh_parent_name, split_filename)
+
+    written_parts = []
+    payloads = (prepared_parts if prepared_parts is not None else [None])
+    for part_index, (part_filename, payload) in enumerate(
+            zip(part_filenames, payloads)):
+        part_path = os.path.join(out_sub, part_filename)
+        if payload is None:
+            written = export_ply_game(
+                part_path, mesh, tgt,
+                alpha_mats=alpha_mats,
+                two_sided_mats=two_sided_mats,
+                skip_mats=hidden_mats)
+        else:
+            written = export_ply_game(
+                part_path, mesh, tgt,
+                alpha_mats=alpha_mats,
+                two_sided_mats=two_sided_mats,
+                prepared_data=payload)
+        _validate_exported_ply_contract(
+            part_path, out_sub, hidden_mats, alpha_mats, two_sided_mats,
+            material_semantics, mat_diffuse, written)
+        written_parts.append(written)
+        if payload is not None:
+            summary = split_plan['part_summaries'][part_index]
+            if (written['vertices'] != summary['records']
+                    or written['triangles'] != summary['triangles']):
+                raise RuntimeError(
+                    'Auto-split payload changed between planning and writing')
+
+    if prepared_parts is not None:
+        if sum(part['triangles'] for part in written_parts) != \
+                split_plan['total_triangles']:
+            raise RuntimeError(
+                'Auto-split triangle total changed between planning and writing')
+        print('[auto-split] wrote:', [
+            '%s (%dv/%dt)' % (filename, result['vertices'],
+                              result['triangles'])
+            for filename, result in zip(part_filenames, written_parts)
+        ])
+
+    with open(os.path.join(out_sub, skin_name + '.mdl'), 'wb') as handle:
+        handle.write(mdl_content.encode('gbk', errors='replace'))
+
+    kept_split_paths = {
+        os.path.normcase(os.path.abspath(os.path.join(out_sub, filename)))
+        for filename in part_filenames[1:]
+    }
+    for stale_path in stale_split_paths:
+        if os.path.normcase(os.path.abspath(stale_path)) in kept_split_paths:
+            continue
+        try:
+            os.remove(stale_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(_(
+                "mowas2.err.cleanup_failed", path=stale_path,
+                error=exc)) from exc
 
     print('=' * 60)
     return out_sub
 
 
+def export_all(mesh, tgt, output_dir=None, skin_name='skin',
+               texture_format='TGA', nvtt_path=None, toon_shader=True,
+               export_route=None, auto_split_over_limit=False,
+               split_record_limit=GAME_VERTEX_LIMIT,
+               split_plan_hint=None):
+    """Build one complete entity in staging, then commit it with rollback."""
+    root = os.path.abspath(output_dir or OUT_DEFAULT)
+    validated_name = _validate_entity_name(skin_name)
+    out_sub = _entity_output_dir(root, validated_name)
+    export_key = os.path.normcase(os.path.abspath(out_sub))
+    if export_key in _ACTIVE_ENTITY_EXPORTS:
+        raise RuntimeError(
+            'Another export is already writing this entity directory: '
+            + out_sub)
+    _assert_output_does_not_delete_source_textures(out_sub, mesh)
+    os.makedirs(os.path.dirname(root), exist_ok=True)
+    _ACTIVE_ENTITY_EXPORTS.add(export_key)
+    try:
+        for attempt in range(2):
+            stage_root = tempfile.mkdtemp(
+                prefix='.%s_pipeline_stage_' % validated_name,
+                dir=os.path.dirname(root))
+            stage_sub = _entity_output_dir(stage_root, validated_name)
+            try:
+                _export_all_once(
+                    mesh, tgt, output_dir=stage_root,
+                    skin_name=validated_name,
+                    texture_format=texture_format, nvtt_path=nvtt_path,
+                    toon_shader=toon_shader, export_route=export_route,
+                    auto_split_over_limit=auto_split_over_limit,
+                    split_record_limit=split_record_limit,
+                    split_plan_hint=split_plan_hint)
+
+                manifest_name = '.gem2_export_manifest.json'
+                owned_before = set()
+                manifest_path = os.path.join(out_sub, manifest_name)
+                try:
+                    with open(manifest_path, 'r', encoding='utf-8') as handle:
+                        manifest_data = json.load(handle)
+                    if (not isinstance(manifest_data, dict)
+                            or manifest_data.get('version') != 1):
+                        raise ValueError('Unsupported GEM2 export manifest version')
+                    for relative in manifest_data.get('files', ()):
+                        if not isinstance(relative, str):
+                            continue
+                        normalized = os.path.normpath(relative)
+                        if (os.path.isabs(normalized)
+                                or normalized == os.pardir
+                                or normalized.startswith(os.pardir + os.sep)):
+                            continue
+                        owned_before.add(os.path.normcase(normalized))
+                except (OSError, TypeError, ValueError):
+                    owned_before.clear()
+
+                from .multipart_export import (
+                    _commit_staged_files, _relative_files)
+                generated_files = _relative_files(stage_sub)
+                with open(os.path.join(stage_sub, manifest_name), 'w',
+                          encoding='utf-8') as handle:
+                    json.dump({'version': 1, 'files': generated_files}, handle,
+                              ensure_ascii=True, indent=2)
+                    handle.write('\n')
+
+                split_pattern = re.compile(
+                    re.escape(validated_name) + r'_split\d+\.ply$',
+                    re.IGNORECASE)
+
+                def stale_generated(relative):
+                    if os.path.dirname(relative):
+                        return (os.path.normcase(os.path.normpath(relative))
+                                in owned_before)
+                    filename = os.path.basename(relative)
+                    return (os.path.normcase(os.path.normpath(relative))
+                            in owned_before
+                            or split_pattern.fullmatch(filename) is not None)
+
+                _commit_staged_files(stage_sub, out_sub, stale_generated)
+                return out_sub
+            except Exception as exc:
+                missing_path = _missing_export_artifact_in_exception(
+                    exc, stage_sub)
+                if attempt or not missing_path:
+                    raise
+                print('[export-retry] generated artifact disappeared during '
+                      'export:', missing_path)
+                print('[export-retry] rebuilding the complete entity once from '
+                      'the original Blender texture sources')
+            finally:
+                shutil.rmtree(stage_root, ignore_errors=True)
+    finally:
+        _ACTIVE_ENTITY_EXPORTS.discard(export_key)
+
+
 def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
              protect_tight=True, enable_decimate=False, skin_name='skin',
              pmx_path=None, texture_format='TGA', nvtt_path=None,
-             toon_shader=True):
+             toon_shader=True, export_route=None,
+             auto_split_over_limit=False,
+             split_record_limit=GAME_VERTEX_LIMIT):
     """完整移植 (对齐/绑定/减面可选/导出)。
 
     2026-08-17 晚: enable_decimate 默认 False —— 用户流程默认不减面
     (KK/pmx 顶点数通常 <65535, 直接导出; 减面是可选优化, 需手动开启)。
     skin_name: GOH Entity 资源名，输出 <name>/<name>.def/.mdl/.ply。
+    auto_split_over_limit: GOH/MOWAS2 将最终记录无损分区到多个 PLY，优先于减面。
+    split_record_limit: 每个 PLY 的自定义最终记录上限，范围 3..65535。
     """
+    global _mowas2_settings_restore_depth
     if not output_dir:
         output_dir = OUT_DEFAULT
+    split_record_limit = int(split_record_limit)
+    if split_record_limit < 3 or split_record_limit > GAME_VERTEX_LIMIT:
+        raise ValueError('Split record limit must be between 3 and 65535')
     skin_name = _validate_entity_name(skin_name)
     os.makedirs(output_dir, exist_ok=True)
     src, tgt, mesh, root = resolve_scene()
-    src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
-        src, tgt, mesh, root, pmx_path=pmx_path)
-    # 旧场景兼容：目标骨架若缺就绪标记 → 执行 rebuild (mirrorY 转正,
-    # GOH 皮肤 mdl 同款约定, 实测必需否则左右手反)。
-    if tgt is not None and not tgt.get('mowas2_frame0_rest'):
-        rebuild_frame0_rest(tgt)
+    _assert_legacy_pmx_scene(mesh, tgt)
+    target_mdl = str(tgt.get('gem2_mdl_path') or '')
+    effective_route = export_route or _infer_export_route(target_mdl)
+    props = getattr(bpy.context.scene, 'mowas2_props', None)
+    if effective_route in {'GOH', 'MOWAS2'}:
+        # Route targets always use the short, bundled compatibility template.
+        # Set the variant policy before repairing an older scene whose target
+        # may still be the long-arm template, then validate the actual target.
+        if props is not None:
+            _mowas2_settings_restore_depth += 1
+            try:
+                props.goh_gfa_longarm = False
+                if effective_route == 'MOWAS2':
+                    props.toon_shader = False
+            finally:
+                _mowas2_settings_restore_depth -= 1
+        src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
+            src, tgt, mesh, root, pmx_path=pmx_path,
+            force_short=(effective_route == 'GOH'))
+    else:
+        src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
+            src, tgt, mesh, root, pmx_path=pmx_path)
+    target_mdl = str(tgt.get('gem2_mdl_path') or '')
+    effective_route = _validate_export_route_target(effective_route, target_mdl)
+    multipart_enabled = bool(
+        auto_split_over_limit and effective_route in {'GOH', 'MOWAS2'})
+    if auto_split_over_limit and not multipart_enabled:
+        print('[7] auto-split unavailable for route %s; decimation fallback '
+              'remains route-safe' % effective_route)
+    if effective_route == 'MOWAS2':
+        toon_shader = False
+    # 旧场景兼容：PMX 管线始终使用历史 frame-0 显示约定；若场景曾被
+    # 临时 human-normalized 版本污染，从保留的 raw MDL 元数据恢复。
+    if tgt is not None:
+        _ensure_legacy_frame0_rest(tgt)
     print('=' * 60)
-    print('GOH PMX→GEM2 pipeline v2 (single-ply)')
+    print('GOH PMX→GEM2 pipeline v2 (compact PLY, optional safe split)')
     print('  src:', src.name, '| tgt:', tgt.name, '| mesh:', mesh.name)
 
     # 状态检测: mesh 是否已冻结 (freeze_mesh 后无 ARMATURE modifier / 已绑到 tgt)
@@ -6882,30 +9764,63 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
     if wrist_weights_cleaned:
         print('[6.5] legacy wrist weights restored:', wrist_weights_cleaned)
 
-    # 7. 可选全局 COLLAPSE 减面。关闭时保留当前绑定后的原始几何，
-    # 交给 indexed export 按 position/normal/UV/weight 共享顶点；不执行
-    # UV seam split，避免为了旧的 loop 顶点限制而修改原模型拓扑。
-    if enable_decimate:
-        nf = decimate_global(mesh, target_faces=21000, arm=tgt,
-                             protect_face=protect_face,
-                             protect_tight=protect_tight)
-        nv = uv_seam_split(mesh)
-        print('[7] decimated:', nf, 'faces | uv-split:', nv,
-              'verts (limit 65535)')
-        if nv > 65535:
+    # 7. GOH 自动拆分优先于减面。规划器冻结最终记录后只重映射各 PLY 的
+    # 局部 u16 索引；多骨/双权重以及跨文件材质都保持字节等价。其他路由仍
+    # 使用单 PLY，并在已勾选时由减面接管。
+    preview_hidden_mats = set()
+    for material in mesh.data.materials:
+        if not material:
+            continue
+        alpha = _material_static_alpha(material)
+        if alpha is not None and alpha <= 1e-4:
+            preview_hidden_mats.add(material.name)
+    split_preview = None
+    if multipart_enabled:
+        split_preview = _plan_game_auto_split(
+            mesh, tgt, skip_mats=preview_hidden_mats, log=True,
+            entity_name=skin_name, record_limit=split_record_limit)
+    split_will_handle_limit = bool(
+        split_preview and split_preview['required']
+        and split_preview['available'])
+    if split_will_handle_limit:
+        nf = len(mesh.data.polygons)
+        nv = split_preview['total_records']
+        print('[7] decimation bypassed: auto-split will preserve all', nf,
+              'faces | records:', nv)
+    elif enable_decimate:
+        # Reduce only as far as the real compact-record u16 limit requires.
+        nf = decimate_global(
+            mesh, target_faces=len(mesh.data.polygons), arm=tgt,
+            protect_face=protect_face, protect_tight=protect_tight,
+            skip_mats=preview_hidden_mats)
+        nv = _indexed_export_vertex_count(
+            mesh, tgt, skip_mats=preview_hidden_mats)
+        print('[7] decimated:', nf, 'faces | indexed records:', nv,
+              '(limit %d)' % GAME_VERTEX_LIMIT)
+        if nv > GAME_VERTEX_LIMIT:
             raise RuntimeError(_(
                 "mowas2.err.decimated_vertex_limit", vertices=nv))
     else:
         nf = len(mesh.data.polygons)
-        nv = len(mesh.data.vertices)
-        print('[7] decimation skipped:', nf, 'faces | raw verts:', nv,
-              '| indexed exporter will enforce the 65535 unique-vertex limit')
+        if split_preview is not None:
+            nv = split_preview['total_records']
+            print('[7] decimation skipped:', nf,
+                  'faces | indexed records:', nv,
+                  '| exporter limit:', GAME_VERTEX_LIMIT)
+        else:
+            nv = len(mesh.data.vertices)
+            print('[7] decimation skipped:', nf, 'faces | raw verts:', nv,
+                  '| indexed exporter will enforce the',
+                  GAME_VERTEX_LIMIT, 'record limit')
 
     # 8.5 export (E6.29 抽为 export_all, 便于不重跑绑定/减面单独重做导出)
     return export_all(
         mesh, tgt, output_dir, skin_name=skin_name,
         texture_format=texture_format, nvtt_path=nvtt_path,
-        toon_shader=toon_shader)
+        toon_shader=toon_shader, export_route=effective_route,
+        auto_split_over_limit=auto_split_over_limit,
+        split_record_limit=split_record_limit,
+        split_plan_hint=(split_preview if split_will_handle_limit else None))
 
 
 class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
@@ -6914,6 +9829,14 @@ class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
     bl_description = _("mowas2.op.pipeline.desc")
     bl_options = {'REGISTER', 'UNDO'}
 
+    def invoke(self, context, event):
+        _restore_mowas2_settings(context.scene, force=False)
+        _apply_export_route(context.scene.mowas2_props)
+        return context.window_manager.invoke_props_dialog(self, width=760)
+
+    def draw(self, context):
+        _draw_pipeline_confirmation(self.layout, context.scene.mowas2_props)
+
     def execute(self, context):
         try:
             _restore_mowas2_settings(context.scene, force=False)
@@ -6921,6 +9844,7 @@ class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
             if props is None:
                 out = run_full()
             else:
+                _apply_export_route(props)
                 out = run_full(
                     props.output_dir, props.ground_z,
                     protect_face=props.protect_face,
@@ -6930,7 +9854,10 @@ class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
                     pmx_path=props.pmx_path,
                     texture_format=props.texture_format,
                     nvtt_path=props.nvtt_path or None,
-                    toon_shader=props.toon_shader)
+                    toon_shader=props.toon_shader,
+                    export_route=props.export_route,
+                    auto_split_over_limit=props.auto_split_over_limit,
+                    split_record_limit=props.split_record_limit)
             self.report({'INFO'}, _("mowas2.info.pipeline_done", dir=out))
             return {'FINISHED'}
         except Exception as e:
@@ -6946,9 +9873,12 @@ class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
 
 _MOWAS2_SETTINGS_ID = 'mowas2'
 _MOWAS2_PERSISTED_PROPS = (
-    'pmx_path', 'mdl_path', 'output_dir', 'texture_format', 'nvtt_path',
+    'pmx_path', 'mdl_path', 'output_dir', 'export_route',
+    'mmd_import_preset', 'texture_format', 'nvtt_path',
     'toon_shader', 'ground_z', 'protect_face', 'protect_tight',
-    'enable_decimate', 'skin_name', 'goh_hand_split', 'goh_gfa_longarm',
+    'enable_decimate', 'auto_split_over_limit', 'split_record_limit',
+    'skin_name',
+    'goh_hand_split', 'goh_gfa_longarm',
     'goh_enlarge_head', 'goh_head_scale', 'goh_head_neck_follow',
     'goh_alpha_test', 'goh_fix_pupil_depth', 'goh_pupil_clearance',
     'goh_ik_updown_scale', 'goh_ik_updown_multiplier', 'goh_foot_scale',
@@ -6957,7 +9887,151 @@ _MOWAS2_PERSISTED_PROPS = (
     'goh_iklr_keep',
     'goh_hand_clamp', 'goh_wrist_stitch', 'goh_finger_curl',
 )
+_MOWAS2_PRESET_PROPS = tuple(
+    name for name in _MOWAS2_PERSISTED_PROPS
+    if name not in {'pmx_path', 'output_dir', 'skin_name'}
+)
 _mowas2_settings_restore_depth = 0
+_named_preset_item_cache = []
+
+
+def _infer_export_route(mdl_path):
+    if not mdl_path:
+        return 'CUSTOM'
+    current = os.path.normcase(os.path.abspath(str(mdl_path)))
+    if current == os.path.normcase(os.path.abspath(MOWAS2_ROUTE_MDL)):
+        return 'MOWAS2'
+    if current == os.path.normcase(os.path.abspath(GOH_ROUTE_MDL)):
+        return 'GOH'
+    return 'CUSTOM'
+
+
+def _apply_export_route(props):
+    global _mowas2_settings_restore_depth
+    route = str(getattr(props, 'export_route', 'CUSTOM'))
+    _mowas2_settings_restore_depth += 1
+    try:
+        if route == 'MOWAS2':
+            props.mdl_path = MOWAS2_ROUTE_MDL
+            props.goh_gfa_longarm = False
+            props.toon_shader = False
+        elif route == 'GOH':
+            props.mdl_path = GOH_ROUTE_MDL
+            props.goh_gfa_longarm = False
+    finally:
+        _mowas2_settings_restore_depth -= 1
+
+
+def _mowas2_route_updated(props, context):
+    _apply_export_route(props)
+    _persist_mowas2_settings(props)
+
+
+def _mowas2_toon_updated(props, context):
+    global _mowas2_settings_restore_depth
+    if getattr(props, 'export_route', 'CUSTOM') == 'MOWAS2' \
+            and bool(props.toon_shader):
+        _mowas2_settings_restore_depth += 1
+        try:
+            props.toon_shader = False
+        finally:
+            _mowas2_settings_restore_depth -= 1
+    _persist_mowas2_settings(props)
+
+
+def _named_export_preset_items(_self, _context):
+    global _named_preset_item_cache
+    from .core import get_export_presets
+    values = get_export_presets()
+    items = [('__NONE__', 'Select a named preset', '')]
+    items.extend((name, name, '') for name in sorted(values, key=str.casefold))
+    _named_preset_item_cache = items
+    return _named_preset_item_cache
+
+
+def _capture_named_export_preset(props):
+    values = {name: getattr(props, name) for name in _MOWAS2_PRESET_PROPS}
+    scene = getattr(props, 'id_data', bpy.context.scene)
+    snapshot = _effective_mmd_import_snapshot(scene, props)
+    values['mmd_import_settings'] = snapshot['settings']
+    values['mmd_import_preset_path'] = snapshot['preset_path']
+    values['mmd_import_preset_sha256'] = snapshot['preset_sha256']
+    values['saved_at'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    if values.get('export_route') == 'MOWAS2':
+        values['toon_shader'] = False
+    return values
+
+
+_MOWAS2_CONFIRM_FIELDS = (
+    ('Remember settings', 'remember_settings'),
+    ('Route', 'export_route'), ('MMD preset', 'mmd_import_preset'),
+    ('Texture format', 'texture_format'), ('NVTT path', 'nvtt_path'),
+    ('ToonShader', 'toon_shader'),
+    ('Ground Z', 'ground_z'), ('Decimate', 'enable_decimate'),
+    ('Auto split records', 'auto_split_over_limit'),
+    ('Records per PLY', 'split_record_limit'),
+    ('Protect face', 'protect_face'), ('Protect tight areas', 'protect_tight'),
+    ('GOH split hands', 'goh_hand_split'),
+    ('GOH GFA long arm', 'goh_gfa_longarm'),
+    ('Enlarge head', 'goh_enlarge_head'), ('Head scale', 'goh_head_scale'),
+    ('Head/neck follow', 'goh_head_neck_follow'),
+    ('Alpha test', 'goh_alpha_test'),
+    ('Fix pupil depth', 'goh_fix_pupil_depth'),
+    ('Pupil clearance', 'goh_pupil_clearance'),
+    ('IK up/down scale', 'goh_ik_updown_scale'),
+    ('IK up/down multiplier', 'goh_ik_updown_multiplier'),
+    ('Foot scale', 'goh_foot_scale'),
+    ('Foot spacing', 'goh_foot1_spacing'),
+    ('Arm span scale', 'goh_arm_span_scale'),
+    ('Legacy shoulder scale', 'goh_shoulder_scale'),
+    ('Torso IK merge', 'goh_torso_ik_merge'),
+    ('IK L/R keep', 'goh_iklr_keep'),
+    ('Hand clamp', 'goh_hand_clamp'),
+    ('Wrist stitch', 'goh_wrist_stitch'),
+    ('Finger curl', 'goh_finger_curl'),
+)
+
+
+def _setting_summary_value(value):
+    if type(value) is bool:
+        return '✓' if value else '✗'
+    if isinstance(value, float):
+        return '%.6g' % value
+    return str(value)
+
+
+def _draw_pipeline_confirmation(layout, props):
+    layout.label(text='Confirm the remembered settings before running',
+                 icon='QUESTION')
+    paths = layout.box()
+    paths.label(text='PMX: ' + str(props.pmx_path or '(scene source)'))
+    paths.label(text='Target: ' + str(props.mdl_path))
+    paths.label(text='Entity: ' + str(props.skin_name or 'skin'))
+    paths.label(text='Output: ' + str(props.output_dir))
+    flow = layout.column_flow(columns=2, align=True)
+    for label, field in _MOWAS2_CONFIRM_FIELDS:
+        value = getattr(props, field)
+        icon = 'CHECKMARK' if value is True else ('X' if value is False else 'DOT')
+        flow.label(text='%s: %s' % (label, _setting_summary_value(value)),
+                   icon=icon)
+    try:
+        snapshot = _effective_mmd_import_snapshot(bpy.context.scene, props)
+        mmd_settings = snapshot['settings']
+        mmd_box = layout.box()
+        mmd_box.label(text='MMD Tools immutable import snapshot', icon='IMPORT')
+        mmd_box.label(text='Preset: ' + snapshot['preset'])
+        mmd_box.label(text='Source: ' + (snapshot['preset_path'] or '(built-in/captured)'))
+        mmd_box.label(text='SHA-256: ' + (snapshot['preset_sha256'] or '(built-in)'))
+        mmd_flow = mmd_box.column_flow(columns=2, align=True)
+        for field in sorted(mmd_settings, key=str.casefold):
+            value = mmd_settings[field]
+            icon = 'CHECKMARK' if value is True else ('X' if value is False else 'DOT')
+            mmd_flow.label(
+                text='%s: %s' % (field, _setting_summary_value(value)), icon=icon)
+    except Exception as exc:
+        layout.label(text='MMD preset unavailable: ' + str(exc), icon='ERROR')
+    if props.export_route == 'MOWAS2':
+        layout.label(text='MOWAS2 invariant: ToonShader forced ✗', icon='LOCKED')
 
 
 def _persist_mowas2_settings(props):
@@ -6975,6 +10049,22 @@ def _persist_mowas2_settings(props):
 
 
 def _mowas2_setting_updated(props, context):
+    _persist_mowas2_settings(props)
+
+
+def _mowas2_mmd_preset_updated(props, context):
+    if not _mowas2_settings_restore_depth and context is not None:
+        try:
+            snapshot = mmd_import_preset_snapshot(props.mmd_import_preset)
+            _store_mmd_import_snapshot(context.scene, snapshot)
+        except Exception as exc:
+            for key in (_MMD_SCENE_PRESET_KEY, _MMD_SCENE_SETTINGS_KEY,
+                        _MMD_SCENE_PATH_KEY, _MMD_SCENE_SHA256_KEY):
+                try:
+                    del context.scene[key]
+                except KeyError:
+                    pass
+            print('[MOWAS2] MMD preset snapshot failed:', exc)
     _persist_mowas2_settings(props)
 
 
@@ -7057,9 +10147,14 @@ def _restore_mowas2_settings(scene, force=False):
                 previous_export = get_paths().get('export') or ''
                 if previous_export:
                     props.output_dir = previous_export
+            if 'export_route' not in saved:
+                props.export_route = _infer_export_route(
+                    saved.get('mdl_path', props.mdl_path))
+            _apply_export_route(props)
         props.settings_initialized = True
     finally:
         _mowas2_settings_restore_depth -= 1
+    _effective_mmd_import_snapshot(scene, props)
 
 
 def _restore_all_mowas2_settings(force=False):
@@ -7100,6 +10195,25 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
         name=_("mowas2.prop.remember_settings"),
         description=_("mowas2.prop.remember_settings.desc"),
         default=True, update=_mowas2_setting_updated)
+    export_route: bpy.props.EnumProperty(
+        name="Export Route",
+        description="Choose the reference skeleton and route invariants",
+        items=(
+            ('GOH', 'GOH', 'Use samples/goh_skin.mdl'),
+            ('MOWAS2', 'MOWAS2', 'Use samples/MOWAS2.mdl and disable ToonShader'),
+            ('CUSTOM', 'Custom MDL', 'Keep the selected target MDL'),
+        ),
+        default='GOH', update=_mowas2_route_updated)
+    mmd_import_preset: bpy.props.EnumProperty(
+        name="MMD Import Preset",
+        description="MMD Tools operator preset used for initial import and reimport",
+        items=_mmd_import_preset_items,
+        update=_mowas2_mmd_preset_updated)
+    named_export_preset: bpy.props.EnumProperty(
+        name="Named Export Preset",
+        description="Saved export settings (input, entity and output paths are excluded)",
+        items=_named_export_preset_items,
+        options={'SKIP_SAVE'})
     pmx_path: bpy.props.StringProperty(
         name=_("mowas2.prop.pmx"), subtype='FILE_PATH',
         description=_("mowas2.prop.pmx.desc"),
@@ -7107,11 +10221,9 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
     mdl_path: bpy.props.StringProperty(
         name=_("mowas2.prop.mdl"), subtype='FILE_PATH',
         description=_("mowas2.prop.mdl.desc"),
-        # GOH 版: 默认指向插件 samples 内 GFA 长臂模板 (goh_skin_gfa.mdl,
-        # 前臂/手与 GOH 动画一致); 用户可自行选择任意 GFA/GOH 皮肤 .mdl。
-        default=(GOH_DEFAULT_MDL if GOH_GFA_LONGARM else
-                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              'samples', 'goh_skin.mdl')),
+        # Route selection owns the bundled GOH/MOWAS2 targets; Custom keeps any
+        # explicitly selected compatible skin MDL.
+        default=GOH_ROUTE_MDL,
         update=_mowas2_setting_updated)
     output_dir: bpy.props.StringProperty(
         name=_("mowas2.prop.output_dir"), subtype='DIR_PATH',
@@ -7135,7 +10247,7 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
     toon_shader: bpy.props.BoolProperty(
         name=_("mowas2.prop.toon_shader"),
         description=_("mowas2.prop.toon_shader.desc"),
-        default=True, update=_mowas2_setting_updated)
+        default=True, update=_mowas2_toon_updated)
     ground_z: bpy.props.FloatProperty(
         name=_("mowas2.prop.ground_z"), default=GROUND_Z,
         description=_("mowas2.prop.ground_z.desc"),
@@ -7155,6 +10267,15 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
     enable_decimate: bpy.props.BoolProperty(
         name=_("mowas2.prop.enable_decimate"), default=False,
         description=_("mowas2.prop.enable_decimate.desc"),
+        update=_mowas2_setting_updated)
+    auto_split_over_limit: bpy.props.BoolProperty(
+        name=_("mowas2.prop.auto_split_over_limit"), default=False,
+        description=_("mowas2.prop.auto_split_over_limit.desc"),
+        update=_mowas2_setting_updated)
+    split_record_limit: bpy.props.IntProperty(
+        name=_("mowas2.prop.split_record_limit"),
+        description=_("mowas2.prop.split_record_limit.desc"),
+        default=GAME_VERTEX_LIMIT, min=3, max=GAME_VERTEX_LIMIT,
         update=_mowas2_setting_updated)
     # Backward-compatible property name; exposed as the game's Entity resource id.
     skin_name: bpy.props.StringProperty(
@@ -7270,6 +10391,134 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
     report: bpy.props.StringProperty(name=_("mowas2.prop.report"), default="")
 
 
+class MOWAS2_OT_RefreshMMDPresetSnapshot(bpy.types.Operator):
+    bl_idname = 'gem2.mowas2_refresh_mmd_preset_snapshot'
+    bl_label = 'Refresh MMD Snapshot'
+    bl_description = 'Re-read the selected live MMD Tools preset into the immutable scene snapshot'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.mowas2_props
+        try:
+            snapshot = mmd_import_preset_snapshot(props.mmd_import_preset)
+            snapshot = _store_mmd_import_snapshot(context.scene, snapshot)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report(
+            {'INFO'}, 'Refreshed MMD snapshot: %s (%s)' % (
+                snapshot['preset'], snapshot['preset_sha256'] or 'built-in'))
+        return {'FINISHED'}
+
+
+class MOWAS2_OT_SaveExportPreset(bpy.types.Operator):
+    bl_idname = 'gem2.mowas2_save_export_preset'
+    bl_label = 'Save Named Preset'
+    bl_description = 'Save current import, route, export and adjustment settings'
+    bl_options = {'REGISTER'}
+
+    preset_name: bpy.props.StringProperty(name='Preset Name', maxlen=64)
+
+    def invoke(self, context, event):
+        selected = getattr(context.scene.mowas2_props,
+                           'named_export_preset', '__NONE__')
+        if selected != '__NONE__':
+            self.preset_name = selected
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        from .core import save_export_preset
+        name = str(self.preset_name or '').strip()
+        try:
+            values = _capture_named_export_preset(context.scene.mowas2_props)
+            save_export_preset(name, values)
+            context.scene.mowas2_props.named_export_preset = name
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, 'Saved export preset: ' + name)
+        return {'FINISHED'}
+
+
+class MOWAS2_OT_LoadExportPreset(bpy.types.Operator):
+    bl_idname = 'gem2.mowas2_load_export_preset'
+    bl_label = 'Load Named Preset'
+    bl_description = 'Apply the selected named export preset'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        global _mowas2_settings_restore_depth
+        from .core import get_export_preset
+        props = context.scene.mowas2_props
+        name = str(props.named_export_preset)
+        values = get_export_preset(name)
+        if values is None:
+            self.report({'ERROR'}, 'Select an existing named preset')
+            return {'CANCELLED'}
+        migrated_mmd_snapshot = False
+        try:
+            if 'mmd_import_settings' in values:
+                snapshot = _validated_mmd_import_snapshot({
+                    'preset': values.get('mmd_import_preset'),
+                    'preset_path': values.get('mmd_import_preset_path', ''),
+                    'preset_sha256': values.get('mmd_import_preset_sha256', ''),
+                    'settings': values['mmd_import_settings'],
+                })
+            else:
+                snapshot = mmd_import_preset_snapshot(
+                    values.get('mmd_import_preset', _MMD_PIPELINE_PRESET))
+            try:
+                _validate_pipeline_mmd_invariants(snapshot['settings'])
+            except ValueError as unsafe_snapshot:
+                snapshot = mmd_import_preset_snapshot(_MMD_RECOMMENDED_PRESET)
+                migrated_mmd_snapshot = True
+                print('[MOWAS2] named preset MMD snapshot migrated:', unsafe_snapshot)
+            _store_mmd_import_snapshot(context.scene, snapshot)
+        except Exception as exc:
+            self.report({'ERROR'}, 'Invalid MMD snapshot in preset: ' + str(exc))
+            return {'CANCELLED'}
+        _mowas2_settings_restore_depth += 1
+        try:
+            for field in _MOWAS2_PRESET_PROPS:
+                if field not in values:
+                    continue
+                try:
+                    value = values[field]
+                    if migrated_mmd_snapshot and field == 'mmd_import_preset':
+                        value = _MMD_RECOMMENDED_PRESET
+                    setattr(props, field, value)
+                except (AttributeError, TypeError, ValueError):
+                    print('[MOWAS2] ignored invalid preset setting %s=%r'
+                          % (field, values[field]))
+            _apply_export_route(props)
+        finally:
+            _mowas2_settings_restore_depth -= 1
+        _persist_mowas2_settings(props)
+        self.report({'INFO'}, 'Loaded export preset: ' + name)
+        return {'FINISHED'}
+
+
+class MOWAS2_OT_DeleteExportPreset(bpy.types.Operator):
+    bl_idname = 'gem2.mowas2_delete_export_preset'
+    bl_label = 'Delete Named Preset'
+    bl_description = 'Remove the selected named preset (does not alter current settings)'
+    bl_options = {'REGISTER'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        from .core import delete_export_preset
+        props = context.scene.mowas2_props
+        name = str(props.named_export_preset)
+        if name == '__NONE__' or not delete_export_preset(name):
+            self.report({'ERROR'}, 'Select an existing named preset')
+            return {'CANCELLED'}
+        props.named_export_preset = '__NONE__'
+        self.report({'INFO'}, 'Deleted export preset: ' + name)
+        return {'FINISHED'}
+
+
 class MOWAS2_OT_ImportPMX(bpy.types.Operator):
     """步骤1：导入 PMX 源模型（mmd_tools）"""
     bl_idname = "gem2.mowas2_import_pmx"
@@ -7294,8 +10543,14 @@ class MOWAS2_OT_ImportPMX(bpy.types.Operator):
             if not self.filepath:
                 self.report({'ERROR'}, _("mowas2.err.select_pmx"))
                 return {'CANCELLED'}
-            arm, mesh = import_pmx(self.filepath)
             props = context.scene.mowas2_props
+            snapshot = _effective_mmd_import_snapshot(context.scene, props)
+            arm, mesh = import_pmx(
+                self.filepath,
+                preset_name=snapshot['preset'],
+                preset_settings=snapshot['settings'],
+                preset_path=snapshot['preset_path'],
+                preset_sha256=snapshot['preset_sha256'])
             props.pmx_path = self.filepath
             props.report = _("mowas2.info.pmx_imported",
                              file=os.path.basename(self.filepath),
@@ -7306,6 +10561,179 @@ class MOWAS2_OT_ImportPMX(bpy.types.Operator):
             import traceback
             traceback.print_exc()
             self.report({'ERROR'}, _("mowas2.err.pmx_failed", error=e))
+            return {'CANCELLED'}
+
+
+class MOWAS2_OT_HumanRestConvert(bpy.types.Operator):
+    """Convert an existing GEM2 human mesh between MDL rest spaces."""
+    bl_idname = 'gem2.mowas2_human_rest_convert'
+    bl_label = _('mowas2.human_rest.convert.label')
+    bl_description = _('mowas2.human_rest.convert.desc')
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _human_rest_convert_available(context)
+
+    mesh_name: bpy.props.StringProperty(name='Mesh', default='', options={'HIDDEN'})
+    source_armature_name: bpy.props.StringProperty(
+        name='Source Armature', default='', options={'HIDDEN'})
+    target_armature_name: bpy.props.StringProperty(
+        name='Target Armature', default='', options={'HIDDEN'})
+    duplicate_mesh: bpy.props.BoolProperty(
+        name=_('mowas2.human_rest.duplicate'),
+        description=_('mowas2.human_rest.duplicate.desc'),
+        default=False)
+    exact_reverse: bpy.props.BoolProperty(
+        name=_('mowas2.human_rest.exact_reverse'),
+        description=_('mowas2.human_rest.exact_reverse.desc'),
+        default=True)
+
+    def invoke(self, context, event):
+        _restore_mowas2_settings(context.scene, force=False)
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.mowas2_props
+        layout.label(text=_('mowas2.human_rest.desc'), icon='ARMATURE_DATA')
+        destination_name = os.path.basename(str(props.mdl_path))
+        if not destination_name:
+            destination_name = _('mowas2.human_rest.destination_missing')
+        layout.label(text=_('mowas2.human_rest.convert.destination',
+                            name=destination_name),
+                     icon='FILE_TICK' if os.path.isfile(
+                         bpy.path.abspath(str(props.mdl_path))) else 'ERROR')
+        layout.prop(self, 'duplicate_mesh')
+        layout.prop(self, 'exact_reverse')
+
+    def execute(self, context):
+        try:
+            _restore_mowas2_settings(context.scene, force=False)
+            props = context.scene.mowas2_props
+            _apply_export_route(props)
+            report = convert_human_rest_scene(
+                context.scene, props.mdl_path,
+                mesh_name=self.mesh_name,
+                source_armature_name=self.source_armature_name,
+                target_armature_name=self.target_armature_name,
+                duplicate_mesh=self.duplicate_mesh,
+                exact_reverse=self.exact_reverse)
+            props.report = _human_rest_module().conversion_summary(report)
+            self.report({'INFO'}, props.report)
+            return {'FINISHED'}
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, _(
+                'mowas2.human_rest.err.convert_failed', error=str(exc)))
+            return {'CANCELLED'}
+
+
+def _human_rest_conversion_metadata(mesh):
+    value = _human_rest_module().conversion_metadata(mesh)
+    return value if isinstance(value, dict) else {}
+
+
+def _human_rest_converted_mesh(scene):
+    active = bpy.context.view_layer.objects.active
+    all_candidates = [obj for obj in scene.objects
+                      if obj.type == 'MESH'
+                      and _human_rest_conversion_marked(obj)]
+    if not all_candidates:
+        raise RuntimeError('No converted GEM2 human mesh found')
+    if any(_human_rest_same_object(active, candidate)
+           for candidate in all_candidates):
+        return active
+    selected = [obj for obj in all_candidates if obj.select_get()]
+    if len(selected) == 1:
+        return selected[0]
+    expected = _human_rest_path(
+        getattr(getattr(scene, 'mowas2_props', None), 'mdl_path', ''))
+    matching = [obj for obj in all_candidates
+                if _human_rest_path(
+                    _human_rest_conversion_metadata(obj).get('destination_mdl', ''))
+                == expected]
+    if len(matching) == 1:
+        return matching[0]
+    if len(selected) > 1:
+        raise RuntimeError('Select exactly one converted human mesh to export')
+    if len(matching) > 1:
+        raise RuntimeError('Multiple converted meshes match the destination MDL')
+    if len(all_candidates) == 1:
+        return all_candidates[0]
+    raise RuntimeError('Select exactly one converted human mesh to export')
+
+
+def _human_rest_target_for_mesh(scene, mesh):
+    metadata = _human_rest_conversion_metadata(mesh)
+    target_name = metadata.get('destination_armature', '')
+    target = next((obj for obj in scene.objects if obj.name == target_name), None)
+    if target is not None and target.type == 'ARMATURE':
+        if not _human_rest_target_usable(target):
+            raise RuntimeError(
+                'Converted mesh requires a raw-rest destination armature')
+        expected = _human_rest_path(metadata.get('destination_mdl', ''))
+        actual = _human_rest_armature_path(target)
+        if expected and actual and expected != actual:
+            raise RuntimeError('Converted mesh metadata targets a different armature MDL')
+        return target
+    target_mods = []
+    for modifier in mesh.modifiers:
+        target = modifier.object
+        if (modifier.type == 'ARMATURE' and target
+                and target.type == 'ARMATURE'
+                and not any(_human_rest_same_object(target, item)
+                            for item in target_mods)):
+            target_mods.append(target)
+    target_mods = [target for target in target_mods
+                   if scene.objects.get(target.name) is not None]
+    if len(target_mods) == 1:
+        if not _human_rest_target_usable(target_mods[0]):
+            raise RuntimeError(
+                'Converted mesh requires a raw-rest destination armature')
+        return target_mods[0]
+    raise RuntimeError('Converted human mesh has no unique destination armature')
+
+
+class MOWAS2_OT_HumanRestExport(bpy.types.Operator):
+    """Export a mesh already converted by the human rest operator."""
+    bl_idname = 'gem2.mowas2_human_rest_export'
+    bl_label = _('mowas2.human_rest.converted_export.label')
+    bl_description = _('mowas2.human_rest.converted_export.desc')
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _human_rest_export_available(context)
+
+    def execute(self, context):
+        try:
+            _restore_mowas2_settings(context.scene, force=False)
+            props = context.scene.mowas2_props
+            mesh = _human_rest_converted_mesh(context.scene)
+            target = _human_rest_target_for_mesh(context.scene, mesh)
+            destination = str(target.get('gem2_mdl_path') or '')
+            if not destination:
+                raise RuntimeError('Destination armature lacks gem2_mdl_path')
+            route = _infer_export_route(destination)
+            out = export_all(
+                mesh, target, props.output_dir,
+                skin_name=props.skin_name or 'skin',
+                texture_format=props.texture_format,
+                nvtt_path=props.nvtt_path or None,
+                toon_shader=props.toon_shader,
+                export_route=route,
+                auto_split_over_limit=props.auto_split_over_limit,
+                split_record_limit=props.split_record_limit)
+            props.report = _('mowas2.info.export_done', dir=out)
+            self.report({'INFO'}, props.report)
+            return {'FINISHED'}
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, _(
+                'mowas2.human_rest.err.export_failed', error=str(exc)))
             return {'CANCELLED'}
 
 
@@ -7322,8 +10750,11 @@ class MOWAS2_OT_BuildTarget(bpy.types.Operator):
     def invoke(self, context, event):
         _restore_mowas2_settings(context.scene, force=False)
         props = context.scene.mowas2_props
+        _apply_export_route(props)
         if props.mdl_path and os.path.isfile(props.mdl_path):
             self.filepath = props.mdl_path
+        if props.export_route != 'CUSTOM':
+            return self.execute(context)
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -7333,9 +10764,11 @@ class MOWAS2_OT_BuildTarget(bpy.types.Operator):
             if not self.filepath or not os.path.isfile(self.filepath):
                 self.report({'ERROR'}, _("mowas2.err.select_mdl"))
                 return {'CANCELLED'}
-            tgt = build_target_from_mdl(self.filepath)
             props = context.scene.mowas2_props
+            props.export_route = _infer_export_route(self.filepath)
             props.mdl_path = self.filepath
+            _apply_export_route(props)
+            tgt = build_target_from_mdl(props.mdl_path)
             props.report = _("mowas2.info.target_built",
                              name=tgt.name, bones=len(tgt.data.bones))
             self.report({'INFO'}, props.report)
@@ -7377,10 +10810,19 @@ class MOWAS2_OT_FullPipeline(bpy.types.Operator):
     bl_description = _("mowas2.op.full_pipeline.desc")
     bl_options = {'REGISTER', 'UNDO'}
 
+    def invoke(self, context, event):
+        _restore_mowas2_settings(context.scene, force=False)
+        _apply_export_route(context.scene.mowas2_props)
+        return context.window_manager.invoke_props_dialog(self, width=760)
+
+    def draw(self, context):
+        _draw_pipeline_confirmation(self.layout, context.scene.mowas2_props)
+
     def execute(self, context):
         try:
             _restore_mowas2_settings(context.scene, force=False)
             props = context.scene.mowas2_props
+            _apply_export_route(props)
             out = run_full(props.output_dir, props.ground_z,
                            protect_face=props.protect_face,
                            protect_tight=props.protect_tight,
@@ -7389,7 +10831,10 @@ class MOWAS2_OT_FullPipeline(bpy.types.Operator):
                            pmx_path=props.pmx_path,
                            texture_format=props.texture_format,
                            nvtt_path=props.nvtt_path or None,
-                           toon_shader=props.toon_shader)
+                           toon_shader=props.toon_shader,
+                           export_route=props.export_route,
+                           auto_split_over_limit=props.auto_split_over_limit,
+                           split_record_limit=props.split_record_limit)
             props.report = _("mowas2.info.export_done", dir=out)
             self.report({'INFO'}, props.report)
             return {'FINISHED'}
@@ -7406,6 +10851,7 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "GOH"
+    bl_order = 10
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
@@ -7422,6 +10868,13 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         box.label(text=_("mowas2.panel.summary1"), icon='DOT')
         box.label(text=_("mowas2.panel.summary2"), icon='DOT')
         box.prop(props, "remember_settings", icon='PREFERENCES')
+        box.prop(props, "named_export_preset", text="Preset")
+        row = box.row(align=True)
+        row.operator('gem2.mowas2_load_export_preset', text='Load', icon='IMPORT')
+        row.operator('gem2.mowas2_save_export_preset', text='Save As', icon='ADD')
+        delete_row = row.row(align=True)
+        delete_row.enabled = props.named_export_preset != '__NONE__'
+        delete_row.operator('gem2.mowas2_delete_export_preset', text='', icon='TRASH')
 
         # 场景状态
         arms = [o for o in context.scene.objects if o.type == 'ARMATURE']
@@ -7437,9 +10890,24 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         box.label(text=_("mowas2.scene.label"), icon='SCENE_DATA')
         box.label(text=status, icon='INFO')
 
+        # Existing GEM2 human rest conversion is intentionally separate from
+        # the PMX alignment workflow.
+        box = layout.box()
+        box.label(text=_('mowas2.human_rest.label'), icon='ARMATURE_DATA')
+        box.label(text=_('mowas2.human_rest.desc'), icon='LOCKED')
+        box.operator('gem2.mowas2_human_rest_convert',
+                     text=_('mowas2.human_rest.convert.label'), icon='BONE_DATA')
+        box.operator('gem2.mowas2_human_rest_export',
+                     text=_('mowas2.human_rest.converted_export.label'),
+                     icon='EXPORT')
+
         # 1. 导入 PMX
         box = layout.box()
         box.label(text=_("mowas2.step1.label"), icon='IMPORT')
+        preset_row = box.row(align=True)
+        preset_row.prop(props, "mmd_import_preset", text="MMD Preset")
+        preset_row.operator(
+            'gem2.mowas2_refresh_mmd_preset_snapshot', text='', icon='FILE_REFRESH')
         box.prop(props, "pmx_path", text="")
         box.operator("gem2.mowas2_import_pmx", text=_("mowas2.step1.import"),
                      icon='FILE_TICK')
@@ -7447,7 +10915,12 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         # 2. 构建目标骨架
         box = layout.box()
         box.label(text=_("mowas2.step2.label"), icon='ARMATURE_DATA')
-        box.prop(props, "mdl_path", text="")
+        box.prop(props, "export_route", expand=True)
+        target_row = box.row()
+        target_row.enabled = props.export_route == 'CUSTOM'
+        target_row.prop(props, "mdl_path", text="")
+        if props.export_route != 'CUSTOM':
+            box.label(text=os.path.basename(props.mdl_path), icon='FILE_TICK')
         row = box.row()
         row.operator("gem2.mowas2_build_target", text=_("mowas2.step2.build"),
                      icon='BONE_DATA')
@@ -7482,8 +10955,12 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
                 box.label(text=os.path.basename(_tool_path), icon='CHECKMARK')
             except RuntimeError:
                 box.label(text=_("mowas2.status.nvtt_not_found"), icon='ERROR')
-        box.prop(props, "toon_shader")
-        if props.toon_shader:
+        toon_row = box.row()
+        toon_row.enabled = props.export_route != 'MOWAS2'
+        toon_row.prop(props, "toon_shader")
+        if props.export_route == 'MOWAS2':
+            box.label(text="ToonShader is always disabled for MOWAS2", icon='LOCKED')
+        if props.toon_shader and props.export_route != 'MOWAS2':
             toon_root = _find_toon_shader_root()
             if toon_root:
                 box.label(text=_("mowas2.status.toon_found",
@@ -7497,6 +10974,20 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         run_row.enabled = entity_valid
         run_row.operator("gem2.mowas2_full_pipeline",
                          text=_("mowas2.step4.run"), icon='PLAY')
+
+        # 已由 Blender 导入的 FBX/OBJ/glTF 等模型直接走格式无关拆分导出。
+        box = layout.box()
+        box.label(text=_("mowas2.generic_export.label"), icon='MESH_DATA')
+        box.prop(props, "split_record_limit")
+        generic_row = box.row(align=True)
+        preflight = generic_row.operator(
+            "gem2.multipart_preflight",
+            text=_("mowas2.generic_export.preflight"), icon='VIEWZOOM')
+        preflight.record_limit = props.split_record_limit
+        generic_export = generic_row.operator(
+            "export_scene.gem2_multipart",
+            text=_("mowas2.generic_export.run"), icon='EXPORT')
+        generic_export.record_limit = props.split_record_limit
 
         # 高级
         box = layout.box()
@@ -7544,6 +11035,14 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         # E6.19: 减面保护开关 (默认开启)
         sub = box.box()
         sub.label(text=_("mowas2.advanced.protection"), icon='MOD_DECIM')
+        split_row = sub.row()
+        split_row.enabled = (props.export_route in {'GOH', 'MOWAS2'})
+        split_row.prop(props, "auto_split_over_limit")
+        limit_row = sub.row()
+        limit_row.enabled = bool(
+            props.auto_split_over_limit
+            and props.export_route in {'GOH', 'MOWAS2'})
+        limit_row.prop(props, "split_record_limit")
         sub.prop(props, "enable_decimate")
         sub.prop(props, "protect_face")
         sub.prop(props, "protect_tight")
@@ -7573,7 +11072,13 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
 
 
 CLASSES = (MOWAS2_OT_AutoPipeline,
+           MOWAS2_OT_RefreshMMDPresetSnapshot,
+           MOWAS2_OT_SaveExportPreset,
+           MOWAS2_OT_LoadExportPreset,
+           MOWAS2_OT_DeleteExportPreset,
            MOWAS2_OT_ImportPMX,
+           MOWAS2_OT_HumanRestConvert,
+           MOWAS2_OT_HumanRestExport,
            MOWAS2_OT_BuildTarget,
            MOWAS2_OT_AlignOnly,
            MOWAS2_OT_FullPipeline,
@@ -7589,18 +11094,35 @@ def register():
         unregister()
     except Exception:
         pass
-    for cls in CLASSES:
-        try:
-            bpy.utils.register_class(cls)
-        except Exception as e:
-            print('[MOWAS2] FAIL register %s: %s' % (cls.__name__, e))
+    registered = []
     try:
+        for cls in CLASSES:
+            bpy.utils.register_class(cls)
+            registered.append(cls)
         bpy.types.Scene.mowas2_props = bpy.props.PointerProperty(
             type=MOWAS2_SceneProps, options={'SKIP_SAVE'})
         _register_mowas2_settings_handlers()
-        _restore_all_mowas2_settings(force=True)
-    except Exception as e:
-        print('[MOWAS2] FAIL scene prop/settings:', e)
+        # During Blender startup add-ons register while bpy.data is _RestrictData.
+        # load_post restores settings once Scene data is available; manual enabling
+        # and bridge registration still restore immediately.
+        try:
+            bpy.data.scenes
+        except AttributeError:
+            pass
+        else:
+            _restore_all_mowas2_settings(force=True)
+    except Exception:
+        _remove_mowas2_settings_handlers()
+        try:
+            del bpy.types.Scene.mowas2_props
+        except Exception:
+            pass
+        for cls in reversed(registered):
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+        raise
 
 
 def unregister():

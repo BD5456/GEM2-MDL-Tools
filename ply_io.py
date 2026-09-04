@@ -271,12 +271,69 @@ def _try_mtl_at(file_bytes, p):
     return None
 
 
+_NATIVE_HUMAN_DISPLAY_BONES = frozenset({
+    'basis', 'body', 'skin',
+    'foot1l', 'foot2l', 'foot3l',
+    'foot1r', 'foot2r', 'foot3r',
+    'hand1l', 'hand2l', 'hand1r', 'hand2r',
+})
+
+
+def _normalize_native_human_display(arm_obj, mesh_parent_name, has_skin,
+                                     skip_mdl_transform, strict=False):
+    """Explicitly repair a clearly identified human armature for Pose Mode.
+
+    The low-level importer calls this only when its explicit opt-in is set by
+    the high-level human model importer, after baking the mesh root transform.
+    ``strict=True`` re-raises a display-rest rebuild failure so a high-level
+    import cannot report a poseable rig when it is still in raw display space.
+    """
+    if (skip_mdl_transform or not has_skin or arm_obj is None
+            or mesh_parent_name != 'skin'
+            or arm_obj.get('gem2_human_rest_display_rest')
+            or not arm_obj.get('gem2_world_mats')
+            or not arm_obj.get('gem2_parents')):
+        return None
+    if not _NATIVE_HUMAN_DISPLAY_BONES.issubset(
+            {bone.name for bone in arm_obj.data.bones}):
+        return None
+    try:
+        from . import human_rest_convert
+        graph = human_rest_convert.graph_from_armature(arm_obj)
+        report = human_rest_convert.apply_human_display_rest(
+            arm_obj, graph, mark_raw=False)
+        print('[human] normalized native display rest:', arm_obj.name,
+              'max_delta=', report.get('max_delta', 0.0))
+        return report
+    except Exception as exc:
+        # Low-level inspection can continue when a thin Blender context cannot
+        # enter Edit mode; high-level human import requests strict behavior.
+        print('[human] display-rest normalization skipped:', exc)
+        if strict:
+            raise
+        return None
+
+
 def import_ply(filepath, skip_mdl_transform=False, skip_armature=False,
-               create_helpers=True):
+               create_helpers=True, existing_armature=None,
+               existing_group=None, reference_object=None,
+               mdl_path_override=None, mesh_parent_override=None,
+                normalize_human_display=False):
+                
     """主 PLY 导入函数。返回 (mesh_obj, arm_obj, root_empty)
+
+     ``normalize_human_display=True`` 仅在调用方已确认这是挂在原始
+     ``skin`` 骨上的 human PLY 时使用；它只重建 Blender 的归一化显示 rest，
+     不改写 ``gem2_world_mats`` 等原始 MDL 导出元数据。默认关闭以保留低层
+     调试/载具兼容性。
 
     ``skip_armature``/``create_helpers=False`` 供载具文件夹导入：载具只创建一套
     MDL 主骨架，每个部件 PLY 不再额外扫描同目录 MDL、创建重复骨架和空节点。
+
+    ``existing_armature``/``existing_group`` 供人物多 PLY 导入：后续分片复用
+    第一片创建的骨架和模型组，同时仍按各自 SKIN/palette 建立权重。引用对象用于
+    复制第一片的最终对象变换，保证同一骨下的直接 VolumeView 完全重合；显式
+    mesh_parent_override 避免多挂接骨 MDL 的“最后一个 VolumeView”猜测。
 
     自适应解析多种二进制变体：
       - 插件导出的原生格式：EPLY+BNDS / SKIN(长度前缀) / MESH / VERT(带头) / INDX(count+u16)
@@ -567,7 +624,7 @@ def import_ply(filepath, skip_mdl_transform=False, skip_armature=False,
     bpy.context.collection.objects.link(obj)
 
     root_empty = None
-    if create_helpers:
+    if create_helpers and existing_group is None:
         root_empty = bpy.data.objects.new(mesh_name + "_Root", None)
         bpy.context.collection.objects.link(root_empty)
         root_empty.empty_display_type = 'PLAIN_AXES'
@@ -694,37 +751,67 @@ def import_ply(filepath, skip_mdl_transform=False, skip_armature=False,
     mesh.update()
 
     # ── MDL 骨骼 ──
-    mdl_path = None if skip_armature else _find_mdl_path(filepath)
+    mdl_path = None
     mdl_bones = None
     mesh_parent_name = None
-    if mdl_path and os.path.isfile(mdl_path):
-        print(_("ply.mdl_found", path=mdl_path))
-        with open(mdl_path, 'r', encoding='utf-8', errors='ignore') as f:
-            mdl_bones, mesh_parent_name = _parse_bones_flat(f.read())
-    elif not skip_armature:
-        print(_("ply.mdl_not_found"))
-
-    # ── 骨架创建 ──
-    arm_obj = None
+    arm_obj = existing_armature
     world_mats = None
-    if mdl_bones:
-        arm_obj = _build_armature_from_mdl(
-            mesh_name, mdl_bones, mesh_parent_name, mdl_path)
-        world_mats = _precompute_bone_world_mats(mdl_bones)
-    elif not skip_armature and has_skin and bone_names:
-        arm_data = bpy.data.armatures.new(mesh_name + "_Arm")
-        arm_obj = bpy.data.objects.new(mesh_name + "_Armature", arm_data)
-        bpy.context.collection.objects.link(arm_obj)
-        bpy.context.view_layer.objects.active = arm_obj
-        bpy.ops.object.mode_set(mode='EDIT')
-        for name in bone_names:
-            eb = arm_data.edit_bones.new(name)
-            eb.head = (0, 0, 0)
-            eb.tail = (0.5, 0, 0)
-        bpy.ops.object.mode_set(mode='OBJECT')
-        arm_obj.display_type = 'WIRE'
-        arm_obj.show_in_front = True
-        world_mats = None
+
+    if existing_armature is not None:
+        if existing_armature.type != 'ARMATURE':
+            raise TypeError('existing_armature must be an ARMATURE object')
+        mdl_path = (mdl_path_override
+                    or str(existing_armature.get('gem2_mdl_path') or ''))
+        mesh_parent_name = (mesh_parent_override or str(
+            existing_armature.get('gem2_mesh_parent') or '') or None)
+        try:
+            stored_world = json.loads(
+                str(existing_armature.get('gem2_world_mats') or '{}'))
+            world_mats = {
+                name: Matrix(rows) for name, rows in stored_world.items()
+            }
+            stored_parents = json.loads(
+                str(existing_armature.get('gem2_parents') or '{}'))
+            mdl_bones = {
+                name: {'parent': (parent or None)}
+                for name, parent in stored_parents.items()
+            }
+        except (TypeError, ValueError):
+            world_mats = None
+            mdl_bones = None
+    elif not skip_armature:
+        mdl_path = mdl_path_override or _find_mdl_path(filepath)
+        if mdl_path and os.path.isfile(mdl_path):
+            print(_("ply.mdl_found", path=mdl_path))
+            with open(mdl_path, 'r', encoding='utf-8', errors='ignore') as f:
+                mdl_bones, mesh_parent_name = _parse_bones_flat(f.read())
+            if mesh_parent_override:
+                if mesh_parent_override not in mdl_bones:
+                    raise RuntimeError(
+                        'MDL attachment bone not found: ' + mesh_parent_override)
+                mesh_parent_name = mesh_parent_override
+        else:
+            print(_("ply.mdl_not_found"))
+
+        # ── 骨架创建 ──
+        if mdl_bones:
+            arm_obj = _build_armature_from_mdl(
+                mesh_name, mdl_bones, mesh_parent_name, mdl_path)
+            world_mats = _precompute_bone_world_mats(mdl_bones)
+        elif has_skin and bone_names:
+            arm_data = bpy.data.armatures.new(mesh_name + "_Arm")
+            arm_obj = bpy.data.objects.new(mesh_name + "_Armature", arm_data)
+            bpy.context.collection.objects.link(arm_obj)
+            bpy.context.view_layer.objects.active = arm_obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            for name in bone_names:
+                eb = arm_data.edit_bones.new(name)
+                eb.head = (0, 0, 0)
+                eb.tail = (0.5, 0, 0)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            arm_obj.display_type = 'WIRE'
+            arm_obj.show_in_front = True
+            world_mats = None
 
     if arm_obj and root_empty:
         arm_obj.parent = root_empty
@@ -830,9 +917,24 @@ def import_ply(filepath, skip_mdl_transform=False, skip_armature=False,
     if not skip_mdl_transform and root_empty:
         _apply_root_transform(obj, arm_obj, root_empty)
 
+    # The low-level importer keeps its historical raw rest by default.  The
+    # high-level human importer opts in only after the root transform has been
+    # baked on the mesh, so Blender's display bones and weighted vertices share
+    # the same ancestor-normalized space while raw MDL metadata stays intact.
+    if normalize_human_display:
+        _normalize_native_human_display(
+            arm_obj, mesh_parent_name, has_skin, skip_mdl_transform)
+
     # ── 群组节点 ──
     group_empty = None
-    if create_helpers:
+    if existing_group is not None:
+        target_world = (reference_object.matrix_world.copy()
+                        if reference_object is not None else None)
+        obj.parent = existing_group
+        if target_world is not None:
+            obj.matrix_world = target_world
+        group_empty = existing_group
+    elif create_helpers:
         group_empty = bpy.data.objects.new(mesh_name + "_Model", None)
         bpy.context.collection.objects.link(group_empty)
         group_empty.empty_display_type = 'PLAIN_AXES'
@@ -990,11 +1092,14 @@ def _fix_viewport():
 # ═══════════════════════════════════════════════════════════════
 
 def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
-    """导出二进制 PLY 文件，并按最终属性共享可复用的顶点。"""
-    mesh = mesh_obj.data
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    """导出二进制 PLY 文件，并按最终属性共享可复用的顶点。
 
+    ``skin_world`` is the attachment-local VolumeView matrix.  Callers with
+    stored MDL metadata should use ``mdl_io.mesh_parent_local_matrix`` rather
+    than passing the raw world matrix. For skinned meshes, object transforms are
+    converted from Blender world space into the armature/model frame here.
+    """
+    mesh = mesh_obj.data
     if not mesh.uv_layers.active:
         raise Exception("Mesh has no UV layers")
     if not mesh.materials:
@@ -1006,16 +1111,64 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
 
     has_skin = bool(arm_obj and mesh_obj.vertex_groups)
     bones_count = len(mesh_obj.vertex_groups) if has_skin else 0
+    skin_name_bytes = []
+    if has_skin:
+        if bones_count > 254:
+            raise ValueError(
+                "Skinned EPLY supports at most 254 bone groups plus palette slot 0")
+        for group in mesh_obj.vertex_groups:
+            try:
+                encoded = group.name.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "Skinned EPLY bone group names must be ASCII: " + group.name
+                ) from exc
+            if not encoded or len(encoded) > 255:
+                raise ValueError(
+                    "Skinned EPLY bone group name must contain 1-255 ASCII bytes: "
+                    + group.name)
+            skin_name_bytes.append(encoded)
+
+    material_name_bytes = []
+    for material in mesh.materials:
+        material_name = material.name if material else ''
+        try:
+            encoded = (material_name + '.mtl').encode('ascii')
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                'EPLY material names must be ASCII: ' + material_name) from exc
+        if len(encoded) > 255:
+            raise ValueError(
+                'EPLY material name must contain at most 251 ASCII bytes: '
+                + material_name)
+        material_name_bytes.append(encoded)
 
     skin_world_inv = Matrix.Identity(4)
     if has_skin and skin_world is not None:
         skin_world_inv = skin_world.inverted()
 
+    # Skinned coordinates are serialized in the armature/model frame below the
+    # local VolumeView attachment.  The old generic path assumed both object
+    # transforms were identity, which silently exported a rotated/scaled mesh
+    # in the wrong frame after human-rest conversion.
+    mesh_to_ply = skin_world_inv
+    normal_matrix = Matrix.Identity(3)
+    if has_skin and arm_obj is not None:
+        try:
+            mesh_to_armature = arm_obj.matrix_world.inverted() @ mesh_obj.matrix_world
+            mesh_to_ply = skin_world_inv @ mesh_to_armature
+            normal_matrix = mesh_to_ply.to_3x3().inverted().transposed()
+        except (ValueError, ZeroDivisionError, RuntimeError) as exc:
+            raise ValueError(
+                'Mesh/armature transform is singular during PLY export') from exc
+
     uvs = [uv.uv for uv in mesh.uv_layers.active.data]
     if has_skin:
         from heapq import nlargest
         vertex_weights = [
-            [(g.weight, g.group) for g in nlargest(2, v.groups, key=lambda g: g.weight)]
+            [(g.weight, g.group)
+             for g in nlargest(2, v.groups, key=lambda g: g.weight)
+             if g.weight > 1e-6]
             for v in mesh.vertices
         ]
 
@@ -1032,17 +1185,26 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
     def record_for_loop(loop):
         v_idx = loop.vertex_index
         v = mesh.vertices[v_idx]
-        pos = skin_world_inv @ v.co
+        pos = mesh_to_ply @ v.co
         record = bytearray()
         record.extend(pack_fff(pos.x * unit_scale, pos.y * unit_scale,
                                pos.z * unit_scale))
         if has_skin:
-            wl = vertex_weights[v_idx] + [(0, 0)] * (4 - len(vertex_weights[v_idx]))
-            weight_sum = wl[0][0] + wl[1][0]
-            inv = 1.0 / weight_sum if weight_sum > 0 else 1.0
-            record.extend(pack_f(wl[0][0] * inv))
-            record.extend(pack_BBBB(*(w[1] for w in wl)))
-        record.extend(pack_fff(*loop.normal))
+            influences = vertex_weights[v_idx]
+            weight_sum = sum(weight for weight, _group in influences[:2])
+            first_weight = (influences[0][0] / weight_sum
+                            if influences and weight_sum > 0 else 0.0)
+            palette_slots = [group + 1 for _weight, group in influences[:2]]
+            palette_slots.extend([0] * (4 - len(palette_slots)))
+            record.extend(pack_f(first_weight))
+            record.extend(pack_BBBB(*palette_slots))
+        if has_skin:
+            normal = normal_matrix @ loop.normal
+            if normal.length_squared > 1.0e-20:
+                normal.normalize()
+        else:
+            normal = loop.normal.copy()
+        record.extend(pack_fff(*normal))
         record.extend(pack_I(0xFFFFFFFF))
         record.extend(pack_ff(uvs[loop.index][0], 1.0 - uvs[loop.index][1]))
         key = bytes(record)
@@ -1069,8 +1231,20 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
     with open(filepath, "wb") as f:
         f.write(b"EPLY")
 
-        bbox_min = skin_world_inv @ (Vector(eval_obj.bound_box[0]) * unit_scale)
-        bbox_max = skin_world_inv @ (Vector(eval_obj.bound_box[6]) * unit_scale)
+        # BNDS must describe the records actually emitted. An evaluated
+        # object's bound_box can include modifier geometry that this low-level
+        # writer does not serialize, producing a misleading culling box.
+        bbox_points = [Vector(unpack_fff(bytes(record[:12])))
+                       for record in vertex_records]
+        if bbox_points:
+            bbox_min = Vector((min(point.x for point in bbox_points),
+                               min(point.y for point in bbox_points),
+                               min(point.z for point in bbox_points)))
+            bbox_max = Vector((max(point.x for point in bbox_points),
+                               max(point.y for point in bbox_points),
+                               max(point.z for point in bbox_points)))
+        else:
+            bbox_min = bbox_max = Vector((0.0, 0.0, 0.0))
         f.write(b"BNDS")
         f.write(pack_fff(*bbox_min))
         f.write(pack_fff(*bbox_max))
@@ -1078,11 +1252,7 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
         if has_skin:
             f.write(b"SKIN")
             f.write(pack_I(bones_count))
-            for vg in mesh_obj.vertex_groups:
-                try:
-                    name_bytes = vg.name.encode("ascii")
-                except UnicodeEncodeError:
-                    continue  # skip Japanese-named VGs
+            for name_bytes in skin_name_bytes:
                 f.write(pack_B(len(name_bytes)))
                 f.write(name_bytes)
 
@@ -1105,17 +1275,14 @@ def export_ply(filepath, mesh_obj, arm_obj, unit_scale=1.0, skin_world=None):
                 flags |= MESH_FLAG_SKINNED | MESH_FLAG_SUBSKIN
             f.write(pack_I(flags))
 
-            try:
-                mat_name = mesh.materials[i].name
-            except:
-                mat_name = ""
-            mtl_name = mat_name + ".mtl"
-            f.write(pack_B(len(mtl_name)))
-            f.write(mtl_name.encode("ascii"))
+            mtl_name_bytes = material_name_bytes[i]
+            f.write(pack_B(len(mtl_name_bytes)))
+            f.write(mtl_name_bytes)
 
             if has_skin:
-                f.write(pack_B(bones_count))
-                f.write(struct.pack("B" * bones_count, *(i + 1 for i in range(bones_count))))
+                palette = [0] + [index + 1 for index in range(bones_count)]
+                f.write(pack_B(len(palette)))
+                f.write(bytes(palette))
 
         stride = len(vertex_records[0]) if vertex_records else (44 if has_skin else 36)
         f.write(b"VERT")

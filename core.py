@@ -134,7 +134,7 @@ def find_matching_brace(text, start):
 
 # ── User settings persistence ──────────────────────────────────
 
-_SETTINGS_VERSION = 1
+_SETTINGS_VERSION = 2
 
 
 def _get_legacy_paths_file():
@@ -180,6 +180,8 @@ def _load_settings():
     }
     if not isinstance(data.get('panels'), dict):
         data['panels'] = {}
+    if not isinstance(data.get('export_presets'), dict):
+        data['export_presets'] = {}
     return data
 
 
@@ -244,6 +246,59 @@ def set_panel_settings(panel_id, values):
 def clear_panel_settings(panel_id):
     _settings['panels'].pop(str(panel_id), None)
     _save_settings()
+
+
+def _clean_json_setting(value, depth=0):
+    if depth > 6:
+        raise ValueError('preset settings are nested too deeply')
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_clean_json_setting(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        clean = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError('preset setting keys must be nonempty text')
+            clean[key] = _clean_json_setting(item, depth + 1)
+        return clean
+    raise TypeError('preset settings must contain JSON-compatible values')
+
+
+def get_export_presets():
+    """Return a detached mapping of named MOWAS2/GOH export presets."""
+    return json.loads(json.dumps(_settings.get('export_presets', {}),
+                                 ensure_ascii=False))
+
+
+def get_export_preset(name):
+    value = _settings.get('export_presets', {}).get(str(name), None)
+    if not isinstance(value, dict):
+        return None
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def save_export_preset(name, values):
+    name = str(name or '').strip()
+    if not name or len(name) > 64 or any(ord(char) < 32 for char in name):
+        raise ValueError('preset name must contain 1-64 printable characters')
+    if not isinstance(values, dict):
+        raise TypeError('preset settings must be a mapping')
+    existing = next((key for key in _settings['export_presets']
+                     if key.casefold() == name.casefold()), None)
+    if existing and existing != name:
+        del _settings['export_presets'][existing]
+    _settings['export_presets'][name] = _clean_json_setting(values)
+    _save_settings()
+
+
+def delete_export_preset(name):
+    name = str(name or '')
+    if name not in _settings.get('export_presets', {}):
+        return False
+    del _settings['export_presets'][name]
+    _save_settings()
+    return True
 
 # ── Template armature loading ──────────────────────────────────
 

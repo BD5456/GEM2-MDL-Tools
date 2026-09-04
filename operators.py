@@ -4,7 +4,7 @@ Blender operators: Import GEM2 PLY, Export GEM2, and File Handler.
 import traceback
 import os
 import bpy
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from .i18n import _
@@ -66,8 +66,13 @@ def _expanded_fbx_selection(context):
 class ImportGEM2PLY(bpy.types.Operator, ImportHelper):
     bl_idname = "import_scene.gem2ply"
     bl_label = _("operator.import_ply.label")
+    bl_description = _("operator.import_ply.desc")
     bl_options = {'UNDO'}
     filter_glob: StringProperty(default="*.ply", options={'HIDDEN'})
+    auto_multipart: BoolProperty(
+        name=_("operator.import_ply.auto_multipart"),
+        description=_("operator.import_ply.auto_multipart.desc"),
+        default=True)
 
     def invoke(self, context, event):
         paths = _get_paths()
@@ -76,12 +81,57 @@ class ImportGEM2PLY(bpy.types.Operator, ImportHelper):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+    def draw(self, context):
+        self.layout.prop(self, "auto_multipart")
+
     def execute(self, context):
         try:
             _set_import_dir(os.path.dirname(self.filepath))
-            from .ply_io import import_ply
-            import_ply(self.filepath)
-            self.report({'INFO'}, _("operator.import_ply.imported", path=self.filepath))
+            from .multipart_import import import_model_from_ply
+            summary = import_model_from_ply(
+                self.filepath, auto_multipart=self.auto_multipart)
+            if summary['part_count'] > 1:
+                self.report({'INFO'}, _(
+                    "operator.import_ply.imported_multi",
+                    parts=summary['part_count'],
+                    path=summary['directory']))
+            else:
+                self.report({'INFO'}, _(
+                    "operator.import_ply.imported", path=self.filepath))
+            return {'FINISHED'}
+        except Exception as e:
+            traceback.print_exc()
+            self.report({'ERROR'}, _("operator.import_ply.failed", error=e))
+            return {'CANCELLED'}
+
+
+class ImportGEM2PLYFolder(bpy.types.Operator):
+    bl_idname = "import_scene.gem2ply_folder"
+    bl_label = _("operator.import_ply_folder.label")
+    bl_description = _("operator.import_ply_folder.desc")
+    bl_options = {'UNDO'}
+
+    directory: StringProperty(
+        name=_("operator.import_ply_folder.directory"), subtype='DIR_PATH')
+    filter_glob: StringProperty(
+        default="*.mdl;*.ply", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        paths = _get_paths()
+        if paths.get('import') and os.path.isdir(paths['import']):
+            self.directory = paths['import']
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        try:
+            directory = os.path.abspath(bpy.path.abspath(self.directory))
+            _set_import_dir(directory)
+            from .multipart_import import import_model_folder
+            summary = import_model_folder(directory)
+            self.report({'INFO'}, _(
+                "operator.import_ply_folder.imported",
+                parts=summary['part_count'], path=directory))
             return {'FINISHED'}
         except Exception as e:
             traceback.print_exc()
@@ -216,6 +266,126 @@ class ExportGEM2FBX(bpy.types.Operator, ExportHelper):
                 self.report({'INFO'}, _(
                     "operator.export_fbx.done", file=filepath))
             return result
+        except Exception as exc:
+            traceback.print_exc()
+            self.report({'ERROR'}, _("operator.export.failed", error=exc))
+            return {'CANCELLED'}
+
+
+class GEM2_OT_MultipartPreflight(bpy.types.Operator):
+    bl_idname = "gem2.multipart_preflight"
+    bl_label = _("operator.export_multipart.preflight")
+    bl_description = _("operator.export_multipart.preflight.desc")
+    bl_options = {'REGISTER'}
+
+    use_selection: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+    record_limit: bpy.props.IntProperty(default=65535, min=3, max=65535)
+
+    def execute(self, context):
+        try:
+            from .multipart_export import analyze_selected_model
+            summary = analyze_selected_model(
+                context,
+                use_selection=self.use_selection,
+                record_limit=self.record_limit,
+            )
+            message = _(
+                "operator.export_multipart.preflight.done",
+                meshes=summary['source_meshes'],
+                triangles=summary['triangles'],
+                records=summary['total_records'],
+                parts=summary['required_parts'],
+                limit=summary['record_limit'])
+            truncated = summary['truncated_influence_vertices']
+            if truncated:
+                message += " | " + _(
+                    "operator.export_multipart.top2_warning",
+                    count=truncated)
+            props = getattr(context.scene, 'mowas2_props', None)
+            if props is not None:
+                props.report = message
+            print('[multipart-preflight]', summary)
+            self.report({'WARNING'} if truncated else {'INFO'}, message)
+            return {'FINISHED'}
+        except Exception as exc:
+            traceback.print_exc()
+            self.report({'ERROR'}, _("operator.export.failed", error=exc))
+            return {'CANCELLED'}
+
+
+class ExportGEM2Multipart(bpy.types.Operator, ExportHelper):
+    """Export selected imported meshes as one lossless multipart GEM2 model."""
+
+    bl_idname = "export_scene.gem2_multipart"
+    bl_label = _("operator.export_multipart.label")
+    bl_description = _("operator.export_multipart.desc")
+    bl_options = {'REGISTER'}
+
+    filename_ext = ".mdl"
+    filter_glob: StringProperty(default="*.mdl", options={'HIDDEN'})
+    use_selection: bpy.props.BoolProperty(
+        name=_("operator.export_multipart.selection"), default=True)
+    record_limit: bpy.props.IntProperty(
+        name=_("operator.export_multipart.limit"),
+        description=_("operator.export_multipart.limit.desc"),
+        default=65535, min=3, max=65535)
+    material_mode: bpy.props.EnumProperty(
+        name=_("operator.export.material_format"),
+        items=(
+            ('SIMPLE', _("operator.export.simple"), ''),
+            ('BUMP', _("operator.export.bump"), ''),
+        ),
+        default='SIMPLE')
+    copy_textures: bpy.props.BoolProperty(
+        name=_("operator.export_multipart.textures"), default=True)
+
+    def invoke(self, context, event):
+        paths = _get_paths()
+        directory = paths.get('export') or ''
+        if not os.path.isdir(directory):
+            directory = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else ''
+        active = context.active_object
+        basename = (active.name if active and active.type == 'MESH'
+                    else os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+                    if bpy.data.filepath else 'model')
+        if directory:
+            self.filepath = os.path.join(directory, basename + self.filename_ext)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "use_selection")
+        layout.prop(self, "record_limit")
+        layout.prop(self, "material_mode")
+        layout.prop(self, "copy_textures")
+
+    def execute(self, context):
+        try:
+            if not self.filepath:
+                self.report({'ERROR'}, _("operator.export.select_dir"))
+                return {'CANCELLED'}
+            _set_export_dir(os.path.dirname(self.filepath))
+            from .multipart_export import export_selected_model
+            summary = export_selected_model(
+                context,
+                self.filepath,
+                use_selection=self.use_selection,
+                record_limit=self.record_limit,
+                material_mode=self.material_mode,
+                copy_textures=self.copy_textures,
+            )
+            print('[multipart-export]', summary)
+            if summary['truncated_influence_vertices']:
+                self.report({'WARNING'}, _(
+                    "operator.export_multipart.top2_warning",
+                    count=summary['truncated_influence_vertices']))
+            self.report({'INFO'}, _(
+                "operator.export_multipart.done",
+                parts=len(summary['parts']),
+                records=summary['total_records'],
+                dir=summary['output_dir']))
+            return {'FINISHED'}
         except Exception as exc:
             traceback.print_exc()
             self.report({'ERROR'}, _("operator.export.failed", error=exc))
@@ -427,18 +597,24 @@ class IO_FH_gem2ply(bpy.types.FileHandler):
 
 
 def _menu_import(self, context):
+    self.layout.operator(
+        ImportGEM2PLYFolder.bl_idname, text=_("menu.import.ply_folder"))
     self.layout.operator(ImportGEM2PLY.bl_idname, text=_("menu.import.ply"))
     self.layout.operator(ImportGEM2VOL.bl_idname, text=_("menu.import.vol"))
     self.layout.operator(ImportGEM2ANM.bl_idname, text=_("menu.import.anm"))
 
 def _menu_export(self, context):
+    self.layout.operator(
+        ExportGEM2Multipart.bl_idname, text=_("menu.export.multipart"))
     self.layout.operator(ExportGEM2FBX.bl_idname, text=_("menu.export.fbx"))
     self.layout.operator(ExportGEM2ANM.bl_idname, text=_("menu.export.anm"))
 
 
-OPERATOR_CLASSES = (ImportGEM2PLY, ImportGEM2VOL, ImportGEM2ANM,
-                    ExportGEM2FBX, ExportGEM2ANM, ExtractGOHANM,
-                    IO_FH_gem2ply, IO_FH_gem2anm)
+OPERATOR_CLASSES = (ImportGEM2PLY, ImportGEM2PLYFolder,
+                     ImportGEM2VOL, ImportGEM2ANM,
+                    GEM2_OT_MultipartPreflight, ExportGEM2Multipart,
+                    ExportGEM2FBX, ExportGEM2ANM,
+                    ExtractGOHANM, IO_FH_gem2ply, IO_FH_gem2anm)
 
 
 def register():
