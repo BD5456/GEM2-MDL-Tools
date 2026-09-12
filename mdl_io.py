@@ -167,24 +167,52 @@ def flatten_bones(root_bones):
     return flat
 
 
+def _bone_header_regex(bone_name):
+    return re.compile(
+        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
+        + re.escape(str(bone_name)) + r'"',
+        re.IGNORECASE)
+
+
+def _skeleton_search_span(content):
+    """Search the Skeleton block when present.
+
+    Vehicle/weapon MDLs repeat ``{Bone "body"}`` inside collision Volume
+    blocks. Those are attachments, not bone declarations, so a whole-file
+    case-insensitive ``{bone "body"`` search reports duplicates.
+    """
+    match = re.search(r'\{\s*skeleton\b', content, re.IGNORECASE)
+    if match is None:
+        return 0, len(content)
+    end = find_matching_brace(content, match.start())
+    if end < 0:
+        raise RuntimeError("Unbalanced MDL skeleton block")
+    return match.start(), end + 1
+
+
+def find_named_bone_span(content, bone_name, label="MDL bone"):
+    """Return the unique skeleton bone block span named *bone_name*."""
+    header = _bone_header_regex(bone_name)
+    search_start, search_end = _skeleton_search_span(content)
+    headers = list(header.finditer(content, search_start, search_end))
+    if len(headers) != 1:
+        raise RuntimeError(
+            "Expected exactly one %s %r, found %d"
+            % (label, bone_name, len(headers)))
+    bone_start = headers[0].start()
+    bone_end = find_matching_brace(content, bone_start)
+    if bone_end < 0 or bone_end >= search_end:
+        raise RuntimeError("Unbalanced MDL bone block: " + str(bone_name))
+    return bone_start, bone_end
+
+
 def direct_volume_views(content, bone_name):
     """Return only VolumeView entries directly inside one bone block.
 
     VolumeViews nested inside LODView or another child block are alternatives,
     not simultaneously visible multipart geometry, and are intentionally skipped.
     """
-    header = re.compile(
-        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
-        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
-    headers = list(header.finditer(content))
-    if len(headers) != 1:
-        raise RuntimeError(
-            "Expected exactly one MDL bone %r, found %d"
-            % (bone_name, len(headers)))
-    bone_start = headers[0].start()
-    bone_end = find_matching_brace(content, bone_start)
-    if bone_end < 0:
-        raise RuntimeError("Unbalanced MDL bone block: " + str(bone_name))
+    bone_start, bone_end = find_named_bone_span(content, bone_name)
 
     view_pattern = re.compile(
         r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}',

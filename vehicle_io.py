@@ -1029,12 +1029,37 @@ def _export_vehicle_textures(output_dir, src_dir, parts):
     }
 
 
+def _vehicle_entity_name(root_obj, src_dir, mdl_path=None):
+    """Prefer the source MDL/folder basename as the entity folder name."""
+    if mdl_path:
+        name = os.path.splitext(os.path.basename(mdl_path))[0].strip()
+        if name:
+            return name
+    name = os.path.basename(os.path.normpath(src_dir)).strip()
+    if name and name not in {'.', os.sep, '/'}:
+        return name
+    return str(getattr(root_obj, 'name', '') or 'vehicle')
+
+
+def _resolve_entity_output_dir(chosen_dir, entity_name):
+    """Write whole-package exports into <chosen>/<entity>/, without double-nesting."""
+    chosen = os.path.abspath(chosen_dir)
+    entity_name = str(entity_name or '').strip()
+    if not entity_name:
+        return chosen
+    if os.path.basename(chosen).casefold() == entity_name.casefold():
+        return chosen
+    return os.path.join(chosen, entity_name)
+
+
 def export_vehicle_folder(output_dir, root_obj=None, target_game=None):
     """Safely export a vehicle folder and optionally convert its MDL dialect.
 
     PLY/VOL payloads and all non-MDL sidecars keep the existing safe-export
     behavior. ``target_game`` may be ``GOH`` or ``MOWAS2``; conversion is
     deliberately limited to known incompatible MDL animation syntax.
+    Whole-package output is nested into an entity-named subfolder unless the
+    chosen directory already has that name.
     """
     output_dir = os.path.abspath(output_dir)
     if root_obj is None:
@@ -1052,11 +1077,13 @@ def export_vehicle_folder(output_dir, root_obj=None, target_game=None):
     src_dir = root_obj.get(FOLDER_KEY)
     if not src_dir or not os.path.isdir(src_dir):
         raise RuntimeError('载具来源目录缺失: %s' % src_dir)
+    mdl_path = _find_mdl(src_dir)
+    output_dir = _resolve_entity_output_dir(
+        output_dir, _vehicle_entity_name(root_obj, src_dir, mdl_path))
     if os.path.normcase(output_dir) == os.path.normcase(os.path.abspath(src_dir)):
         raise RuntimeError('为避免覆盖原始模板，载具导出目录不能等于来源目录')
 
     target_name = str(target_game or '').strip().upper()
-    mdl_path = _find_mdl(src_dir)
     goh_def_plan = None
     if target_name == 'GOH':
         if not mdl_path:
@@ -1435,6 +1462,10 @@ class MOWAS2_OT_ImportVehicleFolder(bpy.types.Operator):
     directory: bpy.props.StringProperty(subtype='DIR_PATH')
 
     def invoke(self, context, event):
+        from .core import get_paths
+        import_dir = get_paths().get('import') or ''
+        if import_dir and os.path.isdir(import_dir):
+            self.directory = import_dir
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1443,6 +1474,8 @@ class MOWAS2_OT_ImportVehicleFolder(bpy.types.Operator):
             if not self.directory or not os.path.isdir(self.directory):
                 self.report({'ERROR'}, _("vehicle.err.select_import_dir"))
                 return {'CANCELLED'}
+            from .core import set_import_dir
+            set_import_dir(self.directory)
             root = import_vehicle_folder(self.directory)
             _frame_selected_vehicle(context)
             props = context.scene.mowas2_props
@@ -1464,7 +1497,7 @@ def _invoke_vehicle_export(operator, context):
     return {'RUNNING_MODAL'}
 
 
-def _execute_vehicle_export(operator, context, target_game):
+def _execute_vehicle_export(operator, context, target_game=None):
     try:
         if not operator.directory:
             operator.report({'ERROR'}, _("vehicle.err.select_export_dir"))
@@ -1472,8 +1505,11 @@ def _execute_vehicle_export(operator, context, target_game):
         out = export_vehicle_folder(
             operator.directory, target_game=target_game)
         props = context.scene.mowas2_props
-        message = _("vehicle.info.exported_target", dir=out,
-                    target=target_game)
+        if target_game:
+            message = _("vehicle.info.exported_target", dir=out,
+                        target=target_game)
+        else:
+            message = _("vehicle.info.exported", dir=out)
         props.report = message
         operator.report({'INFO'}, message)
         return {'FINISHED'}
@@ -1486,10 +1522,10 @@ def _execute_vehicle_export(operator, context, target_game):
 
 
 class MOWAS2_OT_ExportVehicleFolder(bpy.types.Operator):
-    """Compatibility alias for the former vehicle export operator."""
+    """Export the imported vehicle as a complete entity folder."""
     bl_idname = "gem2.mowas2_export_vehicle_folder"
-    bl_label = _("vehicle.export_mowas2.label")
-    bl_description = _("vehicle.export_mowas2.desc")
+    bl_label = _("vehicle.export.label")
+    bl_description = _("vehicle.export.desc")
     bl_options = {'REGISTER', 'UNDO'}
 
     directory: bpy.props.StringProperty(subtype='DIR_PATH')
@@ -1498,7 +1534,7 @@ class MOWAS2_OT_ExportVehicleFolder(bpy.types.Operator):
         return _invoke_vehicle_export(self, context)
 
     def execute(self, context):
-        return _execute_vehicle_export(self, context, 'MOWAS2')
+        return _execute_vehicle_export(self, context)
 
 
 class GEM2_OT_ExportVehicleToMOWAS2(bpy.types.Operator):

@@ -118,6 +118,49 @@ def _plan_is_human(plan):
         for path in paths)
 
 
+def _attachment_names(direct_map):
+    return {str(name).casefold() for name in (direct_map or ())}
+
+
+def _looks_like_human_skin(direct_map, has_skin):
+    return bool(has_skin and "skin" in _attachment_names(direct_map))
+
+
+def _should_import_as_vehicle(mdl_path, direct_map, has_skin):
+    """Route rigid multi-bone / collision MDLs through vehicle folder import.
+
+    Human skins stay on the skinned PLY path. Vehicles, weapons, and other
+    models with multiple VolumeViews or ``{Volume}`` collision blocks need
+    the vehicle importer so per-bone parts and volumes survive. Rigid meshes
+    can contain coincidental ``SKIN`` bytes, so a SKIN hit only keeps the
+    human path when the MDL actually attaches to ``skin``.
+    """
+    if _looks_like_human_skin(direct_map, has_skin):
+        return False
+    if len(direct_map) > 1:
+        return True
+    try:
+        with open(mdl_path, "r", encoding="utf-8", errors="ignore") as handle:
+            content = handle.read()
+    except OSError:
+        return False
+    return bool(re.search(r'\{\s*Volume\s+"', content, re.IGNORECASE))
+
+
+def _vehicle_plan(directory, mdl_path, direct_map):
+    resolved = _resolve_map(directory, direct_map, require_all=True)
+    all_paths = _deduplicate_paths(
+        path for paths in resolved.values() for path in paths)
+    return {
+        "mode": "vehicle",
+        "source": "mdl",
+        "directory": directory,
+        "mdl_path": mdl_path,
+        "attachment_bone": None,
+        "ply_paths": all_paths,
+    }
+
+
 def _read_direct_map(mdl_path):
     with open(mdl_path, "r", encoding="utf-8", errors="ignore") as handle:
         content = handle.read()
@@ -213,18 +256,9 @@ def discover_ply_model(filepath):
         if not selected_parts:
             raise RuntimeError("Selected MDL bone has no importable PLY views")
 
-        if len(direct_map) > 1 and not _ply_has_skin(filepath):
-            resolved = _resolve_map(directory, direct_map, require_all=True)
-            all_paths = _deduplicate_paths(
-                path for paths in resolved.values() for path in paths)
-            return {
-                "mode": "vehicle",
-                "source": "mdl",
-                "directory": directory,
-                "mdl_path": mdl_path,
-                "attachment_bone": None,
-                "ply_paths": all_paths,
-            }
+        if _should_import_as_vehicle(
+                mdl_path, direct_map, _ply_has_skin(filepath)):
+            return _vehicle_plan(directory, mdl_path, direct_map)
         return {
             "mode": "multipart" if len(selected_parts) > 1 else "single",
             "source": "mdl",
@@ -285,11 +319,12 @@ def discover_ply_folder(directory):
     all_paths = _deduplicate_paths(
         path for paths in resolved.values() for path in paths)
     has_skin = any(_ply_has_skin(path) for path in all_paths)
-    if len(resolved) > 1:
-        if has_skin:
-            raise RuntimeError(
-                "Folder mixes skinned PLY parts across multiple attachment bones; "
-                "select a PLY on the desired multipart character bone instead")
+    if (has_skin and len(resolved) > 1
+            and "skin" in _attachment_names(resolved)):
+        raise RuntimeError(
+            "Folder mixes skinned PLY parts across multiple attachment bones; "
+            "select a PLY on the desired multipart character bone instead")
+    if _should_import_as_vehicle(mdl_path, resolved, has_skin):
         return {
             "mode": "vehicle",
             "source": "mdl",

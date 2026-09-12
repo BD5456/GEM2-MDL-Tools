@@ -17,6 +17,7 @@ import uuid
 import bpy
 from mathutils import Matrix
 
+from .i18n import _
 from .texture_export import resolve_material_image
 
 from .core import (
@@ -38,7 +39,6 @@ from .core import (
     pack_H,
     pack_HHH,
     pack_I,
-    find_matching_brace,
 )
 
 
@@ -893,18 +893,9 @@ def write_ply_payload(filepath, payload, has_skin, skin_names):
 
 
 def _direct_volume_view_matches(content, bone_name):
-    header = re.compile(
-        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
-        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
-    headers = list(header.finditer(content))
-    if len(headers) != 1:
-        raise RuntimeError(
-            "Expected exactly one MDL bone %r, found %d"
-            % (bone_name, len(headers)))
-    bone_start = headers[0].start()
-    bone_end = find_matching_brace(content, bone_start)
-    if bone_end < 0:
-        raise RuntimeError("Unbalanced MDL bone block: " + str(bone_name))
+    from .mdl_io import find_named_bone_span
+
+    bone_start, bone_end = find_named_bone_span(content, bone_name)
 
     view_pattern = re.compile(
         r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}',
@@ -1143,6 +1134,101 @@ def analyze_selected_model(context, use_selection=True,
         }
 
 
+def _post_export_selfcheck(written_parts, export_data, palette_names):
+    """Read back the just-written PLY files and flag regressions that silently
+    break the model in-game (single-material collapse, duplicated triangles,
+    non-standard vertex stride). Returns dict with per-part facts and warnings.
+
+    This guards the exact failure mode seen in the field: a legacy exporter
+    collapsed every face onto the first material slot (one MESH block instead of
+    three) and duplicated triangles, which rendered Body/Head/Hair with the wrong
+    texture and caused the 'facing texture broken/inside-out' reports in GOH.
+    """
+    from collections import Counter
+    import struct as _st
+
+    per_part = []
+    warnings = []
+    for part in written_parts:
+        path = part.get("path")
+        info = {
+            "filename": part.get("filename"),
+            "records": part.get("records"),
+            "triangles": part.get("triangles"),
+            "stride": part.get("stride"),
+        }
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+            # MESH block count and triangle counts
+            pos = 4
+            mesh_blocks = 0
+            block_tris = 0
+            if data[pos:pos + 4] == b"BNDS":
+                pos += 28
+            if data[pos:pos + 4] == b"SKIN":
+                pos += 4
+                n = _st.unpack_from("<I", data, pos)[0]
+                pos += 4
+                for _index in range(n):
+                    ln = data[pos]
+                    pos += 1 + ln
+            while data[pos:pos + 4] == b"MESH":
+                pos += 4
+                _fvf = _st.unpack_from("<I", data, pos)[0]
+                pos += 4
+                _start = _st.unpack_from("<I", data, pos)[0]
+                pos += 4
+                count = _st.unpack_from("<I", data, pos)[0]
+                pos += 4
+                _flags = _st.unpack_from("<I", data, pos)[0]
+                pos += 4
+                _mlen = data[pos]
+                pos += 1 + _mlen
+                _plen = data[pos]
+                pos += 1 + _plen
+                mesh_blocks += 1
+                block_tris += count
+            # actual INDX triangles + uniqueness
+            indx = data.find(b"INDX", pos)
+            if indx >= 0:
+                icount = _st.unpack_from("<I", data, indx + 4)[0]
+                idxs = _st.unpack_from("<%dH" % icount, data, indx + 8)
+                indx_tris = icount // 3
+                unique = len(Counter(
+                    tuple(idxs[i:i + 3]) for i in range(0, icount, 3)))
+                info["mesh_blocks"] = mesh_blocks
+                info["indx_tris"] = indx_tris
+                info["unique_tris"] = unique
+                if unique < indx_tris:
+                    warnings.append(_(
+                        "operator.export_multipart.selfcheck.dup_tris",
+                        file=part.get("filename"),
+                        dup=indx_tris - unique,
+                        unique=unique,
+                        total=indx_tris))
+                if mesh_blocks == 1 and block_tris == indx_tris and \
+                        len(export_data.get("tris_by_mat", ())) > 1:
+                    warnings.append(_(
+                        "operator.export_multipart.selfcheck.collapsed",
+                        file=part.get("filename"),
+                        tris=indx_tris,
+                        slots=len(export_data.get("tris_by_mat", ()))))
+        except Exception as exc:
+            info["readback_error"] = repr(exc)
+        per_part.append(info)
+
+    stride = {p.get("stride") for p in written_parts}
+    if stride and 40 not in stride:
+        warnings.append(_(
+            "operator.export_multipart.selfcheck.stride",
+            stride=sorted(stride)))
+    if len(palette_names) != len(export_data.get("skin_names", ())) and \
+            export_data.get("skin_names"):
+        warnings.append(_("operator.export_multipart.selfcheck.palette"))
+    return {"parts": per_part, "warnings": warnings}
+
+
 def export_selected_model(context, filepath, use_selection=True,
                           record_limit=GAME_VERTEX_LIMIT,
                           material_mode="SIMPLE", copy_textures=True):
@@ -1266,6 +1352,7 @@ def export_selected_model(context, filepath, use_selection=True,
                 "truncated_influence_vertices": export_data[
                     "truncated_influence_vertices"],
                 "attachment_bone": attachment_bone,
+                "selfcheck": None,
             }
 
         split_pattern = re.compile(
@@ -1282,6 +1369,15 @@ def export_selected_model(context, filepath, use_selection=True,
                         and folded.endswith((".mtl", ".tga"))))
 
         _commit_staged_files(stage_dir, output_dir, stale_generated)
+        # Read-back the committed files (not the staging dir) so the selfcheck
+        # sees exactly what lands on disk.
+        selfcheck = _post_export_selfcheck(
+            written_parts, export_data, palette_names)
+        summary["selfcheck"] = selfcheck
+        if selfcheck["warnings"]:
+            print("[multipart-selfcheck] warnings:")
+            for warn in selfcheck["warnings"]:
+                print("  -", warn)
         return summary
     except BaseException:
         shutil.rmtree(stage_dir, ignore_errors=True)

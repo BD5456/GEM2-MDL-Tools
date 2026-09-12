@@ -433,6 +433,466 @@ def detect_source_mode(tgt=None, src=None):
     return mode
 
 
+def _has_standard_mmd_shoulder_chain(src):
+    """Detect a true four-stage MMD shoulder chain by hierarchy.
+
+    In these rigs ShoulderP/Shoulder heads are chest-side cancel/clavicle-root
+    points, while ShoulderC/Arm heads are the actual arm pivots.  KK/KKS rigs
+    do not have this complete parent chain and therefore keep their established
+    shoulder and head-processing path unchanged.
+    """
+    if src is None or src.type != 'ARMATURE':
+        return False
+    names = [bone.name.casefold() for bone in src.data.bones]
+    cf_count = sum(1 for name in names if name.startswith('cf_'))
+    cfs_count = sum(1 for name in names if name.startswith('cf_s_'))
+    if cf_count >= 6 or cfs_count >= 3:
+        return False
+    for side in ('L', 'R'):
+        expected = (
+            ('Shoulder_' + side, 'ShoulderP_' + side),
+            ('ShoulderC_' + side, 'Shoulder_' + side),
+            ('Arm_' + side, 'ShoulderC_' + side),
+        )
+        if 'ShoulderP_' + side not in src.data.bones:
+            return False
+        for child_name, parent_name in expected:
+            child = src.data.bones.get(child_name)
+            if (child is None or child.parent is None
+                    or child.parent.name != parent_name):
+                return False
+    return True
+
+
+STANDARD_MMD_SHOULDER_WIDTH_FACTOR = 0.85
+STANDARD_MMD_SHOULDER_TUNE_VERSION = 1
+STANDARD_MMD_SHOULDER_ANIM_WEIGHT_VERSION = 9
+STANDARD_MMD_ELBOW_WEIGHT_VERSION = 3
+STANDARD_MMD_ARM_SEGMENT_VERSION = 1
+# Axial upper-arm stretch was visually too long and split the elbow
+# texture; keep the helper for diagnostics but do not auto-apply.
+STANDARD_MMD_ARM_SEGMENT_ENABLED = False
+STANDARD_MMD_ARM_WAIST_VERSION = 1
+KK_SHOULDER_TUNE_VERSION = 5
+KK_COLLAR_SOFTEN_VERSION = 1
+
+
+def goh_tune_standard_mmd_upper_chest(src, tgt):
+    """Lift four-stage MMD shoulder roots while keeping animation pivots fixed.
+
+    ShoulderP/Shoulder carry the inner shoulder, upper-chest skin, clothes and
+    accessories.  ShoulderC/Arm remain on GOH hand1, so the animation pivot and
+    arm chain do not rise.  Neck/Head are outside this local branch and therefore
+    keep the already-correct head/neck placement.
+    """
+    if not _has_standard_mmd_shoulder_chain(src):
+        return {'changed': 0, 'reason': 'not standard four-stage MMD'}
+    required_src = ('ShoulderP_L', 'ShoulderP_R', 'ShoulderC_L',
+                    'ShoulderC_R', 'Arm_L', 'Arm_R')
+    required_tgt = ('clavicle_left', 'clavicle_right', 'hand1l', 'hand1r')
+    if (not all(name in src.pose.bones for name in required_src)
+            or not all(name in tgt.pose.bones for name in required_tgt)):
+        return {'changed': 0, 'reason': 'missing source/target shoulder bones'}
+
+    def world_matrix(armature, name):
+        return armature.matrix_world @ armature.pose.bones[name].matrix
+
+    source_root_z = sum(world_matrix(src, name).translation.z
+                        for name in ('ShoulderP_L', 'ShoulderP_R')) / 2.0
+    source_joint_z = sum(world_matrix(src, name).translation.z
+                         for name in ('ShoulderC_L', 'ShoulderC_R')) / 2.0
+    target_root_z = sum(world_matrix(tgt, name).translation.z
+                        for name in ('clavicle_left', 'clavicle_right')) / 2.0
+    target_joint_z = sum(world_matrix(tgt, name).translation.z
+                         for name in ('hand1l', 'hand1r')) / 2.0
+    source_offset = source_root_z - source_joint_z
+    target_offset = target_root_z - target_joint_z
+    lift = max(0.0, min(0.75, (target_offset - source_offset) * 0.5))
+
+    driven_meshes = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != 'MESH':
+            continue
+        if any(mod.type == 'ARMATURE' and mod.object is src
+               for mod in obj.modifiers):
+            driven_meshes.append(obj)
+
+    if lift <= 1e-5:
+        for obj in driven_meshes:
+            obj['mowas2_standard_mmd_shoulder_tune_version'] = \
+                STANDARD_MMD_SHOULDER_TUNE_VERSION
+            obj['mowas2_standard_mmd_shoulder_lift'] = 0.0
+            obj['mowas2_standard_mmd_shoulder_width_factor'] = \
+                STANDARD_MMD_SHOULDER_WIDTH_FACTOR
+        return {'changed': 0, 'reason': 'shoulder root is already high enough',
+                'meshes': len(driven_meshes)}
+
+    for side in ('L', 'R'):
+        shoulder_c = 'ShoulderC_' + side
+        arm = 'Arm_' + side
+        preserved_c = world_matrix(src, shoulder_c).copy()
+        preserved_arm = world_matrix(src, arm).copy()
+        root = src.pose.bones['ShoulderP_' + side]
+        root_world = world_matrix(src, root.name)
+        root.matrix = src.matrix_world.inverted() @ (
+            Matrix.Translation(Vector((0.0, 0.0, lift))) @ root_world)
+        bpy.context.view_layer.update()
+        src.pose.bones[shoulder_c].matrix = (
+            src.matrix_world.inverted() @ preserved_c)
+        bpy.context.view_layer.update()
+        src.pose.bones[arm].matrix = src.matrix_world.inverted() @ preserved_arm
+        bpy.context.view_layer.update()
+
+    marked = 0
+    for obj in bpy.context.scene.objects:
+        if obj.type != 'MESH':
+            continue
+        driven = any(mod.type == 'ARMATURE' and mod.object is src
+                     for mod in obj.modifiers)
+        if not driven:
+            continue
+        obj['mowas2_standard_mmd_shoulder_tune_version'] = \
+            STANDARD_MMD_SHOULDER_TUNE_VERSION
+        obj['mowas2_standard_mmd_shoulder_lift'] = float(lift)
+        obj['mowas2_standard_mmd_shoulder_width_factor'] = \
+            STANDARD_MMD_SHOULDER_WIDTH_FACTOR
+        marked += 1
+    print('[shoulder-mmd] shoulder roots +%.4f; ShoulderC/Arm fixed; '
+          'meshes=%d' % (lift, marked))
+    return {'changed': 1, 'lift': lift, 'meshes': marked}
+
+
+def goh_tune_kk_upper_chest(src, tgt):
+    """Lift KK/KKS inner-shoulder roots to GOH clavicle height.
+
+    Width handling is unchanged.  Arm_L/R stay on GOH hand1 so the animation
+    pivot and arm chain do not rise.  The sternum fill is spread from waist to
+    chest so one bone does not stretch the texture.  Neck and Head follow a
+    fraction of that lift to keep neck length.
+    """
+    if src is None or src.type != 'ARMATURE' or tgt is None:
+        return {'changed': 0, 'reason': 'missing source/target'}
+    names = [bone.name.casefold() for bone in src.data.bones]
+    cf = sum(1 for name in names if name.startswith('cf_'))
+    cfs = sum(1 for name in names if name.startswith('cf_s_'))
+    if cf < 6 and cfs < 3:
+        return {'changed': 0, 'reason': 'not KK/KKS'}
+    if not all(name in src.pose.bones for name in ('Arm_L', 'Arm_R')):
+        return {'changed': 0, 'reason': 'missing KK Arm bones'}
+    if not all(name in tgt.pose.bones
+               for name in ('clavicle_left', 'clavicle_right',
+                            'hand1l', 'hand1r')):
+        return {'changed': 0, 'reason': 'missing target clavicle/hand1'}
+
+    def world_matrix(armature, name):
+        return armature.matrix_world @ armature.pose.bones[name].matrix
+
+    root_names = []
+    for side in ('L', 'R'):
+        dummy = 'cf_d_shoulder_' + side
+        shoulder = 'Shoulder_' + side
+        if dummy in src.pose.bones:
+            root_names.append(dummy)
+        elif shoulder in src.pose.bones:
+            root_names.append(shoulder)
+        else:
+            return {'changed': 0, 'reason': 'missing KK shoulder root'}
+
+    source_root_z = sum(world_matrix(src, name).translation.z
+                        for name in root_names) / float(len(root_names))
+    clavicle_z = sum(world_matrix(tgt, name).translation.z
+                     for name in ('clavicle_left', 'clavicle_right')) / 2.0
+    arm_z = sum(world_matrix(src, name).translation.z
+                for name in ('Arm_L', 'Arm_R')) / 2.0
+    # Full clavicle height with Arm pinned at hand1 reads as a permanent
+    # shrug.  Sit the shoulder pad a little above the arm pivot instead.
+    target_root_z = arm_z + (clavicle_z - arm_z) * 0.32
+    lift = max(0.0, min(1.0, target_root_z - source_root_z))
+    chest_name = next((name for name in ('cf_j_spine03', 'UpperBody2')
+                       if name in src.pose.bones), None)
+    chest_z = (world_matrix(src, chest_name).translation.z
+               if chest_name else source_root_z)
+    # Fill the M-dip: raise the sternum part-way toward the clavicle line.
+    chest_lift = max(0.0, min(0.70, (clavicle_z - chest_z) * 0.40))
+
+    driven_meshes = [obj for obj in bpy.context.scene.objects
+                     if obj.type == 'MESH' and any(
+                         mod.type == 'ARMATURE' and mod.object is src
+                         for mod in obj.modifiers)]
+    if lift <= 1e-5 and chest_lift <= 1e-5:
+        for obj in driven_meshes:
+            obj['mowas2_kk_shoulder_tune_version'] = KK_SHOULDER_TUNE_VERSION
+            obj['mowas2_kk_shoulder_lift'] = 0.0
+            obj['mowas2_kk_chest_lift'] = 0.0
+        return {'changed': 0, 'reason': 'KK shoulder/chest already at GOH height',
+                'meshes': len(driven_meshes)}
+
+    def preserve(names):
+        return [(name, world_matrix(src, name).copy())
+                for name in names if name in src.pose.bones]
+
+    def restore(stored):
+        for bone_name, matrix in stored:
+            src.pose.bones[bone_name].matrix = (
+                src.matrix_world.inverted() @ matrix)
+            bpy.context.view_layer.update()
+
+    def lift_bone(name, amount):
+        if abs(amount) <= 1e-5 or name not in src.pose.bones:
+            return
+        bone = src.pose.bones[name]
+        bone.matrix = src.matrix_world.inverted() @ (
+            Matrix.Translation(Vector((0.0, 0.0, amount)))
+            @ world_matrix(src, name))
+        bpy.context.view_layer.update()
+
+    arm_pinned = ['Arm_L', 'Arm_R', 'Elbow_L', 'Elbow_R',
+                  'Wrist_L', 'Wrist_R']
+    neck_pinned = ['Neck', 'Head']
+    stored_arms = preserve(arm_pinned)
+    stored_neck = preserve(neck_pinned)
+    neck_follow = 0.80
+    if chest_lift > 1e-5:
+        # Nested lifts so waist→chest shares the delta instead of stretching
+        # one chest bone.  Fractions are final world Z, converted to extras.
+        chain = []
+        fractions = {
+            'UpperBody': 0.30,
+            'UpperBody2': 0.65,
+            'cf_j_spine03': 1.00,
+        }
+        for name in ('UpperBody', 'UpperBody2', 'cf_j_spine03'):
+            if name in src.pose.bones:
+                chain.append(name)
+        previous = 0.0
+        for name in chain:
+            extra = (fractions[name] - previous) * chest_lift
+            lift_bone(name, extra)
+            previous = fractions[name]
+        if 'BreastParent' in src.pose.bones and previous < 1.0:
+            lift_bone('BreastParent', (1.0 - previous) * chest_lift)
+        restore(stored_arms)
+        for bone_name, matrix in stored_neck:
+            src.pose.bones[bone_name].matrix = src.matrix_world.inverted() @ (
+                Matrix.Translation(Vector((0.0, 0.0, chest_lift * neck_follow)))
+                @ matrix)
+            bpy.context.view_layer.update()
+        source_root_z = sum(world_matrix(src, name).translation.z
+                            for name in root_names) / float(len(root_names))
+        lift = max(-0.50, min(1.0, target_root_z - source_root_z))
+    stored_arms = preserve(arm_pinned)
+    for root_name in root_names:
+        lift_bone(root_name, lift)
+    restore(stored_arms)
+
+    marked = 0
+    for obj in driven_meshes:
+        obj['mowas2_kk_shoulder_tune_version'] = KK_SHOULDER_TUNE_VERSION
+        obj['mowas2_kk_shoulder_lift'] = float(lift)
+        obj['mowas2_kk_chest_lift'] = float(chest_lift)
+        obj['mowas2_kk_neck_follow'] = float(neck_follow)
+        marked += 1
+    print('[shoulder-kk] clavicle-line +%.4f, waist-chest +%.4f, '
+          'neck/head +%.4f; Arm fixed; meshes=%d'
+          % (lift, chest_lift, chest_lift * neck_follow, marked))
+    return {'changed': 1, 'lift': lift, 'chest_lift': chest_lift,
+            'neck_follow': neck_follow, 'meshes': marked}
+
+
+def goh_attach_kk_bust_accessories(src):
+    """Parent chest clothing/helpers to the KK bust root so they follow breasts.
+
+    Koikatsu bras/bustiers (ct_bra, o_bra, 胸托, etc.) are often parented to
+    spine/clothing roots. After the chest lift they stay behind. Reparent any
+    such bone whose rest head sits in the bust volume onto cf_d_bust00,
+    keeping world matrices.
+    """
+    if src is None or src.type != 'ARMATURE':
+        return {'changed': 0, 'reason': 'missing source'}
+    bust_root = next((name for name in (
+        'cf_d_bust00', 'BreastParent', 'cf_s_bust00_L')
+                      if name in src.data.bones), None)
+    if bust_root is None:
+        return {'changed': 0, 'reason': 'no KK bust root'}
+    bust_names = [bone.name for bone in src.data.bones
+                  if 'bust' in bone.name.lower()
+                  or bone.name.startswith('Breast')]
+    if not bust_names:
+        return {'changed': 0, 'reason': 'no KK bust bones'}
+
+    def world_head(name):
+        return src.matrix_world @ src.pose.bones[name].head
+
+    xs, ys, zs = [], [], []
+    for name in bust_names:
+        if name not in src.pose.bones:
+            continue
+        pos = world_head(name)
+        xs.append(pos.x); ys.append(pos.y); zs.append(pos.z)
+    if not xs:
+        return {'changed': 0, 'reason': 'bust heads missing'}
+    pad = 1.35
+    bbox = (min(xs) - pad, max(xs) + pad,
+            min(ys) - pad, max(ys) + pad,
+            min(zs) - 0.8, max(zs) + 1.2)
+    hints = ('ct_bra', 'o_bra', 'n_bra', 'k_bra', 'bustier', 'corset',
+             '胸托', '胸衣', 'bra')
+    skip = ('arm', 'hand', 'elbow', 'wrist', 'neck', 'head', 'eye',
+            'leg', 'foot', 'knee', 'skirt', 'sk_', 'shoulder',
+            'clavicle', 'spine', 'upperbody')
+    bust_set = set(bust_names)
+
+    def in_bust_chain(bone):
+        seen = set()
+        while bone is not None and bone.name not in seen:
+            if bone.name in bust_set or bone.name == bust_root:
+                return True
+            seen.add(bone.name)
+            bone = bone.parent
+        return False
+
+    moved = []
+    bpy.context.view_layer.objects.active = src
+    bpy.ops.object.mode_set(mode='EDIT')
+    try:
+        for bone in list(src.data.edit_bones):
+            lname = bone.name.lower()
+            if any(token in lname for token in skip):
+                continue
+            hinted = any(token in lname for token in hints) or (
+                'bra' in lname and 'breast' not in lname
+                and not lname.startswith('cf_')
+                and 'bracelet' not in lname)
+            if bone.parent is not None and in_bust_chain(
+                    src.data.bones.get(bone.parent.name)):
+                continue
+            head = src.matrix_world @ bone.head
+            spatial = (bbox[0] <= head.x <= bbox[1]
+                       and bbox[2] <= head.y <= bbox[3]
+                       and bbox[4] <= head.z <= bbox[5]
+                       and head.x > -0.2)
+            if not hinted and not spatial:
+                continue
+            if hinted or (spatial and bone.parent is not None and
+                          any(p in (bone.parent.name or '')
+                              for p in ('spine', 'UpperBody', 'ParentNode',
+                                        'Center', 'ct_', 'n_top', 'Body'))):
+                target = src.data.edit_bones.get(bust_root)
+                if target is None or bone.name == bust_root:
+                    continue
+                bone.use_connect = False
+                bone.parent = target
+                moved.append(bone.name)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    if moved:
+        print('[kk-bust] reparented accessories -> %s: %s'
+              % (bust_root, moved))
+    return {'changed': len(moved), 'bones': moved, 'root': bust_root}
+
+
+def goh_soften_kk_collar_weights(mesh, src, tgt=None, force=False):
+    """Move part of neck/head weight on the collar band onto the chest.
+
+    Heavy Neck→head mapping makes the collar rotate with the neck. Blend a
+    fraction into UpperBody2 / ik_updown so the neckline turns less.
+    """
+    version = KK_COLLAR_SOFTEN_VERSION
+    marker = 'mowas2_kk_collar_soften_version'
+    if mesh is None or mesh.type != 'MESH':
+        return {'changed': 0, 'reason': 'missing mesh'}
+    if not force and int(mesh.get(marker, 0)) >= version:
+        return {'changed': 0, 'reason': 'already applied'}
+    groups = {group.name: group for group in mesh.vertex_groups}
+    source_neck = [name for name in ('Neck', 'cf_s_neck', 'head neck upper')
+                   if name in groups]
+    bound = 'head' in groups and 'ik_updown' in groups
+    if not source_neck and not bound:
+        return {'changed': 0, 'reason': 'no neck/head groups'}
+    if bound:
+        from_names = ['head']
+        to_name = 'ik_updown'
+        ref_arm = tgt if tgt is not None and tgt.type == 'ARMATURE' else src
+        neck_z = None
+        chest_z = None
+        if ref_arm is not None:
+            if 'head' in ref_arm.data.bones:
+                neck_z = (ref_arm.matrix_world
+                          @ ref_arm.data.bones['head'].head_local).z
+            if 'ik_updown' in ref_arm.data.bones:
+                chest_z = (ref_arm.matrix_world
+                           @ ref_arm.data.bones['ik_updown'].head_local).z
+            if 'clavicle_left' in ref_arm.data.bones:
+                clav_z = (ref_arm.matrix_world
+                          @ ref_arm.data.bones['clavicle_left'].head_local).z
+                chest_z = clav_z - 1.8
+                neck_z = clav_z + 1.4
+        neck_z = float(neck_z if neck_z is not None else 30.2)
+        chest_z = float(chest_z if chest_z is not None else 27.6)
+    else:
+        from_names = source_neck
+        to_name = next((name for name in (
+            'cf_s_spine03', 'UpperBody2', 'cf_j_spine03')
+                        if name in groups), None)
+        if to_name is None:
+            return {'changed': 0, 'reason': 'no chest group for collar'}
+        neck_z = (src.matrix_world @ src.pose.bones['Neck'].head).z \
+            if src is not None and 'Neck' in src.pose.bones else 30.0
+        chest_name = next((name for name in ('cf_j_spine03', 'UpperBody2')
+                           if src is not None and name in src.pose.bones), None)
+        chest_z = (src.matrix_world @ src.pose.bones[chest_name].head).z \
+            if chest_name else neck_z - 3.0
+
+    to_group = groups[to_name]
+    from_groups = [groups[name] for name in from_names]
+    from_ids = {group.index for group in from_groups}
+    span = max(1e-3, neck_z - chest_z)
+    changed = 0
+    for vertex in mesh.data.vertices:
+        world = mesh.matrix_world @ vertex.co
+        t = (world.z - chest_z) / span
+        if t < 0.18 or t > 0.92:
+            continue
+        neck_w = 0.0
+        for assignment in vertex.groups:
+            if assignment.group in from_ids:
+                neck_w += float(assignment.weight)
+        if neck_w < 0.12:
+            continue
+        # Peak transfer in the collar band, fade toward true neck and chest.
+        band = _smoothstep01((t - 0.18) / 0.22) * (
+            1.0 - _smoothstep01((t - 0.62) / 0.30))
+        move = neck_w * 0.45 * band
+        if move <= 1e-5:
+            continue
+        remain = neck_w - move
+        # Split remaining neck weight across original neck groups.
+        for group in from_groups:
+            old = 0.0
+            for assignment in vertex.groups:
+                if assignment.group == group.index:
+                    old = float(assignment.weight)
+                    break
+            if old <= 1e-8:
+                continue
+            group.add([vertex.index], remain * (old / neck_w), 'REPLACE')
+        to_old = 0.0
+        for assignment in vertex.groups:
+            if assignment.group == to_group.index:
+                to_old = float(assignment.weight)
+                break
+        to_group.add([vertex.index], to_old + move, 'REPLACE')
+        changed += 1
+    mesh[marker] = version
+    mesh['mowas2_kk_collar_soften_count'] = int(changed)
+    if changed:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    print('[kk-collar] softened neckline weights:', changed,
+          '| to', to_name)
+    return {'changed': changed, 'to': to_name}
+
+
 def _classify_mode(diffuse, has_alpha, exclude=EXCLUDE_TRANSPARENT,
                    mode='kk', alpha_profile=None, alpha_test=None,
                    material_names=None):
@@ -1468,16 +1928,61 @@ def _goh_shoulder_scale():
 
 
 def _goh_foot1_spacing():
-    """读取 foot1 左右腿根的视觉间距倍率；目标 rest 始终不变。"""
+    """读取髋宽倍率；目标 rest 始终不变。默认略外移以贴近 GOH 髋骨。"""
     try:
         sc = bpy.context.scene
         if sc and hasattr(sc, 'mowas2_props'):
             value = float(getattr(sc.mowas2_props,
-                                  'goh_foot1_spacing', 1.0))
-            return max(0.8, min(1.3, value))
+                                  'goh_foot1_spacing', 1.06))
+            return max(0.70, min(2.00, value))
     except Exception:
         pass
-    return 1.0
+    return 1.06
+
+
+def _goh_thigh_width():
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props, 'goh_thigh_width', 1.04))
+            return max(0.70, min(2.00, value))
+    except Exception:
+        pass
+    return 1.04
+
+
+def _goh_calf_width():
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props, 'goh_calf_width', 1.03))
+            return max(0.20, min(5.00, value))
+    except Exception:
+        pass
+    return 1.03
+
+
+def _goh_leg_thickness(prop_name, default=1.0):
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props, prop_name, default))
+            return max(0.20, min(5.00, value))
+    except Exception:
+        pass
+    return default
+
+
+def _goh_hip_thickness():
+    return _goh_leg_thickness('goh_hip_thickness', 1.0)
+
+
+def _goh_thigh_thickness():
+    return _goh_leg_thickness('goh_thigh_thickness', 1.0)
+
+
+def _goh_calf_thickness():
+    return _goh_leg_thickness('goh_calf_thickness', 1.0)
 
 
 def _goh_arm_span_scale():
@@ -4525,7 +5030,123 @@ def goh_gfa_bone_align(src, tgt, mesh=None, source_mode=None):
     bpy.context.view_layer.update()
     bpy.ops.object.mode_set(mode='OBJECT')
     print('[gfa] pose align v13 (L503-764 全文移植): moved %d 项' % moved)
+    try:
+        if src.get('mowas2_leg_lateral_base'):
+            del src['mowas2_leg_lateral_base']
+        lateral = goh_align_leg_lateral(src, tgt)
+        if lateral.get('changed'):
+            print('[gfa] leg lateral hip %.3f thigh %.3f: %s'
+                  % (lateral.get('hip', 1.0), lateral.get('thigh', 1.0),
+                     lateral.get('moved')))
+    except Exception as exc:
+        print('[gfa] leg lateral skip:', exc)
     return moved
+
+
+def goh_align_leg_lateral(src, tgt):
+    """Scale source hip/knee world Y toward a wider stance; ankles stay put.
+
+    Hip/thigh factors multiply the post-GFA head offset from the body
+    midline. 1.0 keeps the GFA result; 1.2 is a visible outward move
+    toward GOH foot1/foot2 so the two armatures actually close the gap.
+    """
+    if src is None or tgt is None or src.type != 'ARMATURE':
+        return {'changed': 0, 'reason': 'missing armatures'}
+    hip_f = _goh_foot1_spacing()
+    thigh_f = _goh_thigh_width()
+    pairs = (
+        ('Leg_L', 'Knee_L', 'Ankle_L'),
+        ('Leg_R', 'Knee_R', 'Ankle_R'),
+        ('LegD_L', 'KneeD_L', 'AnkleD_L'),
+        ('LegD_R', 'KneeD_R', 'AnkleD_R'),
+        ('WaistCancel_L', None, None),
+        ('WaistCancel_R', None, None),
+        ('cf_s_leg_L', None, None),
+        ('cf_s_leg_R', None, None),
+    )
+
+    def world_head(name):
+        return src.matrix_world @ src.pose.bones[name].head
+
+    def move_head(name, target_pos):
+        pb = src.pose.bones[name]
+        current = world_head(name)
+        delta = target_pos - current
+        if delta.length < 1e-7:
+            return
+        world = src.matrix_world @ pb.matrix
+        pb.matrix = src.matrix_world.inverted() @ (
+            Matrix.Translation(delta) @ world)
+        bpy.context.view_layer.update()
+
+    names = [n for trio in pairs for n in trio
+             if n and n in src.pose.bones]
+    if not names:
+        return {'changed': 0, 'reason': 'no KK/MMD leg bones'}
+    raw = src.get('mowas2_leg_lateral_base')
+    base = {}
+    if raw:
+        try:
+            base = json.loads(raw)
+        except Exception:
+            base = {}
+    if not base:
+        for name in names:
+            loc = world_head(name)
+            base[name] = [float(loc.x), float(loc.y), float(loc.z)]
+        src['mowas2_leg_lateral_base'] = json.dumps(base)
+
+    for name, xyz in base.items():
+        if name in src.pose.bones:
+            move_head(name, Vector(xyz))
+
+    center_y = 0.0
+    count = 0
+    for name in ('foot1l', 'foot1r'):
+        if name in tgt.pose.bones:
+            center_y += (tgt.matrix_world @ tgt.pose.bones[name].head).y
+            count += 1
+    if count:
+        center_y /= float(count)
+
+    def tgt_head(name):
+        return tgt.matrix_world @ tgt.pose.bones[name].head
+
+    targets = {
+        'Leg_L': 'foot1l', 'Leg_R': 'foot1r',
+        'Knee_L': 'foot2l', 'Knee_R': 'foot2r',
+        'LegD_L': 'foot1l', 'LegD_R': 'foot1r',
+        'KneeD_L': 'foot2l', 'KneeD_R': 'foot2r',
+        'WaistCancel_L': 'foot1l', 'WaistCancel_R': 'foot1r',
+        'cf_s_leg_L': 'foot1l', 'cf_s_leg_R': 'foot1r',
+    }
+    k_hip = max(0.0, min(1.0, hip_f - 1.0))
+    k_thigh = max(0.0, min(1.0, thigh_f - 1.0))
+    moved = []
+    for hip, knee, ankle in pairs:
+        if hip in src.pose.bones and hip in base and k_hip > 1e-4:
+            goal = tgt_head(targets[hip])
+            x0, y0, z0 = base[hip]
+            move_head(hip, Vector((
+                x0 + (goal.x - x0) * k_hip,
+                y0 + (goal.y - y0) * k_hip,
+                z0)))
+            moved.append(hip)
+        if (knee and knee in src.pose.bones and knee in base
+                and k_thigh > 1e-4):
+            goal = tgt_head(targets[knee])
+            x0, y0, z0 = base[knee]
+            move_head(knee, Vector((
+                x0 + (goal.x - x0) * k_thigh,
+                y0 + (goal.y - y0) * k_thigh,
+                z0)))
+            moved.append(knee)
+        if ankle and ankle in src.pose.bones and ankle in base:
+            move_head(ankle, Vector(base[ankle]))
+    src['mowas2_leg_lateral_hip'] = float(hip_f)
+    src['mowas2_leg_lateral_thigh'] = float(thigh_f)
+    return {'changed': len(moved), 'moved': moved, 'hip': hip_f, 'thigh': thigh_f}
+
 
 def goh_align_bone_lengths(src, tgt, mirrored=False, source_mode=None):
     """完成源/目标手臂链的几何长度对齐。
@@ -4735,10 +5356,18 @@ def align_arms_auto(src, tgt, mirrored, source_mode=None):
     # (GFA Step0.5 固定期望比例 + Step2 Neck×0.925 / Head×0.85 微调)。
     if (_goh_hand_split() and source_mode != 'kk'
             and not GOH_GFA_SKIP_HEAD_NORM):
-        try:
-            goh_normalize_head(src, tgt)
-        except Exception as e:
-            print('[head] normalize skip:', e)
+        if _has_standard_mmd_shoulder_chain(src):
+            # The GOH MDL has no reference head mesh/eye landmarks.  Applying
+            # the GF2 fixed eye/neck constants to a game-character MMD rig made
+            # its head 1.668x larger and distorted the visible neck.  Preserve
+            # this source's already coherent head/neck proportions instead.
+            print('[head-mmd] four-stage shoulder rig: preserve source '
+                  'head/neck proportions')
+        else:
+            try:
+                goh_normalize_head(src, tgt)
+            except Exception as e:
+                print('[head] normalize skip:', e)
     if _goh_enlarge_head():
         try:
             goh_enlarge_head(src, _goh_head_scale())
@@ -4888,6 +5517,30 @@ def align_arms_auto(src, tgt, mirrored, source_mode=None):
                                     source_mode=source_mode)
         except Exception as e:
             print('[arm] bone length scale skip:', e)
+    if source_mode == 'mmd' and _has_standard_mmd_shoulder_chain(src):
+        try:
+            goh_tune_standard_mmd_upper_chest(src, tgt)
+        except Exception as e:
+            print('[shoulder-mmd] upper-chest tune skip:', e)
+    elif source_mode == 'kk':
+        try:
+            goh_tune_kk_upper_chest(src, tgt)
+        except Exception as e:
+            print('[shoulder-kk] upper-chest tune skip:', e)
+        try:
+            goh_attach_kk_bust_accessories(src)
+        except Exception as e:
+            print('[kk-bust] accessory attach skip:', e)
+        for obj in bpy.context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+            if not any(mod.type == 'ARMATURE' and mod.object is src
+                       for mod in obj.modifiers):
+                continue
+            try:
+                goh_soften_kk_collar_weights(obj, src)
+            except Exception as e:
+                print('[kk-collar] source soften skip:', e)
     return pose, ang
 
 
@@ -5118,10 +5771,15 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
     accumulated from one baseline so centerline vertices cannot drift by order.
     """
     migration_version = 4
-    version = 1
+    version = 6
     ik_enabled = _goh_ik_updown_enabled()
     ik_factor = _goh_ik_updown_multiplier() if ik_enabled else 1.0
     foot_factor = _goh_foot1_spacing()
+    thigh_factor = _goh_thigh_width()
+    calf_factor = _goh_calf_width()
+    hip_thick = _goh_hip_thickness()
+    thigh_thick = _goh_thigh_thickness()
+    calf_thick = _goh_calf_thickness()
     if mesh is None or src is None or tgt is None or mesh.type != 'MESH':
         return {'changed': 0, 'skipped': 'missing mesh/source/target'}
 
@@ -5135,10 +5793,21 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
             and abs(float(mesh.get('mowas2_ik_updown_multiplier', 1.0))
                     - ik_factor) <= 1e-6
             and abs(float(mesh.get('mowas2_foot1_spacing', 1.0))
-                    - foot_factor) <= 1e-6):
+                    - foot_factor) <= 1e-6
+            and abs(float(mesh.get('mowas2_thigh_width', 1.0))
+                    - thigh_factor) <= 1e-6
+            and abs(float(mesh.get('mowas2_calf_width', 1.0))
+                    - calf_factor) <= 1e-6
+            and abs(float(mesh.get('mowas2_hip_thickness', 1.0))
+                    - hip_thick) <= 1e-6
+            and abs(float(mesh.get('mowas2_thigh_thickness', 1.0))
+                    - thigh_thick) <= 1e-6
+            and abs(float(mesh.get('mowas2_calf_thickness', 1.0))
+                    - calf_thick) <= 1e-6):
         return {'changed': 0, 'skipped': 'already adjusted'}
 
-    required = ('foot1l', 'foot1r', 'foot2l', 'foot2r')
+    required = ('foot1l', 'foot1r', 'foot2l', 'foot2r', 'foot3l', 'foot3r',
+                'body')
     if (not mesh.vertex_groups
             or not all(name in tgt.pose.bones for name in required)):
         return {'changed': 0, 'skipped': 'missing groups/target leg bones'}
@@ -5166,6 +5835,7 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
         swaps = {
             'foot1l': 'foot1r', 'foot1r': 'foot1l',
             'foot2l': 'foot2r', 'foot2r': 'foot2l',
+            'foot3l': 'foot3r', 'foot3r': 'foot3l',
         }
         return swaps.get(name, name)
 
@@ -5173,6 +5843,8 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
     arm_block_groups = set()
     foot_groups = {'l': {}, 'r': {}}
     knee_groups = {'l': {}, 'r': {}}
+    ankle_groups = {'l': {}, 'r': {}}
+    body_groups = {}
     for group in mesh.vertex_groups:
         raw_targets = eventual_targets(group.name)
         targets = (raw_targets if group.name in direct_targets else
@@ -5183,13 +5855,18 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
             arm_block_groups.add(group.index)
         if targets.get('ik_updown', 0.0) > 0.0:
             ik_groups[group.index] = targets['ik_updown']
+        if targets.get('body', 0.0) > 0.0:
+            body_groups[group.index] = targets['body']
         for side in ('l', 'r'):
             foot_weight = targets.get('foot1' + side, 0.0)
             knee_weight = targets.get('foot2' + side, 0.0)
+            ankle_weight = targets.get('foot3' + side, 0.0)
             if foot_weight > 0.0:
                 foot_groups[side][group.index] = foot_weight
             if knee_weight > 0.0:
                 knee_groups[side][group.index] = knee_weight
+            if ankle_weight > 0.0:
+                ankle_groups[side][group.index] = ankle_weight
     if not ik_groups and not foot_groups['l'] and not foot_groups['r']:
         return {'changed': 0, 'skipped': 'no body-curve vertex groups'}
 
@@ -5205,17 +5882,27 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
         vertex.index for vertex in mesh.data.vertices
         if any(assignment.group in foot_groups['l']
                or assignment.group in foot_groups['r']
+               or assignment.group in knee_groups['l']
+               or assignment.group in knee_groups['r']
+               or assignment.group in ankle_groups['l']
+               or assignment.group in ankle_groups['r']
+               or assignment.group in body_groups
                for assignment in vertex.groups)
     }
     ik_attribute = mesh.data.attributes.get('gem2_ik_updown_width_base')
     foot_attribute = mesh.data.attributes.get('gem2_foot1_spacing_base')
     restored = 0
-    if ik_attribute is not None and force:
+    if ik_attribute is not None:
         restored += _restore_point_vectors(mesh, ik_attribute, ik_vertices)
-    if foot_attribute is not None and force:
+    if foot_attribute is not None:
         restored += _restore_point_vectors(mesh, foot_attribute, foot_vertices)
     ik_active = abs(ik_factor - 1.0) > 1e-6
-    foot_active = abs(foot_factor - 1.0) > 1e-6
+    foot_active = (abs(foot_factor - 1.0) > 1e-6
+                   or abs(thigh_factor - 1.0) > 1e-6
+                   or abs(calf_factor - 1.0) > 1e-6
+                   or abs(hip_thick - 1.0) > 1e-6
+                   or abs(thigh_thick - 1.0) > 1e-6
+                   or abs(calf_thick - 1.0) > 1e-6)
     if ik_attribute is None and ik_active:
         ik_attribute = _ensure_point_vector_attribute(
             mesh, 'gem2_ik_updown_width_base')
@@ -5228,6 +5915,7 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
 
     left = world_head('foot1l')
     right = world_head('foot1r')
+    body_z = world_head('body').z
     lateral = left - right
     if lateral.length <= 1e-7:
         return {'changed': 0, 'skipped': 'zero foot1 span'}
@@ -5239,13 +5927,86 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
     for side in ('l', 'r'):
         root = world_head('foot1' + side)
         knee = world_head('foot2' + side)
-        axis = knee - root
-        length = axis.length
-        if length <= 1e-7:
+        ankle = world_head('foot3' + side)
+        thigh = knee - root
+        calf = ankle - knee
+        if thigh.length <= 1e-7 or calf.length <= 1e-7:
             continue
-        axis.normalize()
-        root_delta = lateral * (root - center).dot(lateral) * (foot_factor - 1.0)
-        foot_geometry[side] = (root, axis, length, root_delta)
+        foot_geometry[side] = {
+            'root': root, 'knee': knee, 'ankle': ankle,
+            'thigh_axis': thigh.normalized(), 'thigh_len': thigh.length,
+            'calf_axis': calf.normalized(), 'calf_len': calf.length,
+        }
+
+    def _leg_axis_radius(point, geo):
+        t_th = (point - geo['root']).dot(geo['thigh_axis']) / geo['thigh_len']
+        t_cf = 1.0 + (point - geo['knee']).dot(geo['calf_axis']) / geo['calf_len']
+        t = t_th if t_th <= 1.02 else t_cf
+        if t <= 1.0:
+            along = max(-0.45, min(1.05, t)) * geo['thigh_len']
+            origin = geo['root'] + geo['thigh_axis'] * along
+            axis = geo['thigh_axis']
+        else:
+            along = max(0.0, min(1.05, t - 1.0)) * geo['calf_len']
+            origin = geo['knee'] + geo['calf_axis'] * along
+            axis = geo['calf_axis']
+        radial = point - origin
+        radial = radial - axis * radial.dot(axis)
+        radial.z = 0.0
+        return t, origin, axis, radial
+
+    radius_bins = {'l': {}, 'r': {}}
+    for index in foot_vertices:
+        point = mesh_world @ mesh.data.vertices[index].co
+        signed = (point - center).dot(lateral)
+        side = 'l' if signed >= 0.0 else 'r'
+        if side not in foot_geometry:
+            continue
+        t, _origin, _axis, radial = _leg_axis_radius(point, foot_geometry[side])
+        if radial.length < 0.12:
+            continue
+        key = round(t * 16.0) / 16.0
+        radius_bins[side].setdefault(key, []).append(radial.length)
+    radius_profile = {'l': {}, 'r': {}}
+    region_peak = {'l': {'hip': 1.0, 'thigh': 1.0, 'calf': 1.0},
+                   'r': {'hip': 1.0, 'thigh': 1.0, 'calf': 1.0}}
+    for side in ('l', 'r'):
+        med = {}
+        for key, samples in radius_bins[side].items():
+            if len(samples) < 3:
+                continue
+            samples.sort()
+            med[key] = samples[len(samples) // 2]
+        keys = sorted(med)
+        smooth = {}
+        for i, key in enumerate(keys):
+            neigh = [med[keys[j]] for j in (i - 1, i, i + 1)
+                     if 0 <= j < len(keys)]
+            smooth[key] = sum(neigh) / float(len(neigh))
+        radius_profile[side] = smooth
+        if smooth:
+            hip_vals = [v for k, v in smooth.items() if k <= 0.30]
+            thigh_vals = [v for k, v in smooth.items() if 0.0 <= k <= 1.05]
+            calf_vals = [v for k, v in smooth.items() if 0.85 <= k <= 1.90]
+            region_peak[side]['hip'] = max(hip_vals) if hip_vals else 1.0
+            region_peak[side]['thigh'] = max(thigh_vals) if thigh_vals else 1.0
+            region_peak[side]['calf'] = max(calf_vals) if calf_vals else 1.0
+
+    def _sample_radius(side, t):
+        smooth = radius_profile.get(side) or {}
+        if not smooth:
+            return 1.0
+        keys = sorted(smooth)
+        if t <= keys[0]:
+            return smooth[keys[0]]
+        if t >= keys[-1]:
+            return smooth[keys[-1]]
+        for left_key, right_key in zip(keys, keys[1:]):
+            if left_key <= t <= right_key:
+                span = right_key - left_key
+                mix = 0.0 if span <= 1e-8 else (t - left_key) / span
+                return smooth[left_key] + (smooth[right_key] - smooth[left_key]) * mix
+        return 1.0
 
     changed_vertices = set()
     ik_changed = set()
@@ -5260,12 +6021,16 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
         arm_blocked = False
         foot_weights = {'l': 0.0, 'r': 0.0}
         knee_weights = {'l': 0.0, 'r': 0.0}
+        ankle_weights = {'l': 0.0, 'r': 0.0}
+        body_weight = 0.0
         for assignment in vertex.groups:
             if (assignment.group in arm_block_groups
                     and assignment.weight > 1e-7):
                 arm_blocked = True
             ik_weight += (assignment.weight
                           * ik_groups.get(assignment.group, 0.0))
+            body_weight += (assignment.weight
+                            * body_groups.get(assignment.group, 0.0))
             for side in ('l', 'r'):
                 foot_weights[side] += (
                     assignment.weight
@@ -5273,6 +6038,9 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
                 knee_weights[side] += (
                     assignment.weight
                     * knee_groups[side].get(assignment.group, 0.0))
+                ankle_weights[side] += (
+                    assignment.weight
+                    * ankle_groups[side].get(assignment.group, 0.0))
         if ik_active and ik_weight > 1e-7 and not arm_blocked:
             signed_width = (point_world - center).dot(lateral)
             contribution = (lateral * signed_width * (ik_factor - 1.0)
@@ -5281,22 +6049,71 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
             if contribution.length > 1e-9:
                 ik_changed.add(index)
         if foot_active:
-            for side in ('l', 'r'):
-                if foot_weights[side] <= 1e-7 or side not in foot_geometry:
-                    continue
-                root, axis, length, root_delta = foot_geometry[side]
-                t = (point_world - root).dot(axis) / length
-                pelvis_fade = _smoothstep01((t + 0.25) / 0.30)
-                knee_fade = 1.0 - _smoothstep01((t - 0.05) / 0.60)
-                influence = (min(1.0, foot_weights[side])
-                             * max(0.0, 1.0 - min(1.0, knee_weights[side]))
-                             * pelvis_fade * knee_fade)
-                if influence <= 1e-7:
-                    continue
-                contribution = root_delta * influence
-                delta_world += contribution
-                if contribution.length > 1e-9:
-                    foot_changed.add(index)
+            signed = (point_world - center).dot(lateral)
+            side = 'l' if signed >= 0.0 else 'r'
+            if side in foot_geometry:
+                pair = (foot_weights[side] + knee_weights[side]
+                        + ankle_weights[side])
+                influence = min(1.0, pair + body_weight)
+                geo = foot_geometry[side]
+                t_th = ((point_world - geo['root']).dot(geo['thigh_axis'])
+                        / geo['thigh_len'])
+                t_cf = 1.0 + ((point_world - geo['knee']).dot(geo['calf_axis'])
+                              / geo['calf_len'])
+                t = t_th if t_th <= 1.02 else t_cf
+                if pair <= 0.05 and body_weight > 0.08:
+                    t = min(t, -0.15)
+                w_hip = 1.0 - _smoothstep01((t + 0.05) / 0.42)
+                w_calf = _smoothstep01((t - 0.82) / 0.50)
+                w_thigh = max(0.0, 1.0 - w_hip - w_calf)
+                w_sum = w_hip + w_thigh + w_calf
+                if w_sum > 1e-8:
+                    w_hip /= w_sum
+                    w_thigh /= w_sum
+                    w_calf /= w_sum
+                f_out = (foot_factor * w_hip
+                         + thigh_factor * w_thigh
+                         + calf_factor * w_calf)
+                f_th = (hip_thick * w_hip
+                        + thigh_thick * w_thigh
+                        + calf_thick * w_calf)
+                if influence > 1e-7 and abs(f_out - 1.0) > 1e-6:
+                    lat_fade = 1.0
+                    if body_weight > 0.08 and pair <= 0.20:
+                        lat_fade = _smoothstep01((abs(signed) - 0.45) / 0.50)
+                    # Inner crotch / tights / groin stay put.
+                    crotch_fade = _smoothstep01((abs(signed) - 0.90) / 0.95)
+                    # Do not carry calf outward onto the foot; that made a
+                    # wider stump at the ankle junction.
+                    ankle_out_fade = 1.0 - _smoothstep01((t - 1.48) / 0.50)
+                    contribution = (lateral * signed * (f_out - 1.0)
+                                    * influence * lat_fade * crotch_fade
+                                    * ankle_out_fade)
+                    if contribution.length > 1e-9:
+                        delta_world += contribution
+                        foot_changed.add(index)
+                if influence > 1e-7 and abs(f_th - 1.0) > 1e-6:
+                    t, _origin, _axis, radial = _leg_axis_radius(
+                        point_world, geo)
+                    ankle_fade = 1.0 - _smoothstep01((t - 1.72) / 0.28)
+                    r_loc = _sample_radius(side, t)
+                    r_ref = (region_peak[side]['hip'] * w_hip
+                             + region_peak[side]['thigh'] * w_thigh
+                             + region_peak[side]['calf'] * w_calf)
+                    shape = max(0.28, min(1.0, r_loc / max(r_ref, 1e-6)))
+                    crotch_fade = _smoothstep01((abs(signed) - 0.90) / 0.95)
+                    thick = 1.0 + ((f_th - 1.0) * influence
+                                   * ankle_fade * shape * crotch_fade)
+                    # Only expand away from the midline so the inner thigh
+                    # and groin do not puff inward.
+                    outward = lateral if signed >= 0.0 else -lateral
+                    inward = max(0.0, -radial.dot(outward))
+                    radial = radial + outward * inward
+                    contribution = radial * (thick - 1.0)
+                    contribution.z = 0.0
+                    if contribution.length > 1e-9:
+                        delta_world += contribution
+                        foot_changed.add(index)
         delta_local = world_to_local @ delta_world
         if delta_local.length <= 1e-9:
             continue
@@ -5313,6 +6130,11 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
         'ik_factor': round(float(ik_factor), 7),
         'ik_vertices': len(ik_changed),
         'foot1_spacing': round(float(foot_factor), 7),
+        'thigh_width': round(float(thigh_factor), 7),
+        'calf_width': round(float(calf_factor), 7),
+        'hip_thickness': round(float(hip_thick), 7),
+        'thigh_thickness': round(float(thigh_thick), 7),
+        'calf_thickness': round(float(calf_thick), 7),
         'foot1_vertices': len(foot_changed),
         'vertices': len(changed_vertices),
         'restored': int(restored),
@@ -5325,10 +6147,16 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
     mesh['mowas2_ik_updown_enabled'] = bool(ik_enabled)
     mesh['mowas2_ik_updown_multiplier'] = float(ik_factor)
     mesh['mowas2_foot1_spacing'] = float(foot_factor)
+    mesh['mowas2_thigh_width'] = float(thigh_factor)
+    mesh['mowas2_calf_width'] = float(calf_factor)
+    mesh['mowas2_hip_thickness'] = float(hip_thick)
+    mesh['mowas2_thigh_thickness'] = float(thigh_thick)
+    mesh['mowas2_calf_thickness'] = float(calf_thick)
     mesh['mowas2_body_curve_details'] = json.dumps(details, sort_keys=True)
     mesh['mowas2_shoulder_geometry_details'] = mesh['mowas2_body_curve_details']
-    print('[body] ik %.3f + foot1 %.3f: %d vertices, max %.6f'
-          % (ik_factor, foot_factor, len(changed_vertices), maximum_move))
+    print('[body] ik %.3f hip %.3f thigh %.3f calf %.3f: %d verts, max %.6f'
+          % (ik_factor, foot_factor, thigh_factor, calf_factor,
+             len(changed_vertices), maximum_move))
     return {'changed': len(changed_vertices), 'restored': restored,
             'details': details}
 
@@ -5336,6 +6164,90 @@ def goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored=False, force=False):
 def goh_adjust_shoulder_geometry(mesh, src, tgt, mirrored=False, force=False):
     """Compatibility wrapper for v132 callers."""
     return goh_adjust_body_curve_geometry(mesh, src, tgt, mirrored, force)
+
+
+def goh_smooth_ankle_junction(mesh, tgt, force=False):
+    """Blend calf XY radius into the foot so the ankle is not a wide step.
+
+    Calf outward used to continue onto the shoe, and the foot mesh is already
+    much wider than the shaft.  Around foot3, lerp radius from the lower-calf
+    measurement toward the native foot, keeping Z (alignment height) unchanged.
+    """
+    version = 5
+    if mesh is None or tgt is None or mesh.type != 'MESH':
+        return {'changed': 0, 'reason': 'missing mesh/target'}
+    if not force and int(mesh.get('mowas2_ankle_smooth_version', 0)) >= version:
+        return {'changed': 0, 'reason': 'already applied'}
+    required = ('foot2l', 'foot2r', 'foot3l', 'foot3r')
+    if not all(name in tgt.data.bones for name in required):
+        return {'changed': 0, 'reason': 'missing foot bones'}
+    groups = {group.name: group for group in mesh.vertex_groups}
+
+    def eventual_targets(group_name):
+        if group_name in ('foot2l', 'foot2r', 'foot3l', 'foot3r'):
+            return {group_name: 1.0}
+        bone = None
+        src = None
+        try:
+            from .bone_mapping_v2 import resolve_pmx_bone, GFA_TO_GEM2_TARGET
+        except Exception:
+            resolve_pmx_bone = None
+            GFA_TO_GEM2_TARGET = {}
+        # Walk the source bone chain when present so KK cf_s_leg* count.
+        for obj in bpy.context.scene.objects:
+            if obj.type == 'ARMATURE' and group_name in obj.data.bones:
+                src = obj
+                bone = obj.data.bones.get(group_name)
+                break
+        while bone is not None:
+            canonical = (resolve_pmx_bone(bone.name) if resolve_pmx_bone
+                         else bone.name) or bone.name
+            mapping = GFA_TO_GEM2_TARGET.get(canonical)
+            if mapping:
+                return {name: float(weight) for name, weight in mapping}
+            bone = bone.parent
+        canonical = (resolve_pmx_bone(group_name) if resolve_pmx_bone
+                     else group_name) or group_name
+        mapping = GFA_TO_GEM2_TARGET.get(canonical)
+        return ({name: float(weight) for name, weight in mapping}
+                if mapping else {})
+
+    knee_ids = {'l': set(), 'r': set()}
+    ankle_ids = {'l': set(), 'r': set()}
+    seed_ids = set()
+    for group in mesh.vertex_groups:
+        targets = eventual_targets(group.name)
+        for name, weight in targets.items():
+            if weight <= 0.0:
+                continue
+            if name.startswith('foot2'):
+                knee_ids['l' if name.endswith('l') else 'r'].add(group.index)
+                seed_ids.add(group.index)
+            elif name.startswith('foot3'):
+                ankle_ids['l' if name.endswith('l') else 'r'].add(group.index)
+                seed_ids.add(group.index)
+    mesh_world = mesh.matrix_world.copy()
+    mesh_inv = mesh_world.inverted_safe()
+    seed = [vertex.index for vertex in mesh.data.vertices
+            if any(a.group in seed_ids and a.weight > 0.08
+                   for a in vertex.groups)]
+    attribute = mesh.data.attributes.get('gem2_ankle_smooth_base')
+    restored = 0
+    if attribute is None and seed:
+        _ensure_point_vector_attribute(mesh, 'gem2_ankle_smooth_base')
+    elif attribute is not None:
+        restored = _restore_point_vectors(mesh, attribute, seed)
+    # v5: keep the modeled calf-to-instep curve.  Earlier radius meets
+    # either flared into a mushroom or cinched the ankle off the foot.
+    # Outward still fades at the ankle in body_curve; no extra XY scale.
+    details = {'mode': 'restore_modeled_ankle', 'restored': int(restored)}
+    mesh['mowas2_ankle_smooth_version'] = version
+    mesh['mowas2_ankle_smooth_details'] = json.dumps(details, sort_keys=True)
+    if restored:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    print('[ankle] restored modeled junction: %d verts' % restored)
+    return {'changed': int(restored), 'details': details}
 
 
 def goh_adjust_arm_inset_geometry(mesh, src, tgt, mirrored=False, force=False):
@@ -5489,6 +6401,671 @@ def goh_adjust_arm_inset_geometry(mesh, src, tgt, mirrored=False, force=False):
           % (factor, len(changed_vertices), maximum_move))
     return {'changed': len(changed_vertices), 'restored': restored,
             'details': details}
+
+
+def _goh_arm_thickness():
+    """Radial arm-thickness factor. 1.0 = unchanged; >1 thicker, <1 thinner."""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props, 'goh_arm_thickness', 1.0))
+            return max(0.20, min(5.0, value))
+    except Exception:
+        pass
+    return 1.0
+
+
+def goh_adjust_arm_thickness_geometry(mesh, src, tgt, mirrored=False,
+                                      force=False):
+    """Reversible radial thicken of upper arm + forearm; palms stay put.
+
+    Vertices weighted to hand1/hand2/hand_rot1 are scaled around the GOH arm
+    bone axis. Shoulder and wrist ends fade so the chest and hands do not
+    balloon. Target rest bones are never edited.
+    """
+    version = 1
+    factor = _goh_arm_thickness()
+    if mesh is None or src is None or tgt is None or mesh.type != 'MESH':
+        return {'changed': 0, 'skipped': 'missing mesh/source/target'}
+    stored_version = int(mesh.get('mowas2_arm_thickness_version', 0))
+    stored_factor = float(mesh.get('mowas2_arm_thickness', 1.0))
+    if (not force and stored_version >= version
+            and abs(stored_factor - factor) <= 1e-6):
+        return {'changed': 0, 'skipped': 'already adjusted'}
+    required = ('hand1l', 'hand1r', 'hand2l', 'hand2r',
+                'hand_rot1l', 'hand_rot1r')
+    if not all(name in tgt.data.bones for name in required):
+        return {'changed': 0, 'skipped': 'missing target arm bones'}
+
+    direct_targets = set(TGT_VG_ORDER)
+
+    def eventual_targets(group_name):
+        if group_name in direct_targets:
+            return {group_name: 1.0}
+        bone = src.data.bones.get(group_name)
+        while bone is not None:
+            canonical = resolve_pmx_bone(bone.name) or bone.name
+            mapping = GFA_TO_GEM2_TARGET.get(canonical)
+            if mapping:
+                return {name: float(weight) for name, weight in mapping}
+            bone = bone.parent
+        canonical = resolve_pmx_bone(group_name) or group_name
+        mapping = GFA_TO_GEM2_TARGET.get(canonical)
+        return ({name: float(weight) for name, weight in mapping}
+                if mapping else {})
+
+    def mirrored_target(name):
+        if not mirrored:
+            return name
+        if name.endswith('l'):
+            return name[:-1] + 'r'
+        if name.endswith('r'):
+            return name[:-1] + 'l'
+        return name
+
+    upper_ids = {'l': {}, 'r': {}}
+    fore_ids = {'l': {}, 'r': {}}
+    palm_ids = set()
+    for group in mesh.vertex_groups:
+        raw = eventual_targets(group.name)
+        targets = (raw if group.name in direct_targets else
+                   {mirrored_target(name): weight
+                    for name, weight in raw.items()})
+        for name, weight in targets.items():
+            if name.startswith(('palm', 'finger')) or name.startswith('hand3'):
+                palm_ids.add(group.index)
+                continue
+            side = ('l' if name.endswith('l') else
+                    ('r' if name.endswith('r') else None))
+            if side is None or weight <= 0.0:
+                continue
+            if name.startswith('hand1'):
+                upper_ids[side][group.index] = max(
+                    upper_ids[side].get(group.index, 0.0), weight)
+            elif name.startswith(('hand2', 'hand_rot1')):
+                fore_ids[side][group.index] = max(
+                    fore_ids[side].get(group.index, 0.0), weight)
+
+    def world_head(name):
+        return tgt.matrix_world @ tgt.data.bones[name].head_local
+
+    segments = {}
+    for side in ('l', 'r'):
+        h1 = world_head('hand1' + side)
+        h2 = world_head('hand2' + side)
+        hr = world_head('hand_rot1' + side)
+        upper = h2 - h1
+        fore = hr - h2
+        segments[side] = {
+            'upper_o': h1, 'upper_a': upper.normalized(),
+            'upper_l': upper.length,
+            'fore_o': h2, 'fore_a': (fore.normalized()
+                                     if fore.length > 1e-6 else upper.normalized()),
+            'fore_l': max(fore.length, 1e-6),
+        }
+
+    candidates = {
+        vertex.index for vertex in mesh.data.vertices
+        if any((assignment.group in upper_ids['l']
+                or assignment.group in upper_ids['r']
+                or assignment.group in fore_ids['l']
+                or assignment.group in fore_ids['r'])
+               and assignment.group not in palm_ids
+               for assignment in vertex.groups)
+    }
+    attribute = mesh.data.attributes.get('gem2_arm_thickness_base')
+    active = abs(factor - 1.0) > 1e-6
+    restored = (_restore_point_vectors(mesh, attribute, candidates)
+                if attribute is not None and force else 0)
+    if attribute is None and active:
+        attribute = _ensure_point_vector_attribute(
+            mesh, 'gem2_arm_thickness_base')
+
+    mesh_world = mesh.matrix_world.copy()
+    mesh_inv = mesh_world.inverted_safe()
+    changed_vertices = set()
+    maximum_move = 0.0
+    if active:
+        for index in candidates:
+            vertex = mesh.data.vertices[index]
+            palm_w = upper_w = fore_w = 0.0
+            side_score = {'l': 0.0, 'r': 0.0}
+            for assignment in vertex.groups:
+                if assignment.group in palm_ids:
+                    palm_w += assignment.weight
+                for side in ('l', 'r'):
+                    u = upper_ids[side].get(assignment.group, 0.0)
+                    f = fore_ids[side].get(assignment.group, 0.0)
+                    upper_w += assignment.weight * u
+                    fore_w += assignment.weight * f
+                    side_score[side] += assignment.weight * (u + f)
+            if palm_w >= 0.20 or upper_w + fore_w < 0.18:
+                continue
+            side = 'l' if side_score['l'] >= side_score['r'] else 'r'
+            seg = segments[side]
+            world = mesh_world @ vertex.co
+            pair = upper_w + fore_w
+            delta = Vector()
+            for kind, origin, axis, length, weight in (
+                    ('upper', seg['upper_o'], seg['upper_a'],
+                     seg['upper_l'], upper_w),
+                    ('fore', seg['fore_o'], seg['fore_a'],
+                     seg['fore_l'], fore_w)):
+                if weight < 0.05 or length <= 1e-6:
+                    continue
+                rel = world - origin
+                along = float(rel.dot(axis))
+                t = along / length
+                if t < -0.08 or t > 1.08:
+                    continue
+                fade = 1.0
+                if kind == 'upper':
+                    if t < 0.12:
+                        fade = _smoothstep01((t + 0.08) / 0.20)
+                    elif t > 0.88:
+                        fade = _smoothstep01((1.08 - t) / 0.20)
+                else:
+                    if t < 0.08:
+                        fade = _smoothstep01((t + 0.05) / 0.13)
+                    elif t > 0.82:
+                        fade = _smoothstep01((1.08 - t) / 0.26)
+                influence = min(1.0, (weight / pair) * fade * (1.0 - palm_w))
+                if influence <= 1e-4:
+                    continue
+                radial = rel - axis * along
+                if radial.length <= 1e-8:
+                    continue
+                scale = 1.0 + (factor - 1.0) * influence
+                delta += radial * (scale - 1.0)
+            if delta.length <= 1e-9:
+                continue
+            vertex.co = mesh_inv @ (world + delta)
+            changed_vertices.add(index)
+            maximum_move = max(maximum_move, delta.length)
+
+    if changed_vertices or restored:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    details = {
+        'mode': 'radial_arm_thickness_v1',
+        'factor': round(float(factor), 6),
+        'vertices': len(changed_vertices),
+        'restored': int(restored),
+        'maximum_move': round(float(maximum_move), 6),
+    }
+    mesh['mowas2_arm_thickness_version'] = version
+    mesh['mowas2_arm_thickness'] = float(factor)
+    mesh['mowas2_arm_thickness_details'] = json.dumps(details, sort_keys=True)
+    print('[arm-thick] factor %.3f: %d vertices, max %.6f'
+          % (factor, len(changed_vertices), maximum_move))
+    return {'changed': len(changed_vertices), 'restored': restored,
+            'details': details}
+
+
+def _goh_shoulder_inset():
+    """读取肩部/锁骨区横向缩窄倍率。<1 = 肩点内收（二次元窄肩），rest 不动。
+
+    仅方案 B（GEOMETRY）生效；方案 C 默认窄肩走骨骼级目标，不再叠一层几何内收。
+    """
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            if str(getattr(sc.mowas2_props, 'goh_shoulder_mode', 'SKELETON')) != 'GEOMETRY':
+                return 1.0
+            value = float(getattr(sc.mowas2_props, 'goh_shoulder_inset', 1.0))
+            return max(0.6, min(1.15, value))
+    except Exception:
+        pass
+    return 1.0
+
+
+def goh_adjust_shoulder_inset_geometry(mesh, src, tgt, mirrored=False,
+                                       force=False):
+    """Reversible shoulder+upper-arm+forearm inset; palms stay put (v5).
+
+    Pull the shoulder band, upper arm and forearm toward the body centerline
+    along the clavicle lateral axis as one unit:
+    - clavicle / hand1 / hand2 / hand_rot1 vertices share the same inset;
+    - palm / finger / hand3 / IK vertices stay on the GOH hand bones.
+
+    The animation skeleton rest is never touched. Reversible baseline pattern
+    (gem2_shoulder_inset_base) so the viewport slider moves both ways without
+    accumulation.
+    """
+    version = 5
+    factor = _goh_shoulder_inset()
+    if mesh is None or src is None or tgt is None or mesh.type != 'MESH':
+        return {'changed': 0, 'skipped': 'missing mesh/source/target'}
+    stored_version = int(mesh.get('mowas2_shoulder_inset_version', 0))
+    stored_factor = float(mesh.get('mowas2_shoulder_inset_factor', 1.0))
+    if (not force and stored_version >= version
+            and abs(stored_factor - factor) <= 1e-6):
+        return {'changed': 0, 'skipped': 'already adjusted'}
+
+    required = ('clavicle_left', 'clavicle_right',
+                'hand1l', 'hand1r')
+    if not all(name in tgt.pose.bones for name in required):
+        return {'changed': 0, 'skipped': 'missing target clavicle/hand1 bones'}
+
+    direct_targets = set(TGT_VG_ORDER)
+
+    def eventual_targets(group_name):
+        if group_name in direct_targets:
+            return {group_name: 1.0}
+        bone = src.data.bones.get(group_name)
+        while bone is not None:
+            canonical = resolve_pmx_bone(bone.name) or bone.name
+            mapping = GFA_TO_GEM2_TARGET.get(canonical)
+            if mapping:
+                return {name: float(weight) for name, weight in mapping}
+            bone = bone.parent
+        canonical = resolve_pmx_bone(group_name) or group_name
+        mapping = GFA_TO_GEM2_TARGET.get(canonical)
+        return ({name: float(weight) for name, weight in mapping}
+                if mapping else {})
+
+    # 手掌/手指保持在 GOH 手骨上；上臂+前臂作为一整体内收。
+    def is_palm_hand(name):
+        ln = name.lower()
+        return (ln.startswith('palm') or ln.startswith('hand_ik')
+                or ln.startswith('palm_ik') or ln.startswith('finger')
+                or ln in ('right_hand', 'left_hand', 'hand3l', 'hand3r'))
+
+    clavicle_groups = {}
+    hand1_groups = {}
+    hand2_groups = {}
+    hand_rot_groups = {}
+    hard_exclude_groups = set()
+    for group in mesh.vertex_groups:
+        raw_targets = eventual_targets(group.name)
+        targets = raw_targets if group.name in direct_targets else raw_targets
+        for name, w in targets.items():
+            ln = name.lower()
+            if ln.startswith('clavicle'):
+                clavicle_groups[group.index] = max(
+                    clavicle_groups.get(group.index, 0.0), float(w))
+            elif ln.startswith('hand1'):
+                hand1_groups[group.index] = max(
+                    hand1_groups.get(group.index, 0.0), float(w))
+            elif ln.startswith('hand2'):
+                hand2_groups[group.index] = max(
+                    hand2_groups.get(group.index, 0.0), float(w))
+            elif ln.startswith('hand_rot'):
+                hand_rot_groups[group.index] = max(
+                    hand_rot_groups.get(group.index, 0.0), float(w))
+            if is_palm_hand(name):
+                hard_exclude_groups.add(group.index)
+
+    candidate_strength = {}
+    for vertex in mesh.data.vertices:
+        cl = h1 = h2 = hr = 0.0
+        excluded = False
+        for assignment in vertex.groups:
+            if assignment.group in hard_exclude_groups and assignment.weight > 0.15:
+                excluded = True
+                break
+            if assignment.group in clavicle_groups:
+                cl = max(cl, clavicle_groups[assignment.group]
+                         * assignment.weight)
+            if assignment.group in hand1_groups:
+                h1 = max(h1, hand1_groups[assignment.group]
+                         * assignment.weight)
+            if assignment.group in hand2_groups:
+                h2 = max(h2, hand2_groups[assignment.group]
+                         * assignment.weight)
+            if assignment.group in hand_rot_groups:
+                hr = max(hr, hand_rot_groups[assignment.group]
+                         * assignment.weight)
+        if excluded:
+            continue
+        if cl > 0.0 or h1 > 0.0 or h2 > 0.0 or hr > 0.0:
+            candidate_strength[vertex.index] = {
+                'cl': cl, 'h1': h1, 'h2': h2, 'hr': hr}
+    if not candidate_strength:
+        return {'changed': 0, 'skipped': 'no shoulder/upper-arm vertices'}
+
+    attribute = mesh.data.attributes.get('gem2_shoulder_inset_base')
+    active = abs(factor - 1.0) > 1e-6
+    restored = (_restore_point_vectors(mesh, attribute,
+                                       set(candidate_strength))
+                if attribute is not None and force else 0)
+    if attribute is None and active:
+        attribute = _ensure_point_vector_attribute(mesh,
+                                                   'gem2_shoulder_inset_base')
+
+    def world_head(name):
+        return (tgt.matrix_world @ tgt.pose.bones[name].matrix).translation
+
+    cl = world_head('clavicle_left')
+    cr = world_head('clavicle_right')
+    lateral = cr - cl
+    if lateral.length <= 1e-7:
+        return {'changed': 0, 'skipped': 'zero clavicle lateral axis'}
+    lateral.normalize()
+    center = (cl + cr) * 0.5
+    # z 带：锁骨上到手腕（覆盖上臂+前臂，不含手掌）
+    cl_z = (cl.z + cr.z) * 0.5
+    wrist_z = min(world_head('hand_rot1l').z, world_head('hand_rot1r').z)
+    z_lo = min(cl_z, wrist_z) - 1.5
+    z_hi = cl_z + 2.5
+    # 横向作用范围：到上臂外缘（锁骨半宽 4 倍）
+    cl_half = (cr - cl).length * 0.5
+    lateral_limit = cl_half * 4.0
+    world_to_local = mesh.matrix_world.inverted_safe().to_3x3()
+
+    changed_vertices = set()
+    side_weights = {'l': 0.0, 'r': 0.0}
+    maximum_move = 0.0
+    if active:
+        for index, stren in candidate_strength.items():
+            vertex = mesh.data.vertices[index]
+            v = mesh.matrix_world @ vertex.co
+            if not (z_lo <= v.z <= z_hi):
+                continue
+            rel = (v - center).dot(lateral)
+            if abs(rel) > lateral_limit:
+                continue
+            cl_s = stren['cl']
+            h1_s = stren['h1']
+            h2_s = stren['h2']
+            hr_s = stren.get('hr', 0.0)
+            # 上臂+前臂同一平移，避免按中心缩放把手臂剪成三角。
+            strength = cl_s
+            arm_unit = max(h1_s, h2_s, hr_s) > 0.15
+            if arm_unit:
+                strength = 1.0
+            strength = min(1.0, strength)
+            if strength <= 1e-4:
+                continue
+            if arm_unit:
+                h1l_rel = (world_head('hand1l') - center).dot(lateral)
+                h1r_rel = (world_head('hand1r') - center).dot(lateral)
+                ref = (h1l_rel if abs(rel - h1l_rel) <= abs(rel - h1r_rel)
+                       else h1r_rel)
+                new_rel = rel + ref * (factor - 1.0) * strength
+            else:
+                new_rel = rel * (1.0 + (factor - 1.0) * strength)
+            delta_world = lateral * (new_rel - rel)
+            delta = world_to_local @ delta_world
+            if delta.length <= 1e-9:
+                continue
+            vertex.co += delta
+            changed_vertices.add(index)
+            side_weights['l' if rel < 0 else 'r'] = max(
+                side_weights['l' if rel < 0 else 'r'], abs(delta.length))
+            maximum_move = max(maximum_move, delta.length)
+
+    if changed_vertices or restored:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    details = {
+        'mode': 'shoulder_upper_forearm_inset_v5',
+        'factor': round(float(factor), 6),
+        'vertices': len(changed_vertices),
+        'candidates': len(candidate_strength),
+        'excluded_forearm_hand': len(
+            {v.index for v in mesh.data.vertices
+             if any(a.group in hard_exclude_groups for a in v.groups)}),
+        'z_band': [round(z_lo, 2), round(z_hi, 2)],
+        'left_max': round(float(side_weights['l']), 6),
+        'right_max': round(float(side_weights['r']), 6),
+        'restored': int(restored),
+        'maximum_move': round(float(maximum_move), 6),
+    }
+    mesh['mowas2_shoulder_inset_version'] = version
+    mesh['mowas2_shoulder_inset_factor'] = float(factor)
+    mesh['mowas2_shoulder_inset_details'] = json.dumps(details, sort_keys=True)
+    print('[shoulder-inset] v5 factor %.3f: %d verts (shoulder+upper+forearm), '
+          'max %.6f' % (factor, len(changed_vertices), maximum_move))
+    return {'changed': len(changed_vertices), 'restored': restored,
+            'details': details}
+
+
+def _goh_shoulder_mode():
+    """读取肩宽控制模式：'OFF'(默认) / 'GEOMETRY'(方案B 冻结几何内收) /
+    'SKELETON'(方案C 窄肩对齐骨架)。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            return str(getattr(sc.mowas2_props, 'goh_shoulder_mode', 'OFF'))
+    except Exception:
+        pass
+    return 'OFF'
+
+
+def _goh_shoulder_narrow_ratio():
+    """方案 C 目标肩宽系数：1.0 = KK 源骨骼测量肩宽；<1 更窄、>1 更宽。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            value = float(getattr(sc.mowas2_props,
+                                  'goh_shoulder_narrow_ratio', 0.96))
+            return max(0.5, min(1.5, value))
+    except Exception:
+        pass
+    return 1.0
+
+
+def _goh_shoulder_attach():
+    """方案 C 手链衔接方式：'full'=整链平移（keepfrozen 现状）；
+    'blend'=综合方案（肩缩放 + 前臂/手原位 + 上臂共线衔接）。"""
+    try:
+        sc = bpy.context.scene
+        if sc and hasattr(sc, 'mowas2_props'):
+            return str(getattr(sc.mowas2_props, 'goh_shoulder_attach', 'blend'))
+    except Exception:
+        pass
+    return 'blend'
+
+
+def goh_measure_source_shoulder(src):
+    """测量源骨架肩宽（世界横向距离），供方案 C 窄肩目标换算。
+
+    标准四级 MMD 肩链中 ShoulderP/Shoulder 的 head 是胸口侧取消骨/锁骨根，
+    真正对应目标 hand1 的肩关节是 Arm（与 ShoulderC 同点）。这类结构只取
+    Arm_L/R；其他结构（尤其 KK/KKS）保持原候选顺序和原算法不变。
+    """
+    if src is None:
+        return None
+    standard_mmd = _has_standard_mmd_shoulder_chain(src)
+    if standard_mmd:
+        candidates = (('Arm_L', 'Arm_R'),)
+    else:
+        candidates = (
+            ('ShoulderP_L', 'ShoulderP_R'),
+            ('Shoulder_L', 'Shoulder_R'),
+            ('ShoulderC_L', 'ShoulderC_R'),
+            ('Arm_L', 'Arm_R'),
+        )
+    for left, right in candidates:
+        if (left in src.pose.bones and right in src.pose.bones):
+            wl = (src.matrix_world @ src.pose.bones[left].matrix).translation
+            wr = (src.matrix_world @ src.pose.bones[right].matrix).translation
+            span = (wl - wr).length
+            if standard_mmd:
+                adjusted = span * STANDARD_MMD_SHOULDER_WIDTH_FACTOR
+                print('[shoulder-mmd] true joint span %.4f -> %.4f '
+                      '(factor %.2f)' % (
+                          span, adjusted, STANDARD_MMD_SHOULDER_WIDTH_FACTOR))
+                return adjusted
+            print('[shoulder-C] source span %s~%s = %.4f'
+                  % (left, right, span))
+            return span
+    print('[shoulder-C] no source shoulder bone pair found')
+    return None
+
+
+def goh_build_narrow_target_from_mdl(tgt, source_span, ratio=1.0,
+                                     attach='full'):
+    """方案 C：从原目标骨架的 MDL 重建一份只改肩宽的窄肩骨架。
+
+    肩宽由 hand1（肩关节）横向位置决定。实现分两部分：
+    - **整体平移**：hand1 及其全部后裔（hand2/hand_rot1/palm*/hand3/left,
+      right_hand + _hide 变体）+ palm_ik_holder_* IK 载体，每侧整体平移
+      同一位移 d，使 hand1 精确落在目标肩宽。手链段间 Δy 绝对偏移完全
+      保持 → 手臂斜率/长度/形态不变，不扭曲不拉伸；
+    - **锁骨单独缩放**：clavicle 按比例内收（保持锁骨窝形状、不过中线）。
+
+    ``attach='blend'``（综合方案）：肩宽按缩放收窄（hand1 精确落目标位），
+    但**前臂/手腕/手掌/手指与 IK 载体保持原 GOH rest 位置**（附件安全、
+    动画零偏移）；**hand2（肘）沿「窄 hand1 → 原 hand_rot1」连线**按原
+    上臂:前臂比例放置 → 上臂绕肩旋转衔接窄肩与原腕，整条手臂共线伸直，
+    视觉连续；允许整链轻微延展（原比例 ×~1.07，feel 接近原版）。
+
+    理由：等比缩放 y 会压缩手链横向范围（实测 hand2-hand1 Δy 4.08→2.26，
+    上臂内弯+手部挤压）；整体平移保持形态，只把整条手臂向身体靠拢。
+    """
+    if tgt is None or source_span is None or source_span <= 1e-6:
+        return {'target': None, 'reason': 'no source span'}
+    mdl_path = tgt.get('gem2_mdl_path') or ''
+    if not mdl_path or not os.path.isfile(mdl_path):
+        return {'target': None, 'reason': 'missing gem2_mdl_path: %r' % mdl_path}
+    narrow = build_target_from_mdl(mdl_path, name='skin_Armature_narrow')
+
+    mode = bpy.context.object.mode if bpy.context.object else 'OBJECT'
+    if mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.view_layer.objects.active = narrow
+    bpy.ops.object.mode_set(mode='EDIT')
+    eb = narrow.data.edit_bones
+    required = ('clavicle_left', 'clavicle_right',
+                'hand1l', 'hand1r')
+    if not all(n in eb for n in required):
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.data.objects.remove(narrow, do_unlink=True)
+        return {'target': None, 'reason': 'missing target shoulder bones'}
+
+    # 半宽（手链肩点横向）：hand1l=+3.07 / hand1r=-3.30 → half=3.19
+    h1l0 = eb['hand1l'].head.y
+    h1r0 = eb['hand1r'].head.y
+    orig_half = abs(h1r0 - h1l0) / 2.0
+    if abs(orig_half) < 1e-6:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.data.objects.remove(narrow, do_unlink=True)
+        return {'target': None, 'reason': 'zero original hand1 half span'}
+    target_half = float(source_span) * float(ratio) / 2.0
+    center_y = (eb['clavicle_left'].head.y + eb['clavicle_right'].head.y) / 2.0
+
+    # 每侧手链位移 d：hand1 精确落目标位（带左右符号）
+    per_side = {'l': (target_half - h1l0) if h1l0 > center_y
+                else None,
+                'r': (-target_half - h1r0) if h1r0 < center_y
+                else None}
+    d_l = per_side['l'] if per_side['l'] is not None else 0.0
+    d_r = per_side['r'] if per_side['r'] is not None else 0.0
+
+    # clavicle 按比例内收（相对中线），保持锁骨窝形状
+    cl_l0 = eb['clavicle_left'].head.y
+    cl_r0 = eb['clavicle_right'].head.y
+    cl_scale = target_half / orig_half  # 与手链半宽同比例
+    moved = 0
+
+    def move_bone(name, dy):
+        if name not in eb or abs(dy) < 1e-9:
+            return 0
+        b = eb[name]
+        b.head.y += dy
+        b.tail.y += dy
+        return 1
+
+    def place_bone(name, head):
+        """整体平移 edit bone 到目标 head（保持 tail 方向/长度）。"""
+        if name not in eb:
+            return 0
+        b = eb[name]
+        delta = head - b.head
+        b.head = head.copy()
+        b.tail = b.tail + delta
+        return 1
+
+    if attach == 'blend':
+        # 肩宽收窄保持原样（锁骨按比例 + hand1 落到目标半宽），
+        # 前臂/手腕/手掌留在原 GOH；上臂绕收窄后的肩转到
+        # 「窄 hand1 → 原 hand_rot1」连线上，按原上臂:前臂比例放置，允许拉伸。
+        orig = {}
+        for side in ('l', 'r'):
+            hand1_name = 'hand1' + side
+            hand2_name = 'hand2' + side
+            hand_rot_name = 'hand_rot1' + side
+            if (hand1_name not in eb or hand2_name not in eb
+                    or hand_rot_name not in eb):
+                print('[shoulder-C] blend: missing %s/%s/%s, fallback full'
+                      % (hand1_name, hand2_name, hand_rot_name))
+                bpy.ops.object.mode_set(mode='OBJECT')
+                bpy.data.objects.remove(narrow, do_unlink=True)
+                return goh_build_narrow_target_from_mdl(
+                    tgt, source_span, ratio=ratio, attach='full')
+            orig[side] = (eb[hand1_name].head.copy(),
+                          eb[hand2_name].head.copy(),
+                          eb[hand_rot_name].head.copy())
+        dy_cl_l = (cl_l0 - center_y) * (cl_scale - 1.0)
+        dy_cl_r = (cl_r0 - center_y) * (cl_scale - 1.0)
+        moved += move_bone('clavicle_left', dy_cl_l)
+        moved += move_bone('clavicle_right', dy_cl_r)
+        moved += place_bone('hand1l', eb['hand1l'].head + Vector((0, d_l, 0)))
+        moved += place_bone('hand1r', eb['hand1r'].head + Vector((0, d_r, 0)))
+        for side, d in (('l', d_l), ('r', d_r)):
+            hand1_name = 'hand1' + side
+            hand2_name = 'hand2' + side
+            hand_rot_name = 'hand_rot1' + side
+            o_h1, o_h2, o_hr = orig[side]
+            n_h1 = eb[hand1_name].head.copy()
+            arm_len = (o_h2 - o_h1).length
+            fore_len = (o_hr - o_h2).length
+            total = arm_len + fore_len
+            vec = o_hr - n_h1
+            vec_len = vec.length
+            if vec_len < 1e-6 or total < 1e-6:
+                continue
+            uvn = vec / vec_len
+            n_h2 = n_h1 + uvn * (vec_len * arm_len / total)
+            moved += place_bone(hand2_name, n_h2)
+            moved += place_bone(hand_rot_name, o_hr.copy())
+        print('[shoulder-C] attach=blend: 肩缩放 + 前臂/手原位 + 上臂共线')
+    else:
+        # ── 默认：手链整体平移（keepfrozen 行为）──
+        dy_cl_l = (cl_l0 - center_y) * (cl_scale - 1.0)
+        dy_cl_r = (cl_r0 - center_y) * (cl_scale - 1.0)
+        moved += move_bone('clavicle_left', dy_cl_l)
+        moved += move_bone('clavicle_right', dy_cl_r)
+        for root_name, d in (('hand1l', d_l), ('hand1r', d_r)):
+            if abs(d) < 1e-9:
+                continue
+            moved += move_bone(root_name, d)
+            pending = [c.name for c in eb[root_name].children]
+            while pending:
+                name = pending.pop()
+                if name not in eb:
+                    continue
+                moved += move_bone(name, d)
+                for child in eb[name].children:
+                    pending.append(child.name)
+        ik_map = {
+            'palm_ik_holder_left': d_l, 'palm_ik_holder_left01': d_l,
+            'palm_ik_holder_left02': d_l,
+            'palm_ik_holder_right': d_r, 'palm_ik_holder_right01': d_r,
+            'palm_ik_holder_right02': d_r,
+        }
+        for name, d in ik_map.items():
+            if abs(d) < 1e-9:
+                continue
+            moved += move_bone(name, d)
+            if name in eb:
+                for child in eb[name].children:
+                    moved += move_bone(child.name, d)
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.view_layer.update()
+    narrow['gem2_narrow_shoulder'] = True
+    narrow['gem2_original_target'] = tgt.name
+    print('[shoulder-C] narrow target: hand1 half %.3f -> %.3f | '
+          'translate L d=%.4f R d=%.4f | clavicle scale x%.4f | bones: %d | '
+          'attach=%s'
+          % (orig_half, target_half, d_l, d_r, cl_scale, moved, attach))
+    return {'target': narrow, 'reason': 'built', 'half_from': orig_half,
+            'half_to': target_half, 'scale': cl_scale,
+            'translate_l': d_l, 'translate_r': d_r,
+            'bones_moved': moved, 'attach': attach}
 
 
 def goh_scale_neck_follow_geometry(mesh, src, force=False):
@@ -6151,6 +7728,230 @@ def goh_retarget_mmd_forearm_geometry(mesh, src, tgt, mirrored=False,
     return {'changed': total, 'details': details}
 
 
+def goh_retarget_standard_mmd_upper_arm_geometry(mesh, src, tgt,
+                                                 mirrored=False, force=False):
+    """Put the frozen source elbow crease on the GOH hand2 pivot.
+
+    Four-stage MMD upper arms are shorter than the GFA rest.  Bone-length
+    scaling moves Elbow to hand2, but Arm-weighted vertices stay behind, so
+    the original elbow texture sits near mid-upper-arm.  Stretch only the
+    shoulder→crease interval onto hand1→hand2.  Vertices already at or past
+    the target elbow (forearm/hand) are left untouched.
+    """
+    version = STANDARD_MMD_ARM_SEGMENT_VERSION
+    marker = 'mowas2_standard_mmd_arm_segment_version'
+    if (mesh is None or mesh.type != 'MESH' or src is None
+            or src.type != 'ARMATURE' or tgt is None
+            or tgt.type != 'ARMATURE'):
+        return {'changed': 0, 'reason': 'missing mesh/source/target'}
+    if not STANDARD_MMD_ARM_SEGMENT_ENABLED and not force:
+        return {'changed': 0, 'reason': 'disabled; use arm/forearm inset'}
+    if not force and int(mesh.get(marker, 0)) >= version:
+        return {'changed': 0, 'reason': 'already applied'}
+    if (not _has_standard_mmd_shoulder_chain(src)
+            or str(mesh.get('mowas2_source_mode', '') or detect_source_mode(
+                tgt=tgt, src=src)) != 'mmd'):
+        return {'changed': 0, 'reason': 'not standard four-stage MMD'}
+
+    mesh_world = mesh.matrix_world.copy()
+    mesh_inv = mesh_world.inverted_safe()
+    groups = {group.name: group for group in mesh.vertex_groups}
+    details = {}
+    changed = 0
+
+    def group_weight(vertex, group):
+        if group is None:
+            return 0.0
+        for assignment in vertex.groups:
+            if assignment.group == group.index:
+                return float(assignment.weight)
+        return 0.0
+
+    def crease_from_groups(shoulder, axis, segment, arm_group, elbow_group):
+        rows = []
+        if arm_group is None or elbow_group is None:
+            return None
+        for vertex in mesh.data.vertices:
+            arm_w = group_weight(vertex, arm_group)
+            elb_w = group_weight(vertex, elbow_group)
+            pair = arm_w + elb_w
+            if pair < 0.20:
+                continue
+            share = elb_w / pair
+            if not 0.35 < share < 0.65:
+                continue
+            axial = float((mesh_world @ vertex.co - shoulder).dot(axis))
+            if 0.22 * segment < axial < 0.78 * segment:
+                rows.append(axial)
+        if len(rows) < 8:
+            return None
+        rows.sort()
+        return rows[len(rows) // 2]
+
+    def crease_from_radius(shoulder, axis, segment):
+        buckets = {}
+        for vertex in mesh.data.vertices:
+            relative = mesh_world @ vertex.co - shoulder
+            axial = float(relative.dot(axis))
+            if axial < 0.22 * segment or axial > 0.78 * segment:
+                continue
+            radial = float((relative - axis * axial).length)
+            if radial > 2.2:
+                continue
+            key = round(axial / segment, 2)
+            buckets.setdefault(key, []).append(radial)
+        profile = []
+        for key, radii in buckets.items():
+            if len(radii) < 8:
+                continue
+            radii.sort()
+            profile.append((key * segment, radii[len(radii) // 2], len(radii)))
+        if not profile:
+            return None
+        return min(profile, key=lambda item: item[1])[0]
+
+    for source_side in ('L', 'R'):
+        target_side = (('r' if source_side == 'L' else 'l')
+                       if mirrored else source_side.lower())
+        hand1_name = 'hand1' + target_side
+        hand2_name = 'hand2' + target_side
+        if (hand1_name not in tgt.data.bones
+                or hand2_name not in tgt.data.bones):
+            continue
+        shoulder = tgt.matrix_world @ tgt.data.bones[hand1_name].head_local
+        elbow = tgt.matrix_world @ tgt.data.bones[hand2_name].head_local
+        segment = (elbow - shoulder).length
+        if segment <= 1e-6:
+            details[target_side] = {'reason': 'zero upper-arm length'}
+            continue
+        axis = (elbow - shoulder).normalized()
+        arm_group = groups.get('Arm_' + source_side) or groups.get(hand1_name)
+        elbow_group = (groups.get('Elbow_' + source_side)
+                       or groups.get('ElbowD_' + source_side))
+        # Bound meshes already recentered hand1/hand2 onto GOH hand2, so those
+        # groups cannot mark the original crease.
+        if elbow_group is not None and elbow_group.name.startswith('hand2'):
+            elbow_group = None
+        crease = crease_from_groups(
+            shoulder, axis, segment, arm_group, elbow_group)
+        if crease is None:
+            crease = crease_from_radius(shoulder, axis, segment)
+        if crease is None:
+            details[target_side] = {'reason': 'elbow crease not found'}
+            continue
+        crease = max(0.28 * segment, min(0.72 * segment, float(crease)))
+        scale = segment / crease
+        if abs(scale - 1.0) < 0.04:
+            details[target_side] = {
+                'reason': 'crease already at target elbow',
+                'crease': round(float(crease), 6), 'segment': round(float(segment), 6)}
+            continue
+        radial_limit = max(1.6, min(2.6, segment * 0.42))
+        fade = max(0.18, min(0.45, segment * 0.06))
+        side_changed = 0
+        max_move = 0.0
+        for vertex in mesh.data.vertices:
+            position = mesh_world @ vertex.co
+            relative = position - shoulder
+            axial = float(relative.dot(axis))
+            radial = relative - axis * axial
+            if axial < -fade or axial > segment + 0.08:
+                continue
+            if radial.length > radial_limit:
+                continue
+            if axial > segment:
+                continue
+            mapped_axial = min(segment, max(0.0, axial * scale))
+            if axial < fade:
+                mapped_axial = axial + (mapped_axial - axial) * _smoothstep01(
+                    (axial + fade) / (2.0 * fade))
+            mapped = shoulder + axis * mapped_axial + radial
+            displacement = (mapped - position).length
+            if displacement <= 1e-7:
+                continue
+            vertex.co = mesh_inv @ mapped
+            side_changed += 1
+            changed += 1
+            max_move = max(max_move, displacement)
+        details[target_side] = {
+            'crease': round(float(crease), 6),
+            'segment': round(float(segment), 6),
+            'scale': round(float(scale), 6),
+            'vertices': side_changed,
+            'max_displacement': round(float(max_move), 6),
+        }
+
+    mesh[marker] = version
+    mesh['mowas2_standard_mmd_arm_segment_details'] = json.dumps(
+        details, sort_keys=True)
+    if changed:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    print('[arm-mmd] upper-arm crease retarget: %d vertices | %s'
+          % (changed, details))
+    return {'changed': changed, 'details': details}
+
+
+def goh_revert_standard_mmd_upper_arm_geometry(mesh, tgt, mirrored=False):
+    """Undo a previous shoulder→crease axial stretch; forearm stays put."""
+    marker = 'mowas2_standard_mmd_arm_segment_version'
+    if mesh is None or tgt is None or int(mesh.get(marker, 0)) < 1:
+        return {'changed': 0, 'reason': 'nothing to revert'}
+    raw = mesh.get('mowas2_standard_mmd_arm_segment_details')
+    try:
+        details = json.loads(raw) if raw else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        details = {}
+    mesh_world = mesh.matrix_world.copy()
+    mesh_inv = mesh_world.inverted_safe()
+    changed = 0
+    for source_side in ('L', 'R'):
+        target_side = (('r' if source_side == 'L' else 'l')
+                       if mirrored else source_side.lower())
+        side = details.get(target_side) or {}
+        scale = float(side.get('scale') or 0.0)
+        if scale <= 1e-6:
+            continue
+        hand1_name = 'hand1' + target_side
+        hand2_name = 'hand2' + target_side
+        if (hand1_name not in tgt.data.bones
+                or hand2_name not in tgt.data.bones):
+            continue
+        shoulder = tgt.matrix_world @ tgt.data.bones[hand1_name].head_local
+        elbow = tgt.matrix_world @ tgt.data.bones[hand2_name].head_local
+        segment = (elbow - shoulder).length
+        axis = (elbow - shoulder).normalized()
+        radial_limit = max(1.6, min(2.6, segment * 0.42))
+        fade = max(0.18, min(0.45, segment * 0.06))
+        for vertex in mesh.data.vertices:
+            position = mesh_world @ vertex.co
+            relative = position - shoulder
+            axial = float(relative.dot(axis))
+            radial = relative - axis * axial
+            if axial < -fade or axial > segment + 0.08:
+                continue
+            if radial.length > radial_limit or axial > segment:
+                continue
+            mapped_axial = axial / scale
+            if axial < fade:
+                mapped_axial = axial + (mapped_axial - axial) * _smoothstep01(
+                    (axial + fade) / (2.0 * fade))
+            mapped = shoulder + axis * mapped_axial + radial
+            if (mapped - position).length <= 1e-7:
+                continue
+            vertex.co = mesh_inv @ mapped
+            changed += 1
+    if marker in mesh:
+        del mesh[marker]
+    if 'mowas2_standard_mmd_arm_segment_details' in mesh:
+        del mesh['mowas2_standard_mmd_arm_segment_details']
+    if changed:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    print('[arm-mmd] upper-arm crease reverted:', changed)
+    return {'changed': changed}
+
+
 def normalize_foot_geometry(mesh, src, tgt, ground_z=GROUND_Z):
     """按源脚部权重和目标 foot3/地面几何归一脚掌高度。
 
@@ -6414,6 +8215,563 @@ def bind_and_transfer(mesh, tgt, mirrored):
         for vi in np.where(mask)[0]:
             vg_objs[ti].add([int(vi)], float(T2[vi, ti]), 'REPLACE')
     bpy.context.view_layer.update()
+
+
+def goh_reweight_standard_mmd_narrow_shoulder(mesh, src, tgt,
+                                                mirrored=False, force=False):
+    """Approximate the frozen narrow shoulder pivot with two GOH skin bones.
+
+    Static vertex coordinates are never changed. Near each shoulder, part of the
+    existing hand1 weight moves to clavicle so their blended pivot matches the
+    frozen source Arm pivot. The blend fades back to hand1 before the elbow.
+    """
+    version = STANDARD_MMD_SHOULDER_ANIM_WEIGHT_VERSION
+    if (not force and
+            int(mesh.get('mowas2_standard_mmd_anim_weight_version', 0)) >= version):
+        return {'changed': 0, 'reason': 'already applied'}
+    if not bool(mesh.get('gem2_narrow_shoulder_mesh')):
+        return {'changed': 0, 'reason': 'not plan-C narrow shoulder'}
+    if (src is None or src.type != 'ARMATURE'
+            or 'Arm_L' not in src.pose.bones or 'Arm_R' not in src.pose.bones):
+        return {'changed': 0, 'reason': 'missing source Arm bones'}
+    required = ('clavicle_left', 'hand1l', 'hand2l',
+                'clavicle_right', 'hand1r', 'hand2r')
+    if (tgt is None or tgt.type != 'ARMATURE'
+            or not all(name in tgt.data.bones for name in required)):
+        return {'changed': 0, 'reason': 'missing target shoulder bones'}
+    groups = {group.name: group for group in mesh.vertex_groups}
+    if not all(name in groups for name in required):
+        return {'changed': 0, 'reason': 'missing target shoulder groups'}
+
+    def target_rest_world(name):
+        return tgt.matrix_world @ tgt.data.bones[name].head_local
+
+    lateral = target_rest_world('hand1l') - target_rest_world('hand1r')
+    if lateral.length <= 1e-7:
+        return {'changed': 0, 'reason': 'zero target lateral axis'}
+    lateral.normalize()
+    changed = 0
+    per_side = {}
+    for target_side in ('l', 'r'):
+        source_side = (('R' if target_side == 'l' else 'L')
+                       if mirrored else target_side.upper())
+        source_name = 'Arm_' + source_side
+        if source_name not in src.pose.bones:
+            continue
+        clavicle_name = 'clavicle_' + ('left' if target_side == 'l' else 'right')
+        hand1_name = 'hand1' + target_side
+        hand2_name = 'hand2' + target_side
+        clavicle = target_rest_world(clavicle_name)
+        hand1 = target_rest_world(hand1_name)
+        elbow = target_rest_world(hand2_name)
+        desired = src.matrix_world @ src.pose.bones[source_name].head
+        denom = (hand1 - clavicle).dot(lateral)
+        if abs(denom) <= 1e-7:
+            continue
+        measured_share = max(0.0, min(1.0,
+            (desired - clavicle).dot(lateral) / denom))
+        # More clavicle than v3 so in-game shoulder width follows the
+        # narrow preview instead of jumping back to GOH rest.
+        ratio = _goh_shoulder_narrow_ratio()
+        hand_share = max(0.05, min(0.48, measured_share * (0.36 + 0.10 * ratio)))
+        arm_axis = elbow - desired
+        arm_length = arm_axis.length
+        arm_len2 = arm_axis.length_squared
+        if arm_len2 <= 1e-7:
+            continue
+        arm_direction = arm_axis / arm_length
+        rest_span = (hand1 - clavicle).length
+        # v3 covers the deltoid and proximal upper arm, not only the cap.
+        # The wider radial window makes the virtual pivot visible in-game;
+        # the 3-D fades below keep the rounded silhouette from v2.
+        radial_inner = max(0.55, min(1.20, rest_span * 0.40))
+        radial_outer = max(radial_inner + 0.45,
+                           min(2.20, rest_span * 0.82))
+        up_direction = Vector((0.0, 0.0, 1.0))
+        up_direction -= arm_direction * up_direction.dot(arm_direction)
+        if up_direction.length <= 1e-7:
+            up_direction = lateral.cross(arm_direction)
+        if up_direction.length > 1e-7:
+            up_direction.normalize()
+        top_height = max(0.30, radial_outer * 0.55)
+        group_ids = {name: groups[name].index for name in
+                     (clavicle_name, hand1_name, hand2_name)}
+        kk_mode = str(mesh.get('mowas2_source_mode', '')) == 'kk'
+        side_changed = 0
+        for vertex in mesh.data.vertices:
+            weights = {assignment.group: float(assignment.weight)
+                       for assignment in vertex.groups}
+            hand_weight = weights.get(group_ids[hand1_name], 0.0)
+            if hand_weight <= 1e-6:
+                continue
+            elbow_weight = weights.get(group_ids[hand2_name], 0.0)
+            if elbow_weight >= 0.45:
+                continue
+            world = mesh.matrix_world @ vertex.co
+            offset = world - desired
+            along = offset.dot(arm_direction)
+            u = along / arm_length
+            if kk_mode:
+                if u <= -0.22 or u >= 0.82:
+                    continue
+            elif u <= -0.35 or u >= 0.72:
+                continue
+
+            # Two-dimensional rounded field: fade in from the inner shoulder,
+            # fade out toward the elbow, and fade radially away from the arm
+            # axis.  The previous one-dimensional full-strength slab produced
+            # a visible 90-degree shoulder-top hinge during animation.
+            root_t = max(0.0, min(1.0, (u + 0.35) / 0.30))
+            root_fade = root_t * root_t * (3.0 - 2.0 * root_t)
+            distal_t = max(0.0, min(1.0, (u - 0.02) / 0.70))
+            distal_fade = 1.0 - distal_t * distal_t * (3.0 - 2.0 * distal_t)
+            radial = (offset - arm_direction * along).length
+            radial_t = max(0.0, min(1.0,
+                (radial - radial_inner) / (radial_outer - radial_inner)))
+            radial_fade = 1.0 - radial_t * radial_t * (3.0 - 2.0 * radial_t)
+
+            # Fade the top ridge separately.  High cap vertices keep more of
+            # their original hand1 response, rounding the silhouette instead
+            # of rotating the whole shoulder top as one flat slab.
+            height = offset.dot(up_direction)
+            top_t = max(0.0, min(1.0, max(0.0, height) / top_height))
+            top_smooth = top_t * top_t * (3.0 - 2.0 * top_t)
+            # Keep a smooth but non-zero inset on the visible top silhouette;
+            # v2 faded it to zero, rounding the cap but leaving game width wide.
+            top_fade = 0.32 + 0.68 * (1.0 - top_smooth)
+            under_t = max(0.0, min(1.0,
+                max(0.0, -height) / (top_height * 1.5)))
+            under_fade = 1.0 - 0.30 * (
+                under_t * under_t * (3.0 - 2.0 * under_t))
+            elbow_t = max(0.0, min(1.0, elbow_weight / 0.40))
+            elbow_fade = 1.0 - elbow_t * elbow_t * (3.0 - 2.0 * elbow_t)
+            influence = (root_fade * distal_fade * radial_fade
+                         * top_fade * under_fade * elbow_fade)
+            clavicle_weight = weights.get(group_ids[clavicle_name], 0.0)
+            pair_weight = clavicle_weight + hand_weight
+            if pair_weight <= 1e-6:
+                continue
+            if kk_mode:
+                # Inner cap keeps some clavicle for anim width.  Dump to
+                # hand1 over a longer span so the deltoid top is not a
+                # cliff; the armpit lags that dump so the crease blends.
+                dump_top = _smoothstep01((u - 0.00) / 0.40)
+                dump_pit = _smoothstep01((u - 0.10) / 0.42)
+                under_t = _smoothstep01(
+                    max(0.0, -height) / max(0.28, top_height * 1.15))
+                dump = dump_top * (1.0 - under_t) + dump_pit * under_t
+                if u >= 0.50:
+                    dump = 1.0
+                inner_share = max(0.38, hand_share)
+                desired_hand = pair_weight * (
+                    inner_share + (1.0 - inner_share) * dump)
+                new_hand = hand_weight + (desired_hand - hand_weight) * 0.92
+            else:
+                if influence <= 1e-6:
+                    continue
+                minimum_hand = hand_weight * (
+                    0.18 if hand_weight > 0.60 else 0.10)
+                desired_hand = min(
+                    hand_weight, max(pair_weight * hand_share, minimum_hand))
+                new_hand = hand_weight + (desired_hand - hand_weight) * influence
+            new_hand = min(pair_weight, max(0.0, new_hand))
+            new_clavicle = pair_weight - new_hand
+            if (abs(new_hand - hand_weight) <= 1e-7
+                    and abs(new_clavicle - clavicle_weight) <= 1e-7):
+                continue
+            groups[hand1_name].add([vertex.index], new_hand, 'REPLACE')
+            groups[clavicle_name].add(
+                [vertex.index], new_clavicle, 'REPLACE')
+            side_changed += 1
+            changed += 1
+        per_side[target_side] = {
+            'vertices': side_changed,
+            'hand_share': round(float(hand_share), 6),
+            'desired_pivot': [round(float(value), 6) for value in desired],
+        }
+
+    details = {'version': version, 'changed': changed, 'sides': per_side}
+    mesh['mowas2_standard_mmd_anim_weight_version'] = version
+    mesh['mowas2_standard_mmd_anim_weight_details'] = json.dumps(
+        details, sort_keys=True)
+    bpy.context.view_layer.update()
+    print('[shoulder-mmd] animation pivot weights: %d vertices | %s'
+          % (changed, per_side))
+    return {'changed': changed, 'details': details}
+
+
+def goh_recenter_standard_mmd_elbow_weights(mesh, src, tgt,
+                                              mirrored=False, force=False):
+    """Center hand1/hand2 mix on the visual elbow crease when one exists.
+
+    Long GOH rest keeps animation length, so the source crease often sits on
+    the upper-arm bone rather than on hand2.  Shifting only the pair's
+    internal ratio puts the fold on that crease without stretching geometry.
+    If no clear waist is found, the mix still targets the GOH hand2 pivot.
+    Vertex coordinates, rest matrices and non-pair weights stay untouched.
+    """
+    version = STANDARD_MMD_ELBOW_WEIGHT_VERSION
+    marker = 'mowas2_standard_mmd_elbow_weight_version'
+    if (mesh is None or mesh.type != 'MESH' or tgt is None
+            or tgt.type != 'ARMATURE'):
+        return {'changed': 0, 'reason': 'missing mesh/source/target'}
+    if not force and int(mesh.get(marker, 0)) >= version:
+        return {'changed': 0, 'reason': 'already applied'}
+    if not force:
+        if (src is None or src.type != 'ARMATURE'
+                or not _has_standard_mmd_shoulder_chain(src)
+                or str(mesh.get('mowas2_source_mode', '')) != 'mmd'):
+            return {'changed': 0, 'reason': 'not standard four-stage MMD'}
+    required = ('hand1l', 'hand2l', 'hand_rot1l',
+                'hand1r', 'hand2r', 'hand_rot1r')
+    groups = {group.name: group for group in mesh.vertex_groups}
+    if (not all(name in tgt.data.bones for name in required)
+            or not all(name in groups for name in required
+                       if not name.startswith('hand_rot1'))):
+        return {'changed': 0, 'reason': 'missing target arm bones/groups'}
+    try:
+        _assert_goh_source_target(src, tgt.get('gem2_mdl_path'))
+    except (FileNotFoundError, ValueError):
+        # CUSTOM long-arm templates share the GOH names; still recenter.
+        pass
+
+    def fit_logit(rows):
+        fitted = [row for row in rows if 0.03 < row['share'] < 0.97]
+        if len(fitted) < 8:
+            return None
+        weighted = []
+        for row in fitted:
+            share = row['share']
+            weight = row['pair'] * max(0.05, 4.0 * share * (1.0 - share))
+            value = math.log(share / (1.0 - share))
+            weighted.append((row['axial'], value, weight))
+        total = sum(item[2] for item in weighted)
+        if total <= 1e-9:
+            return None
+        mean_x = sum(x * weight for x, _y, weight in weighted) / total
+        mean_y = sum(y * weight for _x, y, weight in weighted) / total
+        variance = sum(weight * (x - mean_x) ** 2
+                       for x, _y, weight in weighted)
+        if variance <= 1e-9:
+            return None
+        slope = sum(weight * (x - mean_x) * (y - mean_y)
+                    for x, y, weight in weighted) / variance
+        intercept = mean_y - slope * mean_x
+        if slope <= 1e-7:
+            return None
+        return {'count': len(fitted), 'slope': slope,
+                'intercept': intercept, 'center': -intercept / slope}
+
+    mesh_world = mesh.matrix_world.copy()
+    details = {}
+    changed = 0
+    for side in ('l', 'r'):
+        hand1_name = 'hand1' + side
+        hand2_name = 'hand2' + side
+        shoulder = tgt.matrix_world @ tgt.data.bones[hand1_name].head_local
+        elbow = tgt.matrix_world @ tgt.data.bones[hand2_name].head_local
+        segment = (elbow - shoulder).length
+        if segment <= 1e-6:
+            details[side] = {'reason': 'zero upper-arm length'}
+            continue
+        axis = (elbow - shoulder).normalized()
+        # Locate the mesh waist on the upper arm (source elbow texture).
+        buckets = {}
+        for vertex in mesh.data.vertices:
+            relative_s = mesh_world @ vertex.co - shoulder
+            along = float(relative_s.dot(axis))
+            if along < 0.28 * segment or along > 0.72 * segment:
+                continue
+            radial_s = float((relative_s - axis * along).length)
+            if radial_s > 2.2:
+                continue
+            key = round(along / segment, 2)
+            buckets.setdefault(key, []).append(radial_s)
+        profile = []
+        for key, radii in buckets.items():
+            if len(radii) < 8:
+                continue
+            radii = sorted(radii)
+            profile.append((key * segment, radii[len(radii) // 2]))
+        target_center = 0.0
+        crease = None
+        if profile:
+            radii = [item[1] for item in profile]
+            radii.sort()
+            median_r = radii[len(radii) // 2]
+            crease_along, crease_r = min(profile, key=lambda item: item[1])
+            if median_r > 1e-6 and crease_r <= 0.85 * median_r:
+                crease = crease_along
+                target_center = crease - segment
+        if crease is None and force:
+            crease = 0.52 * segment
+            target_center = crease - segment
+        fit_extent = max(0.8, min(3.2, abs(target_center) + segment * 0.18))
+        outer_extent = max(1.1, min(3.6, abs(target_center) + segment * 0.22))
+        core_extent = max(0.45, min(1.4, segment * 0.16))
+        radial_limit = max(1.0, min(2.4, segment * 0.36))
+        hand1_group = groups[hand1_name]
+        hand2_group = groups[hand2_name]
+        rows = []
+        for vertex in mesh.data.vertices:
+            hand1_weight = 0.0
+            hand2_weight = 0.0
+            for assignment in vertex.groups:
+                if assignment.group == hand1_group.index:
+                    hand1_weight = float(assignment.weight)
+                elif assignment.group == hand2_group.index:
+                    hand2_weight = float(assignment.weight)
+            pair = hand1_weight + hand2_weight
+            if pair < 0.20:
+                continue
+            relative = mesh_world @ vertex.co - elbow
+            axial = float(relative.dot(axis))
+            radial = float((relative - axis * axial).length)
+            if abs(axial) > outer_extent or radial > radial_limit:
+                continue
+            rows.append({'vertex': vertex, 'pair': pair,
+                         'share': hand2_weight / pair,
+                         'axial': axial, 'radial': radial})
+        fit_rows = [row for row in rows if abs(row['axial']) <= fit_extent]
+        before = fit_logit(fit_rows)
+        max_center = segment * 0.55
+        desired = max(-max_center, min(0.0, float(target_center)))
+        use_crease = crease is not None
+        if (not use_crease
+                and (before is None or before['slope'] * segment < 0.50)):
+            details[side] = {'reason': 'insufficient monotonic elbow blend',
+                             'candidates': len(rows)}
+            continue
+        logit_shift = 0.0
+        if not use_crease:
+            logit_shift = max(-4.5, min(4.5, before['slope'] * before['center']))
+        side_changed = 0
+        for row in rows:
+            share = row['share']
+            along = row['axial'] + segment
+            if use_crease:
+                # Spread the mix from the visual crease to GOH hand2 so the
+                # posed fold is a cone, not a 15-30° knife-plane around the
+                # offset pivot.
+                span = max(1e-6, segment - crease)
+                u = (along - crease) / span
+                influence = 1.0 if -0.25 <= u <= 1.15 else 0.0
+                if u < 0.0:
+                    influence = _smoothstep01((u + 0.25) / 0.25)
+                elif u > 1.0:
+                    influence = _smoothstep01((1.15 - u) / 0.15)
+                target_share = _smoothstep01(max(0.0, min(1.0, u)))
+                new_share = share + (target_share - share) * influence
+            else:
+                if share <= 1e-4 or share >= 1.0 - 1e-4:
+                    continue
+                distance = abs(row['axial'])
+                if distance <= core_extent:
+                    influence = 1.0
+                else:
+                    fade_span = max(1e-6, outer_extent - core_extent)
+                    influence = _smoothstep01(
+                        (outer_extent - distance) / fade_span)
+                if influence <= 1e-6:
+                    continue
+                logit = math.log(share / (1.0 - share))
+                new_share = 1.0 / (1.0 + math.exp(
+                    -(logit + logit_shift * influence)))
+            new_share = min(max(new_share, 0.0), 1.0)
+            new_hand2 = row['pair'] * new_share
+            new_hand1 = row['pair'] - new_hand2
+            if abs(new_hand2 - row['pair'] * share) <= 1e-7:
+                continue
+            hand1_group.add([row['vertex'].index], new_hand1, 'REPLACE')
+            hand2_group.add([row['vertex'].index], new_hand2, 'REPLACE')
+            row['share'] = new_share
+            side_changed += 1
+            changed += 1
+        after = fit_logit(fit_rows)
+        details[side] = {
+            'vertices': side_changed,
+            'segment': round(float(segment), 6),
+            'center_before': (round(float(before['center']), 6)
+                              if before is not None else None),
+            'center_used': round(float(desired), 6),
+            'center_after': (round(float(after['center']), 6)
+                             if after is not None else None),
+            'slope': (round(float(before['slope']), 6)
+                      if before is not None else None),
+            'logit_shift': round(float(logit_shift), 6),
+            'fit_count': int(before['count']) if before is not None else 0,
+            'crease': (round(float(crease), 6) if crease is not None else None),
+            'target_center': round(float(desired), 6),
+            'mode': 'crease_spread' if use_crease else 'hand2',
+        }
+
+    result = {'version': version, 'changed': changed, 'sides': details}
+    mesh[marker] = version
+    mesh['mowas2_standard_mmd_elbow_weight_details'] = json.dumps(
+        result, sort_keys=True)
+    if changed:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    print('[elbow-mmd] centered hand1/hand2 weights: %d vertices | %s'
+          % (changed, details))
+    return {'changed': changed, 'details': result}
+
+
+def goh_smooth_standard_mmd_upper_arm_waist(mesh, src, tgt,
+                                            mirrored=False, force=False):
+    """Compatibility no-op: inflating the mid-arm waist changed overall shape.
+
+    The leftover MMD elbow constriction on a long GOH bone still needs a
+    better fix than radial inflate. Keep the entry point so older callsites
+    do not break.
+    """
+    return {'changed': 0, 'reason': 'waist inflate withdrawn; shape regression'}
+    version = STANDARD_MMD_ARM_WAIST_VERSION
+    marker = 'mowas2_standard_mmd_arm_waist_version'
+    if (mesh is None or mesh.type != 'MESH' or tgt is None
+            or tgt.type != 'ARMATURE'):
+        return {'changed': 0, 'reason': 'missing mesh/target'}
+    if not force and int(mesh.get(marker, 0)) >= version:
+        return {'changed': 0, 'reason': 'already applied'}
+    if not force:
+        if (src is None or src.type != 'ARMATURE'
+                or not _has_standard_mmd_shoulder_chain(src)
+                or str(mesh.get('mowas2_source_mode', '')) != 'mmd'):
+            return {'changed': 0, 'reason': 'not standard four-stage MMD'}
+    groups = {group.name: group for group in mesh.vertex_groups}
+    mesh_world = mesh.matrix_world.copy()
+    mesh_inv = mesh_world.inverted_safe()
+    details = {}
+    changed = 0
+    for side in ('l', 'r'):
+        hand1_name = 'hand1' + side
+        hand2_name = 'hand2' + side
+        if (hand1_name not in tgt.data.bones or hand2_name not in tgt.data.bones
+                or hand1_name not in groups or hand2_name not in groups):
+            continue
+        shoulder = tgt.matrix_world @ tgt.data.bones[hand1_name].head_local
+        elbow = tgt.matrix_world @ tgt.data.bones[hand2_name].head_local
+        segment = (elbow - shoulder).length
+        if segment <= 1e-6:
+            continue
+        axis = (elbow - shoulder).normalized()
+        g1 = groups[hand1_name]
+        g2 = groups[hand2_name]
+        samples = []
+        rows = []
+        for vertex in mesh.data.vertices:
+            w1 = w2 = 0.0
+            for assignment in vertex.groups:
+                if assignment.group == g1.index:
+                    w1 = float(assignment.weight)
+                elif assignment.group == g2.index:
+                    w2 = float(assignment.weight)
+            pair = w1 + w2
+            if pair < 0.18:
+                continue
+            position = mesh_world @ vertex.co
+            relative = position - shoulder
+            along = float(relative.dot(axis))
+            radial = relative - axis * along
+            radius = float(radial.length)
+            if along < 0.18 * segment or along > 1.02 * segment or radius > 2.4:
+                continue
+            rows.append((vertex, along, radial, radius, pair))
+            if 0.22 * segment <= along <= 0.98 * segment and radius < 2.0:
+                samples.append((along / segment, radius))
+        if len(samples) < 20 or len(rows) < 20:
+            details[side] = {'reason': 'not enough upper-arm samples'}
+            continue
+        prox = [r for t, r in samples if 0.22 <= t <= 0.38]
+        dist = [r for t, r in samples if 0.88 <= t <= 0.98]
+        if len(prox) < 6:
+            prox = [r for t, r in samples if t <= 0.45]
+        if len(dist) < 4:
+            dist = [r for t, r in samples if t >= 0.80]
+        if not prox or not dist:
+            details[side] = {'reason': 'missing taper samples'}
+            continue
+        prox.sort(); dist.sort()
+        r0 = prox[len(prox) // 2]
+        r1 = dist[len(dist) // 2]
+        side_changed = 0
+        max_scale = 1.0
+        for vertex, along, radial, radius, pair in rows:
+            if radius <= 1e-5:
+                continue
+            u = (along / segment - 0.22) / 0.76
+            u = max(0.0, min(1.0, u))
+            desired = r0 + (r1 - r0) * u
+            if radius >= desired * 0.92:
+                continue
+            influence = pair
+            if along < 0.28 * segment:
+                influence *= _smoothstep01((along - 0.18 * segment)
+                                           / (0.10 * segment))
+            elif along > 0.92 * segment:
+                influence *= _smoothstep01((1.02 * segment - along)
+                                           / (0.10 * segment))
+            if influence <= 1e-4:
+                continue
+            scale = 1.0 + (desired / radius - 1.0) * influence
+            scale = min(scale, 2.4)
+            mapped = shoulder + axis * along + radial * scale
+            if (mapped - (mesh_world @ vertex.co)).length <= 1e-7:
+                continue
+            vertex.co = mesh_inv @ mapped
+            side_changed += 1
+            changed += 1
+            max_scale = max(max_scale, scale)
+        details[side] = {
+            'vertices': side_changed,
+            'r_prox': round(float(r0), 4),
+            'r_dist': round(float(r1), 4),
+            'max_scale': round(float(max_scale), 4),
+        }
+    mesh[marker] = version
+    mesh['mowas2_standard_mmd_arm_waist_details'] = json.dumps(
+        details, sort_keys=True)
+    if changed:
+        mesh.data.update()
+        bpy.context.view_layer.update()
+    print('[arm-mmd] upper-arm waist inflate: %d vertices | %s'
+          % (changed, details))
+    return {'changed': changed, 'details': details}
+
+
+def goh_sync_standard_mmd_tight_clothing(mesh, src, tgt, force=False):
+    """Compatibility no-op: special garment clipping requires manual cleanup.
+
+    Automatic weight copying, covered-face deletion, and hem inset were unable
+    to distinguish designed exposed skin from poke-through on irregular crop
+    tops reliably.  Keep this entry point for external callers, but never alter
+    weights or geometry.
+    """
+    return {'changed': 0, 'reason': 'manual clothing correction required'}
+
+
+def goh_planC_hand_align(mesh, src, tgt, mirrored=False, force=False):
+    """[DEPRECATED] 方案 C 手链后处理（已从流程移除，保留仅供诊断/回退）。
+
+    2026-09-07 结论：方案 C 冻结时源手链已按窄骨架对齐，freeze 姿态本身就是
+    完整的垂直线条（实测 Arm→Elbow→Wrist z/y 连续）。绑定回原骨架后，任何
+    「拉回宽位」或「沿轴重排」的后处理都会破坏冻结手链的完整性（接缝/形变）。
+    正确行为 = 冻结手链原样进入蒙皮（见 run_full 6.4 分支）。本函数保留定义
+    以支持历史调用方，但不再被管线调用。
+
+    返回移动顶点数（恒 0，除非显式 force 调试）。
+    """
+    if not force:
+        return 0
+    if mesh is None or src is None or tgt is None:
+        return 0
+    if mesh.type != 'MESH' or tgt.type != 'ARMATURE':
+        return 0
+    if not bool(mesh.get('gem2_narrow_shoulder_mesh')):
+        return 0
+    print('[planC-hand] deprecated handler invoked with force=True; '
+          'frozen hand-chain left untouched')
+    return 0
 
 
 def goh_recover_wrist_anchor(mesh, src, tgt, mirrored=False, force=False):
@@ -7323,9 +9681,6 @@ def _align_options_changed(mesh, src):
         # Rebuild once from PMX so v4 starts from the untouched body silhouette.
         if body_version < 4:
             return True
-        if abs(float(mesh.get('mowas2_foot1_spacing', 1.0))
-               - _goh_foot1_spacing()) > 1e-4:
-            return True
         if bool(mesh.get('mowas2_ik_updown_enabled', False)) != _goh_ik_updown_enabled():
             return True
         if abs(float(mesh.get('mowas2_ik_updown_multiplier', 1.0))
@@ -7356,6 +9711,62 @@ def _align_options_changed(mesh, src):
             if (enabled and follow > 1e-4
                     and int(mesh.get('mowas2_neck_follow_version', 0)) < 2):
                 return True
+    except Exception:
+        pass
+
+    # KK/KKS 肩根拔到 GOH 锁骨高度；旧冻结快照需重导一次。
+    try:
+        names = [bone.name.casefold() for bone in src.data.bones] if src else []
+        cf = sum(1 for name in names if name.startswith('cf_'))
+        cfs = sum(1 for name in names if name.startswith('cf_s_'))
+        if cf >= 6 or cfs >= 3:
+            if int(mesh.get('mowas2_kk_shoulder_tune_version', 0)) < \
+                    KK_SHOULDER_TUNE_VERSION:
+                return True
+    except Exception:
+        pass
+
+    # 标准四级 MMD 的肩宽/肩根微调已烘焙进冻结几何；旧快照需重导一次。
+    try:
+        if _has_standard_mmd_shoulder_chain(src):
+            if int(mesh.get('mowas2_standard_mmd_shoulder_tune_version', 0)) < \
+                    STANDARD_MMD_SHOULDER_TUNE_VERSION:
+                return True
+            if abs(float(mesh.get('mowas2_standard_mmd_shoulder_width_factor', 1.0))
+                   - STANDARD_MMD_SHOULDER_WIDTH_FACTOR) > 1e-4:
+                return True
+            # Version 0 means the aligned snapshot has not been bound yet and
+            # can receive v2 directly.  Version 1 already contains the old
+            # axial-only mix, so rebuild from PMX rather than stacking v2 on it.
+            anim_weight_version = int(mesh.get(
+                'mowas2_standard_mmd_anim_weight_version', 0))
+            if (0 < anim_weight_version
+                    < STANDARD_MMD_SHOULDER_ANIM_WEIGHT_VERSION):
+                return True
+            # Experimental clothing-sync v1-v5 changed weights/geometry.
+            # Rebuild once from PMX; the retired compatibility entry point no
+            # longer stamps this property, so the clean snapshot stays clean.
+            if int(mesh.get(
+                    'mowas2_standard_mmd_clothing_sync_version', 0)) > 0:
+                return True
+            if (STANDARD_MMD_ARM_SEGMENT_ENABLED
+                    and int(mesh.get(
+                        'mowas2_standard_mmd_arm_segment_version', 0))
+                    < STANDARD_MMD_ARM_SEGMENT_VERSION):
+                return True
+    except Exception:
+        pass
+
+    # 方案 B/C 肩宽模式变化：冻结几何已固化，模式/系数改动必须重导对齐。
+    try:
+        if str(mesh.get('mowas2_shoulder_mode', '')) != _goh_shoulder_mode():
+            return True
+        if abs(float(mesh.get('mowas2_shoulder_narrow_ratio', 1.0))
+               - _goh_shoulder_narrow_ratio()) > 1e-4:
+            return True
+        if str(mesh.get('mowas2_shoulder_attach', 'blend')) != \
+                _goh_shoulder_attach():
+            return True
     except Exception:
         pass
 
@@ -8463,8 +10874,10 @@ def convert_human_rest_scene(scene, mdl_path, mesh_name='',
 
 
 def _ensure_bundled_target_variant(src, tgt, mesh, root, pmx_path=None,
-                                    force_short=False):
-    """Keep the bundled target skeleton consistent with the long-arm toggle.
+                                    force_short=False, force_long=False):
+    """Optional helper to swap the two bundled GOH rests.
+
+    GOH no longer auto-invokes this; the user-selected skeleton is kept.
 
     Older scenes often keep ``samples/goh_skin.mdl`` even after the long-arm
     option was enabled. That short template shares the same torso and shoulder
@@ -8472,14 +10885,17 @@ def _ensure_bundled_target_variant(src, tgt, mesh, root, pmx_path=None,
     so fitting to it visibly recesses the hand into the forearm. Only replace
     the two known bundled templates; an explicitly selected custom MDL is never
     changed. Frozen meshes must be rebuilt from their PMX rather than stretched.
-    ``force_short`` is used by the explicit GOH route so programmatic callers
-    without registered scene properties still get the route reference target.
+    Route callers use ``force_short`` for legacy/KK targets and ``force_long``
+    for four-stage standard-MMD sources whose GOH animations use the GFA lengths.
     """
+    if force_short and force_long:
+        raise ValueError('Target variant cannot be both short and long')
     short_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               'samples', 'goh_skin.mdl')
     long_path = GOH_DEFAULT_MDL
-    desired = (short_path if force_short
-               else (long_path if _goh_gfa_longarm() else short_path))
+    desired = (long_path if force_long else
+               (short_path if force_short else
+                (long_path if _goh_gfa_longarm() else short_path)))
     current = tgt.get('gem2_mdl_path') if tgt else None
     if not current:
         return src, tgt, mesh, root, False
@@ -8554,8 +10970,12 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
         output_dir = OUT_DEFAULT
     src, tgt, mesh, root = resolve_scene()
     _assert_legacy_pmx_scene(mesh, tgt)
-    src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
-        src, tgt, mesh, root, pmx_path=pmx_path)
+    props = getattr(bpy.context.scene, 'mowas2_props', None)
+    route = str(getattr(props, 'export_route', '') or
+                _infer_export_route(tgt.get('gem2_mdl_path') if tgt else ''))
+    if route == 'GOH':
+        _assert_goh_source_target(src, tgt.get('gem2_mdl_path'))
+    # GOH keeps the user-selected skeleton. CUSTOM/MOWAS2 already own theirs.
     # 旧场景兼容：PMX 管线始终使用历史 frame-0 显示约定；若场景曾被
     # 临时 human-normalized 版本污染，从保留的 raw MDL 元数据恢复。
     if tgt is not None:
@@ -8611,6 +11031,22 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
     align_rigid(src, tgt, mesh, root, mirrored, ground_z)
     print('[3] rigid fit done')
 
+    # 3.2 方案 C (align_only): 窄肩对齐骨架，逻辑与 run_full 一致。
+    mesh['gem2_bind_target_name'] = tgt.name
+    if (_goh_shoulder_mode() == 'SKELETON'
+            and not mesh.get('mowas2_frozen')):
+        src_span = goh_measure_source_shoulder(src)
+        nc = goh_build_narrow_target_from_mdl(
+            tgt, src_span, ratio=_goh_shoulder_narrow_ratio(),
+            attach=_goh_shoulder_attach())
+        if nc.get('target') is not None:
+            tgt = nc['target']
+            print('[3.2] plan-C narrow target active (align-only):',
+                  tgt.name, '| bind-back:', mesh['gem2_bind_target_name'])
+        else:
+            print('[3.2] plan-C narrow target unavailable:',
+                  nc.get('reason', 'unknown'))
+
     # 3.25 GOH v12: GFA 骨骼级躯干链对齐 (freeze 前, 网格随骨架形变)
     #     全盘 GFA 思路: 骨架缩放/偏移 + 网格自动跟随 → 无顶点压缩/撕裂。
     if _goh_hand_split():
@@ -8636,6 +11072,11 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
         mesh, src, tgt, mirrored=mirrored, source_mode=mode)
     if forearm_result.get('changed'):
         print('[5.1] MMD forearm/wrist geometry:', forearm_result['changed'])
+    upper_arm_result = goh_retarget_standard_mmd_upper_arm_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if upper_arm_result.get('changed'):
+        print('[5.15] standard-MMD upper-arm crease:',
+              upper_arm_result['changed'])
     # GFA 后任一源分支都可能改变脚底；归一化只读取源 ankle 权重，
     # 不改变 KK/MMD 的骨骼对齐分支。
     normalize_foot_geometry(mesh, src, tgt, ground_z)
@@ -8643,14 +11084,53 @@ def align_only(output_dir=None, ground_z=GROUND_Z, pmx_path=None):
         mesh, src, tgt, mirrored=mirrored)
     if body_result.get('changed'):
         print('[5.2] body curve / foot1 spacing:', body_result['changed'])
+    ankle_result = goh_smooth_ankle_junction(mesh, tgt, force=True)
+    if ankle_result.get('changed'):
+        print('[5.25] ankle junction:', ankle_result['changed'])
     arm_inset_result = goh_adjust_arm_inset_geometry(
         mesh, src, tgt, mirrored=mirrored)
     if arm_inset_result.get('changed'):
         print('[5.3] rigid whole-arm inset:', arm_inset_result['changed'])
+    arm_thick_result = goh_adjust_arm_thickness_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if arm_thick_result.get('changed'):
+        print('[5.35] arm thickness:', arm_thick_result['changed'])
+    shoulder_inset_result = goh_adjust_shoulder_inset_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if shoulder_inset_result.get('changed'):
+        print('[5.4] clavicle/shoulder inset:',
+              shoulder_inset_result['changed'])
     mesh['mowas2_frozen'] = True
     mesh['mowas2_mirrored'] = mirrored   # 复用首次判定的镜像方向，供绑定阶段换名
     mesh['mowas2_source_mode'] = mode
+    mesh['mowas2_shoulder_mode'] = _goh_shoulder_mode()
+    mesh['mowas2_shoulder_narrow_ratio'] = float(
+        _goh_shoulder_narrow_ratio())
+    mesh['mowas2_shoulder_attach'] = str(_goh_shoulder_attach())
+    mesh['gem2_narrow_shoulder_mesh'] = bool(
+        _goh_shoulder_mode() == 'SKELETON')
     print('[5] frozen (aligned state saved)')
+
+    # 5.05 方案 C (align_only): 快照必须落回原动画骨架，否则 run_full 打开
+    #     快照时会把窄肩骨架当绑定目标（动画 rest 错）。
+    bind_name = mesh.get('gem2_bind_target_name')
+    if bind_name and bind_name != tgt.name:
+        restored = next((o for o in bpy.data.objects
+                         if o.type == 'ARMATURE' and o.name == bind_name),
+                        None)
+        if restored is not None:
+            print('[5.05] plan-C bind-back (align-only):', bind_name)
+            tgt = restored
+        else:
+            print('[5.05] plan-C warn: original target %r missing' % bind_name)
+        for narrow_obj in [o for o in bpy.data.objects
+                           if o.type == 'ARMATURE'
+                           and o.get('gem2_narrow_shoulder')]:
+            print('[5.05] plan-C removing narrow temp:', narrow_obj.name)
+            narrow_data = narrow_obj.data
+            bpy.data.objects.remove(narrow_obj, do_unlink=True)
+            if narrow_data.users == 0:
+                bpy.data.armatures.remove(narrow_data)
 
     # 保存对齐后快照（供用户检查效果）
     snap_dir = os.path.join(output_dir, 'mowas2')
@@ -8672,40 +11152,40 @@ def _route_target_sha256(path):
     return digest.hexdigest()
 
 
+def _assert_goh_source_target(src, target_mdl):
+    """GOH keeps the user-selected skeleton; only require a readable MDL."""
+    del src
+    if not target_mdl or not os.path.isfile(target_mdl):
+        raise FileNotFoundError('GOH target MDL not found: ' + str(target_mdl))
+    return os.path.abspath(target_mdl)
+
+
 def _validate_export_route_target(export_route, target_mdl):
     route = str(export_route or 'CUSTOM')
     if route not in {'GOH', 'MOWAS2', 'CUSTOM'}:
         raise ValueError('Unsupported export route: ' + route)
     if route == 'CUSTOM':
         return route
-    expected = GOH_ROUTE_MDL if route == 'GOH' else MOWAS2_ROUTE_MDL
     if not target_mdl or not os.path.isfile(target_mdl):
         raise FileNotFoundError('Route target MDL not found: ' + str(target_mdl))
+    if route == 'GOH':
+        return route
+    expected = MOWAS2_ROUTE_MDL
     if not os.path.isfile(expected):
         raise FileNotFoundError('Bundled route reference not found: ' + expected)
-    same_path = os.path.normcase(os.path.abspath(target_mdl)) == \
-        os.path.normcase(os.path.abspath(expected))
-    if not same_path and _route_target_sha256(target_mdl) != _route_target_sha256(expected):
-        raise ValueError('%s route target does not match its reference skeleton' % route)
-    return route
+    target_norm = os.path.normcase(os.path.abspath(target_mdl))
+    if target_norm == os.path.normcase(os.path.abspath(expected)):
+        return route
+    if _route_target_sha256(target_mdl) == _route_target_sha256(expected):
+        return route
+    raise ValueError('%s route target does not match its reference skeleton' % route)
 
 
 def _replace_direct_bone_volume_view(content, bone_name, ply_filename):
     """Replace the direct VolumeView on one named bone, ignoring descendants."""
-    from .core import find_matching_brace
+    from .mdl_io import find_named_bone_span
 
-    header = re.compile(
-        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
-        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
-    matches = list(header.finditer(content))
-    if len(matches) != 1:
-        raise RuntimeError(
-            'Expected exactly one MDL bone %r, found %d'
-            % (bone_name, len(matches)))
-    bone_start = matches[0].start()
-    bone_end = find_matching_brace(content, bone_start)
-    if bone_end < 0:
-        raise RuntimeError('Unbalanced MDL bone block: ' + str(bone_name))
+    bone_start, bone_end = find_named_bone_span(content, bone_name)
 
     view_pattern = re.compile(
         r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}', re.IGNORECASE)
@@ -8755,23 +11235,13 @@ def _replace_direct_bone_volume_view(content, bone_name, ply_filename):
 
 def _append_direct_bone_volume_view(content, bone_name, ply_filename):
     """Append one direct VolumeView to an existing animation bone."""
-    from .core import find_matching_brace
+    from .mdl_io import find_named_bone_span
 
     filename = str(ply_filename)
     if not filename or any(char in filename for char in ('"', '\r', '\n')):
         raise ValueError('Invalid split VolumeView filename: ' + filename)
-    header = re.compile(
-        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
-        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
-    matches = list(header.finditer(content))
-    if len(matches) != 1:
-        raise RuntimeError(
-            'Expected exactly one MDL split bone %r, found %d'
-            % (bone_name, len(matches)))
-    bone_start = matches[0].start()
-    bone_end = find_matching_brace(content, bone_start)
-    if bone_end < 0:
-        raise RuntimeError('Unbalanced MDL split bone block: ' + str(bone_name))
+    bone_start, bone_end = find_named_bone_span(
+        content, bone_name, label='MDL split bone')
 
     direct_views = 0
     first_direct_child = None
@@ -8834,20 +11304,9 @@ def _append_direct_bone_volume_view(content, bone_name, ply_filename):
 
 def _direct_volume_view_matches(content, bone_name):
     """Return one bone span and its direct VolumeView matches."""
-    from .core import find_matching_brace
+    from .mdl_io import find_named_bone_span
 
-    header = re.compile(
-        r'\{\s*bone(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s+"'
-        + re.escape(str(bone_name)) + r'"', re.IGNORECASE)
-    headers = list(header.finditer(content))
-    if len(headers) != 1:
-        raise RuntimeError(
-            'Expected exactly one MDL bone %r, found %d'
-            % (bone_name, len(headers)))
-    bone_start = headers[0].start()
-    bone_end = find_matching_brace(content, bone_start)
-    if bone_end < 0:
-        raise RuntimeError('Unbalanced MDL bone block: ' + str(bone_name))
+    bone_start, bone_end = find_named_bone_span(content, bone_name)
 
     view_pattern = re.compile(
         r'\{\s*VolumeView\s+"(?P<filename>[^"]*)"\s*\}',
@@ -9121,7 +11580,7 @@ def _export_all_once(mesh, tgt, output_dir=None, skin_name='skin',
     """导出 PLY/MDL/MTL，并按用户选择生成 TGA 或 DDS 贴图。
 
     skin_name: 游戏 Entity 资源名；输出 <name>/<name>.def/.mdl/.ply。
-    auto_split_over_limit: GOH/MOWAS2 按记录上限将冻结数据无损分区到多个蒙皮 PLY。
+    auto_split_over_limit: GOH/MOWAS2/CUSTOM 按记录上限将冻结数据无损分区到多个蒙皮 PLY。
     split_record_limit: 每个 PLY 的用户自定义最终记录上限，硬上限为 65535。
     split_plan_hint: run_full 在同一调用中生成的冻结规划，避免重复遍历大网格。
 
@@ -9146,10 +11605,7 @@ def _export_all_once(mesh, tgt, output_dir=None, skin_name='skin',
         print('[route:MOWAS2] ToonShader forced off')
         toon_shader = False
     multipart_enabled = bool(
-        auto_split_over_limit and route in {'GOH', 'MOWAS2'})
-    if auto_split_over_limit and not multipart_enabled:
-        print('[auto-split] disabled for route %s: direct multipart skin views '
-              'are verified only for GOH and MOWAS2' % route)
+        auto_split_over_limit and route in {'GOH', 'MOWAS2', 'CUSTOM'})
     if texture_format == 'DDS':
         _tool_kind, nvtt_path = _find_nvtt_tool(nvtt_path)
         print('[8.5] DDS tool:', _tool_kind, nvtt_path)
@@ -9562,7 +12018,7 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
     2026-08-17 晚: enable_decimate 默认 False —— 用户流程默认不减面
     (KK/pmx 顶点数通常 <65535, 直接导出; 减面是可选优化, 需手动开启)。
     skin_name: GOH Entity 资源名，输出 <name>/<name>.def/.mdl/.ply。
-    auto_split_over_limit: GOH/MOWAS2 将最终记录无损分区到多个 PLY，优先于减面。
+    auto_split_over_limit: GOH/MOWAS2/CUSTOM 将最终记录无损分区到多个 PLY，优先于减面。
     split_record_limit: 每个 PLY 的自定义最终记录上限，范围 3..65535。
     """
     global _mowas2_settings_restore_depth
@@ -9578,31 +12034,23 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
     target_mdl = str(tgt.get('gem2_mdl_path') or '')
     effective_route = export_route or _infer_export_route(target_mdl)
     props = getattr(bpy.context.scene, 'mowas2_props', None)
-    if effective_route in {'GOH', 'MOWAS2'}:
-        # Route targets always use the short, bundled compatibility template.
-        # Set the variant policy before repairing an older scene whose target
-        # may still be the long-arm template, then validate the actual target.
-        if props is not None:
-            _mowas2_settings_restore_depth += 1
-            try:
-                props.goh_gfa_longarm = False
-                if effective_route == 'MOWAS2':
-                    props.toon_shader = False
-            finally:
-                _mowas2_settings_restore_depth -= 1
-        src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
-            src, tgt, mesh, root, pmx_path=pmx_path,
-            force_short=(effective_route == 'GOH'))
-    else:
-        src, tgt, mesh, root, _target_changed = _ensure_bundled_target_variant(
-            src, tgt, mesh, root, pmx_path=pmx_path)
+    if effective_route == 'GOH':
+        _assert_goh_source_target(src, tgt.get('gem2_mdl_path'))
+    elif effective_route == 'MOWAS2' and props is not None:
+        # MOWAS2 owns a separate explicit skeleton contract; never pass it
+        # through the GOH short/long selector.
+        _mowas2_settings_restore_depth += 1
+        try:
+            props.goh_gfa_longarm = False
+            props.toon_shader = False
+        finally:
+            _mowas2_settings_restore_depth -= 1
+    # CUSTOM likewise preserves the explicitly selected target verbatim.
     target_mdl = str(tgt.get('gem2_mdl_path') or '')
     effective_route = _validate_export_route_target(effective_route, target_mdl)
     multipart_enabled = bool(
-        auto_split_over_limit and effective_route in {'GOH', 'MOWAS2'})
-    if auto_split_over_limit and not multipart_enabled:
-        print('[7] auto-split unavailable for route %s; decimation fallback '
-              'remains route-safe' % effective_route)
+        auto_split_over_limit
+        and effective_route in {'GOH', 'MOWAS2', 'CUSTOM'})
     if effective_route == 'MOWAS2':
         toon_shader = False
     # 旧场景兼容：PMX 管线始终使用历史 frame-0 显示约定；若场景曾被
@@ -9679,6 +12127,25 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
         align_rigid(src, tgt, mesh, root, mirrored, ground_z)
         print('[3] rigid fit done')
 
+        # 3.2 方案 C: 窄肩对齐骨架 (SKELETON 模式)
+        #     用源骨骼实测肩宽生成一份只改 clavicle/hand1 rest 横向坐标的
+        #     窄肩目标，替换局部 tgt 供后续 GFA/手臂/冻结对齐使用；原骨架名
+        #     记入 mesh 属性，冻结后换回绑定/导出（动画 rest 保持原版）。
+        shoulder_mode = _goh_shoulder_mode()
+        mesh['gem2_bind_target_name'] = tgt.name
+        if shoulder_mode == 'SKELETON' and not mesh.get('mowas2_frozen'):
+            src_span = goh_measure_source_shoulder(src)
+            nc = goh_build_narrow_target_from_mdl(
+                tgt, src_span, ratio=_goh_shoulder_narrow_ratio(),
+                attach=_goh_shoulder_attach())
+            if nc.get('target') is not None:
+                tgt = nc['target']
+                print('[3.2] plan-C narrow target active:',
+                      tgt.name, '| bind-back:', mesh['gem2_bind_target_name'])
+            else:
+                print('[3.2] plan-C narrow target unavailable:',
+                      nc.get('reason', 'unknown'))
+
         # 3.25 GOH v12: GFA 骨骼级躯干链对齐 (freeze 前, 网格随骨架形变)
         #     全盘 GFA 思路: 骨架缩放/偏移 + 网格自动跟随 → 无顶点压缩/撕裂。
         if _goh_hand_split():
@@ -9699,13 +12166,49 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
             mesh, src, tgt, mirrored=mirrored, source_mode=mode)
         if forearm_result.get('changed'):
             print('[5.1] MMD forearm/wrist geometry:', forearm_result['changed'])
+        upper_arm_result = goh_retarget_standard_mmd_upper_arm_geometry(
+            mesh, src, tgt, mirrored=mirrored)
+        if upper_arm_result.get('changed'):
+            print('[5.15] standard-MMD upper-arm crease:',
+                  upper_arm_result['changed'])
         # GFA 后任一源分支都可能改变脚底；归一化只读取源 ankle 权重，
         # 不改变 KK/MMD 的骨骼对齐分支。
         normalize_foot_geometry(mesh, src, tgt, ground_z)
         mesh['mowas2_frozen'] = True
         mesh['mowas2_mirrored'] = mirrored
         mesh['mowas2_source_mode'] = mode
+        mesh['mowas2_shoulder_mode'] = _goh_shoulder_mode()
+        mesh['mowas2_shoulder_narrow_ratio'] = float(
+            _goh_shoulder_narrow_ratio())
+        mesh['mowas2_shoulder_attach'] = str(_goh_shoulder_attach())
+        mesh['gem2_narrow_shoulder_mesh'] = bool(
+            _goh_shoulder_mode() == 'SKELETON')
         print('[5] frozen')
+
+        # 5.05 方案 C: 冻结网格已固化窄肩形状，换回原动画骨架供绑定/导出。
+        #     rest 与动画匹配骨架逐骨一致 → 动画零影响；自由窄肩 clone 后
+        #     若原骨架已被替换，恢复引用并清理窄肩临时骨架。
+        bind_name = mesh.get('gem2_bind_target_name')
+        if bind_name and bind_name != tgt.name:
+            restored = next((o for o in bpy.data.objects
+                             if o.type == 'ARMATURE' and o.name == bind_name),
+                            None)
+            if restored is not None:
+                print('[5.05] plan-C bind-back to original target:', bind_name)
+                tgt = restored
+            else:
+                print('[5.05] plan-C warn: original target %r missing'
+                      % bind_name)
+            # 清理窄肩临时骨架（带 gem2_narrow_shoulder 标记），避免
+            # resolve_scene / 导出误选它作为目标骨架。
+            for narrow_obj in [o for o in bpy.data.objects
+                               if o.type == 'ARMATURE'
+                               and o.get('gem2_narrow_shoulder')]:
+                print('[5.05] plan-C removing narrow temp:', narrow_obj.name)
+                narrow_data = narrow_obj.data
+                bpy.data.objects.remove(narrow_obj, do_unlink=True)
+                if narrow_data.users == 0:
+                    bpy.data.armatures.remove(narrow_data)
 
     else:
         # 复用首次对齐判定的镜像方向（冻结时已写入 mesh 属性）
@@ -9718,10 +12221,22 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
         mesh, src, tgt, mirrored=mirrored)
     if body_result.get('changed'):
         print('[5.2] body curve / foot1 spacing:', body_result['changed'])
+    ankle_result = goh_smooth_ankle_junction(mesh, tgt, force=True)
+    if ankle_result.get('changed'):
+        print('[5.25] ankle junction:', ankle_result['changed'])
     arm_inset_result = goh_adjust_arm_inset_geometry(
         mesh, src, tgt, mirrored=mirrored)
     if arm_inset_result.get('changed'):
         print('[5.3] rigid whole-arm inset:', arm_inset_result['changed'])
+    arm_thick_result = goh_adjust_arm_thickness_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if arm_thick_result.get('changed'):
+        print('[5.35] arm thickness:', arm_thick_result['changed'])
+    shoulder_inset_result = goh_adjust_shoulder_inset_geometry(
+        mesh, src, tgt, mirrored=mirrored)
+    if shoulder_inset_result.get('changed'):
+        print('[5.4] clavicle/shoulder inset:',
+              shoulder_inset_result['changed'])
     neck_result = goh_scale_neck_follow_geometry(mesh, src)
     if neck_result.get('changed'):
         print('[5.06] neck/accessory follow:', neck_result['changed'])
@@ -9756,17 +12271,43 @@ def run_full(output_dir=None, ground_z=GROUND_Z, protect_face=True,
         bind_and_transfer(mesh, tgt, mirrored)
         print('[6] casting', merged, '| bound & transferred')
 
-    wrist_recovered = goh_recover_wrist_anchor(
+    anim_shoulder_result = goh_reweight_standard_mmd_narrow_shoulder(
         mesh, src, tgt, mirrored=mirrored)
-    if wrist_recovered:
-        print('[6.4] wrist anchor geometry restored:', wrist_recovered)
+    if anim_shoulder_result.get('changed'):
+        print('[6.1] standard-MMD animated narrow shoulder:',
+              anim_shoulder_result['changed'])
+    # Elbow-weight recenter (v1–v3) is withdrawn for A/B: it cut a
+    # triangular crease from mid-upper-arm to the GOH elbow. Keep the
+    # helper for diagnostics; production uses the original transferred
+    # hand1/hand2 mix from 2026-09-08 morning.
+    print('[6.2] standard-MMD elbow pivot weights: skipped (legacy mix)')
+    if str(mesh.get('mowas2_source_mode', '')) == 'kk' or (
+            src is not None and src.type == 'ARMATURE' and (
+                sum(1 for bone in src.data.bones
+                    if bone.name.casefold().startswith('cf_')) >= 6)):
+        collar_result = goh_soften_kk_collar_weights(mesh, src, tgt)
+        if collar_result.get('changed'):
+            print('[6.25] KK collar soften:', collar_result['changed'])
+    # 6.4 方案 C 专用：**冻结手链保持原样**（freeze 时源手链已按窄骨架对齐、
+    #     本身就是完整垂直线条）。recover_wrist_anchor 会把整个手链按
+    #     「源腕→目标腕」统一 delta 拉回原骨架宽位，破坏窄肩连贯并形成
+    #     前臂/腕掌接缝（用户实测「被吸附到原骨骼位置」）；因此方案 C
+    #     下完全跳过它的几何移动，手链顶点以 freeze 姿态直接进入蒙皮。
+    #     非方案 C 维持原通用复位流程。goh_stitch_wrist_to_handrot 只做
+    #     权重迁移（不动几何），两模式都保留。
+    if bool(mesh.get('gem2_narrow_shoulder_mesh')):
+        print('[6.4] plan-C: frozen hand-chain kept as-is (no wrist pull-back)')
+    else:
+        wrist_recovered = goh_recover_wrist_anchor(
+            mesh, src, tgt, mirrored=mirrored)
+        if wrist_recovered:
+            print('[6.4] wrist anchor geometry restored:', wrist_recovered)
     wrist_weights_cleaned = goh_stitch_wrist_to_handrot(mesh, tgt)
     if wrist_weights_cleaned:
         print('[6.5] legacy wrist weights restored:', wrist_weights_cleaned)
 
-    # 7. GOH 自动拆分优先于减面。规划器冻结最终记录后只重映射各 PLY 的
-    # 局部 u16 索引；多骨/双权重以及跨文件材质都保持字节等价。其他路由仍
-    # 使用单 PLY，并在已勾选时由减面接管。
+    # 7. 自动拆分优先于减面。规划器冻结最终记录后只重映射各 PLY 的
+    # 局部 u16 索引；GOH/MOWAS2/CUSTOM 均保留多骨、双权重与跨文件材质。
     preview_hidden_mats = set()
     for material in mesh.data.materials:
         if not material:
@@ -9831,7 +12372,8 @@ class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
 
     def invoke(self, context, event):
         _restore_mowas2_settings(context.scene, force=False)
-        _apply_export_route(context.scene.mowas2_props)
+        _apply_export_route(
+            context.scene.mowas2_props, src=_resolved_route_source())
         return context.window_manager.invoke_props_dialog(self, width=760)
 
     def draw(self, context):
@@ -9844,7 +12386,7 @@ class MOWAS2_OT_AutoPipeline(bpy.types.Operator):
             if props is None:
                 out = run_full()
             else:
-                _apply_export_route(props)
+                _apply_export_route(props, src=_resolved_route_source())
                 out = run_full(
                     props.output_dir, props.ground_z,
                     protect_face=props.protect_face,
@@ -9882,14 +12424,24 @@ _MOWAS2_PERSISTED_PROPS = (
     'goh_enlarge_head', 'goh_head_scale', 'goh_head_neck_follow',
     'goh_alpha_test', 'goh_fix_pupil_depth', 'goh_pupil_clearance',
     'goh_ik_updown_scale', 'goh_ik_updown_multiplier', 'goh_foot_scale',
-    'goh_foot1_spacing', 'goh_arm_span_scale', 'goh_shoulder_scale',
+    'goh_foot1_spacing', 'goh_thigh_width', 'goh_calf_width',
+    'goh_hip_thickness', 'goh_thigh_thickness', 'goh_calf_thickness',
+    'goh_arm_span_scale', 'goh_arm_thickness',
+    'goh_shoulder_scale',
+    'goh_shoulder_inset', 'goh_shoulder_mode', 'goh_shoulder_narrow_ratio',
+    'goh_shoulder_attach',
     'goh_torso_ik_merge',
     'goh_iklr_keep',
     'goh_hand_clamp', 'goh_wrist_stitch', 'goh_finger_curl',
+    'named_export_preset',
+    'human_rest_duplicate_mesh', 'human_rest_exact_reverse',
 )
 _MOWAS2_PRESET_PROPS = tuple(
     name for name in _MOWAS2_PERSISTED_PROPS
-    if name not in {'pmx_path', 'output_dir', 'skin_name'}
+    if name not in {
+        'pmx_path', 'output_dir', 'skin_name', 'named_export_preset',
+        'human_rest_duplicate_mesh', 'human_rest_exact_reverse',
+    }
 )
 _mowas2_settings_restore_depth = 0
 _named_preset_item_cache = []
@@ -9901,13 +12453,41 @@ def _infer_export_route(mdl_path):
     current = os.path.normcase(os.path.abspath(str(mdl_path)))
     if current == os.path.normcase(os.path.abspath(MOWAS2_ROUTE_MDL)):
         return 'MOWAS2'
-    if current == os.path.normcase(os.path.abspath(GOH_ROUTE_MDL)):
+    goh_targets = (GOH_ROUTE_MDL, GOH_DEFAULT_MDL)
+    if any(current == os.path.normcase(os.path.abspath(path))
+           for path in goh_targets):
         return 'GOH'
     return 'CUSTOM'
 
 
-def _apply_export_route(props):
+def _standard_mmd_route_source(src=None):
+    """Return the four-stage MMD source that needs GOH's long-arm rest.
+
+    When no resolved source is supplied, search for the shoulder-chain contract
+    itself instead of testing the scene's largest armature. This prevents a
+    larger helper/rigify armature from hiding the actual four-stage PMX source.
+    """
+    if src is not None:
+        return src if _has_standard_mmd_shoulder_chain(src) else None
+    candidates = [obj for obj in bpy.context.scene.objects
+                  if obj.type == 'ARMATURE'
+                  and not obj.get('gem2_world_mats')
+                  and _has_standard_mmd_shoulder_chain(obj)]
+    return max(candidates, key=lambda obj: len(obj.data.bones), default=None)
+
+
+def _resolved_route_source():
+    """Best-effort source resolution for UI entry points before execution."""
+    try:
+        src, _tgt, _mesh, _root = resolve_scene()
+        return src
+    except Exception:
+        return _standard_mmd_route_source()
+
+
+def _apply_export_route(props, src=None):
     global _mowas2_settings_restore_depth
+    del src
     route = str(getattr(props, 'export_route', 'CUSTOM'))
     _mowas2_settings_restore_depth += 1
     try:
@@ -9916,14 +12496,19 @@ def _apply_export_route(props):
             props.goh_gfa_longarm = False
             props.toon_shader = False
         elif route == 'GOH':
-            props.mdl_path = GOH_ROUTE_MDL
-            props.goh_gfa_longarm = False
+            current = bpy.path.abspath(str(getattr(props, 'mdl_path', '') or ''))
+            mowas2_locked = bool(
+                current and os.path.isfile(MOWAS2_ROUTE_MDL)
+                and os.path.normcase(os.path.abspath(current))
+                == os.path.normcase(os.path.abspath(MOWAS2_ROUTE_MDL)))
+            if not current or not os.path.isfile(current) or mowas2_locked:
+                props.mdl_path = GOH_ROUTE_MDL
     finally:
         _mowas2_settings_restore_depth -= 1
 
 
 def _mowas2_route_updated(props, context):
-    _apply_export_route(props)
+    _apply_export_route(props, src=_resolved_route_source())
     _persist_mowas2_settings(props)
 
 
@@ -9981,8 +12566,18 @@ _MOWAS2_CONFIRM_FIELDS = (
     ('IK up/down scale', 'goh_ik_updown_scale'),
     ('IK up/down multiplier', 'goh_ik_updown_multiplier'),
     ('Foot scale', 'goh_foot_scale'),
-    ('Foot spacing', 'goh_foot1_spacing'),
+    ('Hip outward', 'goh_foot1_spacing'),
+    ('Thigh outward', 'goh_thigh_width'),
+    ('Calf outward', 'goh_calf_width'),
+    ('Hip thickness', 'goh_hip_thickness'),
+    ('Thigh thickness', 'goh_thigh_thickness'),
+    ('Calf thickness', 'goh_calf_thickness'),
     ('Arm span scale', 'goh_arm_span_scale'),
+    ('Arm thickness', 'goh_arm_thickness'),
+    ('Shoulder mode', 'goh_shoulder_mode'),
+    ('Shoulder narrow ratio', 'goh_shoulder_narrow_ratio'),
+    ('Shoulder attach', 'goh_shoulder_attach'),
+    ('Shoulder inset', 'goh_shoulder_inset'),
     ('Legacy shoulder scale', 'goh_shoulder_scale'),
     ('Torso IK merge', 'goh_torso_ik_merge'),
     ('IK L/R keep', 'goh_iklr_keep'),
@@ -10043,6 +12638,13 @@ def _persist_mowas2_settings(props):
     if remember:
         for name in _MOWAS2_PERSISTED_PROPS:
             values[name] = getattr(props, name)
+        scene = getattr(props, 'id_data', None)
+        stored = _stored_mmd_import_snapshot(scene) if scene is not None else None
+        if stored:
+            values['mmd_import_preset_path'] = stored['preset_path']
+            values['mmd_import_preset_sha256'] = stored['preset_sha256']
+            values['mmd_import_settings_json'] = json.dumps(
+                stored['settings'], ensure_ascii=False, sort_keys=True)
     # Defer the write: set_panel_settings atomically persists panel + path once.
     set_export_dir(values.get('output_dir') or '', save=False)
     set_panel_settings(_MOWAS2_SETTINGS_ID, values)
@@ -10076,7 +12678,7 @@ def _preview_aligned_geometry(props, context, kind):
         src, tgt, mesh, _root = resolve_scene()
         if not bool(mesh.get('mowas2_frozen')):
             return
-        if kind in {'shoulder', 'arm', 'neck'} and mesh.parent is tgt:
+        if kind in {'shoulder', 'shoulder_inset', 'arm', 'arm_thickness', 'neck'} and mesh.parent is tgt:
             print('[preview:%s] skipped: reopen the aligned snapshot before binding'
                   % kind)
             return
@@ -10086,8 +12688,16 @@ def _preview_aligned_geometry(props, context, kind):
             result = goh_adjust_body_curve_geometry(
                 mesh, src, tgt, mirrored=bool(mesh.get('mowas2_mirrored')),
                 force=True)
+        elif kind == 'shoulder_inset':
+            result = goh_adjust_shoulder_inset_geometry(
+                mesh, src, tgt, mirrored=bool(mesh.get('mowas2_mirrored')),
+                force=True)
         elif kind == 'arm':
             result = goh_adjust_arm_inset_geometry(
+                mesh, src, tgt, mirrored=bool(mesh.get('mowas2_mirrored')),
+                force=True)
+        elif kind == 'arm_thickness':
+            result = goh_adjust_arm_thickness_geometry(
                 mesh, src, tgt, mirrored=bool(mesh.get('mowas2_mirrored')),
                 force=True)
         else:
@@ -10108,11 +12718,32 @@ def _mowas2_neck_preview_updated(props, context):
 
 
 def _mowas2_body_preview_updated(props, context):
-    _preview_aligned_geometry(props, context, 'shoulder')
+    _persist_mowas2_settings(props)
+    if _mowas2_settings_restore_depth or context is None:
+        return
+    try:
+        _src, _tgt, mesh, _root = resolve_scene()
+        if mesh is not None and bool(mesh.get('mowas2_frozen')):
+            _preview_aligned_geometry(props, context, 'shoulder')
+            try:
+                _src, tgt, mesh, _root = resolve_scene()
+                goh_smooth_ankle_junction(mesh, tgt, force=True)
+            except Exception:
+                pass
+    except Exception as exc:
+        print('[preview:body] skipped: %s' % exc)
 
 
 def _mowas2_arm_preview_updated(props, context):
     _preview_aligned_geometry(props, context, 'arm')
+
+
+def _mowas2_arm_thickness_preview_updated(props, context):
+    _preview_aligned_geometry(props, context, 'arm_thickness')
+
+
+def _mowas2_shoulder_inset_preview_updated(props, context):
+    _preview_aligned_geometry(props, context, 'shoulder_inset')
 
 
 def _mowas2_shoulder_preview_updated(props, context):
@@ -10150,7 +12781,19 @@ def _restore_mowas2_settings(scene, force=False):
             if 'export_route' not in saved:
                 props.export_route = _infer_export_route(
                     saved.get('mdl_path', props.mdl_path))
-            _apply_export_route(props)
+            _apply_export_route(props, src=_resolved_route_source())
+            settings_json = saved.get('mmd_import_settings_json')
+            if isinstance(settings_json, str) and settings_json.strip():
+                try:
+                    _store_mmd_import_snapshot(scene, {
+                        'preset': saved.get('mmd_import_preset')
+                        or getattr(props, 'mmd_import_preset', ''),
+                        'preset_path': saved.get('mmd_import_preset_path', ''),
+                        'preset_sha256': saved.get('mmd_import_preset_sha256', ''),
+                        'settings': json.loads(settings_json),
+                    })
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    print('[MOWAS2] ignored invalid saved MMD snapshot:', exc)
         props.settings_initialized = True
     finally:
         _mowas2_settings_restore_depth -= 1
@@ -10199,7 +12842,7 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
         name="Export Route",
         description="Choose the reference skeleton and route invariants",
         items=(
-            ('GOH', 'GOH', 'Use samples/goh_skin.mdl'),
+            ('GOH', 'GOH', 'GOH materials/hand weights; pick any human skeleton MDL'),
             ('MOWAS2', 'MOWAS2', 'Use samples/MOWAS2.mdl and disable ToonShader'),
             ('CUSTOM', 'Custom MDL', 'Keep the selected target MDL'),
         ),
@@ -10221,8 +12864,8 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
     mdl_path: bpy.props.StringProperty(
         name=_("mowas2.prop.mdl"), subtype='FILE_PATH',
         description=_("mowas2.prop.mdl.desc"),
-        # Route selection owns the bundled GOH/MOWAS2 targets; Custom keeps any
-        # explicitly selected compatible skin MDL.
+        # GOH keeps the user-selected human MDL (short, long, or custom).
+        # MOWAS2 owns the bundled reference; Custom keeps any explicit MDL.
         default=GOH_ROUTE_MDL,
         update=_mowas2_setting_updated)
     output_dir: bpy.props.StringProperty(
@@ -10348,13 +12991,81 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
     goh_foot1_spacing: bpy.props.FloatProperty(
         name=_("mowas2.prop.goh_foot1_spacing"),
         description=_("mowas2.prop.goh_foot1_spacing.desc"),
-        default=1.0, min=0.8, max=1.3, soft_min=0.95, soft_max=1.15,
+        default=1.06, min=0.7, max=2.0, soft_min=0.9, soft_max=1.4,
+        precision=3, update=_mowas2_body_preview_updated)
+    goh_thigh_width: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_thigh_width"),
+        description=_("mowas2.prop.goh_thigh_width.desc"),
+        default=1.04, min=0.7, max=2.0, soft_min=0.9, soft_max=1.4,
+        precision=3, update=_mowas2_body_preview_updated)
+    goh_calf_width: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_calf_width"),
+        description=_("mowas2.prop.goh_calf_width.desc"),
+        default=1.03, min=0.2, max=5.0, soft_min=0.7, soft_max=2.0,
+        precision=3, update=_mowas2_body_preview_updated)
+    goh_hip_thickness: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_hip_thickness"),
+        description=_("mowas2.prop.goh_hip_thickness.desc"),
+        default=1.0, min=0.2, max=5.0, soft_min=0.7, soft_max=2.0,
+        precision=3, update=_mowas2_body_preview_updated)
+    goh_thigh_thickness: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_thigh_thickness"),
+        description=_("mowas2.prop.goh_thigh_thickness.desc"),
+        default=1.0, min=0.2, max=5.0, soft_min=0.7, soft_max=2.0,
+        precision=3, update=_mowas2_body_preview_updated)
+    goh_calf_thickness: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_calf_thickness"),
+        description=_("mowas2.prop.goh_calf_thickness.desc"),
+        default=1.0, min=0.2, max=5.0, soft_min=0.7, soft_max=2.0,
         precision=3, update=_mowas2_body_preview_updated)
     goh_arm_span_scale: bpy.props.FloatProperty(
         name=_("mowas2.prop.goh_arm_span_scale"),
         description=_("mowas2.prop.goh_arm_span_scale.desc"),
         default=1.0, min=0.75, max=1.1, soft_min=0.9, soft_max=1.05,
         precision=3, update=_mowas2_arm_preview_updated)
+    goh_arm_thickness: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_arm_thickness"),
+        description=_("mowas2.prop.goh_arm_thickness.desc"),
+        default=1.0, min=0.2, max=5.0, soft_min=0.7, soft_max=2.0,
+        precision=3, update=_mowas2_arm_thickness_preview_updated)
+    # 锁骨/肩带区横向缩窄（二次元窄肩，方案 B）：<1 肩点内收，只改冻结
+    # 几何，目标骨架 rest 与动画枢轴零改动；1.0 关闭。
+    goh_shoulder_inset: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_shoulder_inset"),
+        description=_("mowas2.prop.goh_shoulder_inset.desc"),
+        default=1.0, min=0.5, max=1.2, soft_min=0.85, soft_max=1.05,
+        precision=3, update=_mowas2_shoulder_inset_preview_updated)
+    # 肩宽控制模式：OFF=原样；GEOMETRY=冻结几何内收（方案B）；SKELETON=
+    # 窄肩对齐骨架（方案C，按源骨骼肩宽生成窄肩目标，动画 rest 不变）。
+    goh_shoulder_mode: bpy.props.EnumProperty(
+        name=_("mowas2.prop.goh_shoulder_mode"),
+        description=_("mowas2.prop.goh_shoulder_mode.desc"),
+        items=(
+            ('OFF', _("mowas2.prop.goh_shoulder_mode.off"),
+             _("mowas2.prop.goh_shoulder_mode.off.desc")),
+            ('GEOMETRY', _("mowas2.prop.goh_shoulder_mode.geometry"),
+             _("mowas2.prop.goh_shoulder_mode.geometry.desc")),
+            ('SKELETON', _("mowas2.prop.goh_shoulder_mode.skeleton"),
+             _("mowas2.prop.goh_shoulder_mode.skeleton.desc")),
+        ),
+        default='SKELETON', update=_mowas2_setting_updated)
+    # 方案 C 窄肩系数：1.0 = 源骨骼实测肩宽；<1 更窄、>1 更宽。
+    goh_shoulder_narrow_ratio: bpy.props.FloatProperty(
+        name=_("mowas2.prop.goh_shoulder_narrow_ratio"),
+        description=_("mowas2.prop.goh_shoulder_narrow_ratio.desc"),
+        default=0.96, min=0.5, max=1.5, soft_min=0.8, soft_max=1.2,
+        precision=3, update=_mowas2_setting_updated)
+    # 方案 C 手链衔接：full=整链平移；blend=肩宽不动+前臂/手原GOH+上臂共线。
+    goh_shoulder_attach: bpy.props.EnumProperty(
+        name=_("mowas2.prop.goh_shoulder_attach"),
+        description=_("mowas2.prop.goh_shoulder_attach.desc"),
+        items=(
+            ('full', _("mowas2.prop.goh_shoulder_attach.full"),
+             _("mowas2.prop.goh_shoulder_attach.full.desc")),
+            ('blend', _("mowas2.prop.goh_shoulder_attach.blend"),
+             _("mowas2.prop.goh_shoulder_attach.blend.desc")),
+        ),
+        default='blend', update=_mowas2_setting_updated)
     # v132 兼容字段：v133 起不再应用中央躯干横向缩放。
     goh_shoulder_scale: bpy.props.FloatProperty(
         name=_("mowas2.prop.goh_shoulder_scale"),
@@ -10388,6 +13099,14 @@ class MOWAS2_SceneProps(bpy.types.PropertyGroup):
         name=_("mowas2.prop.goh_finger_curl"),
         description=_("mowas2.prop.goh_finger_curl.desc"),
         default=False, update=_mowas2_setting_updated)
+    human_rest_duplicate_mesh: bpy.props.BoolProperty(
+        name=_('mowas2.human_rest.duplicate'),
+        description=_('mowas2.human_rest.duplicate.desc'),
+        default=False, update=_mowas2_setting_updated)
+    human_rest_exact_reverse: bpy.props.BoolProperty(
+        name=_('mowas2.human_rest.exact_reverse'),
+        description=_('mowas2.human_rest.exact_reverse.desc'),
+        default=True, update=_mowas2_setting_updated)
     report: bpy.props.StringProperty(name=_("mowas2.prop.report"), default="")
 
 
@@ -10402,6 +13121,7 @@ class MOWAS2_OT_RefreshMMDPresetSnapshot(bpy.types.Operator):
         try:
             snapshot = mmd_import_preset_snapshot(props.mmd_import_preset)
             snapshot = _store_mmd_import_snapshot(context.scene, snapshot)
+            _persist_mowas2_settings(props)
         except Exception as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -10490,7 +13210,7 @@ class MOWAS2_OT_LoadExportPreset(bpy.types.Operator):
                 except (AttributeError, TypeError, ValueError):
                     print('[MOWAS2] ignored invalid preset setting %s=%r'
                           % (field, values[field]))
-            _apply_export_route(props)
+            _apply_export_route(props, src=_resolved_route_source())
         finally:
             _mowas2_settings_restore_depth -= 1
         _persist_mowas2_settings(props)
@@ -10591,6 +13311,9 @@ class MOWAS2_OT_HumanRestConvert(bpy.types.Operator):
 
     def invoke(self, context, event):
         _restore_mowas2_settings(context.scene, force=False)
+        props = context.scene.mowas2_props
+        self.duplicate_mesh = bool(props.human_rest_duplicate_mesh)
+        self.exact_reverse = bool(props.human_rest_exact_reverse)
         return context.window_manager.invoke_props_dialog(self, width=520)
 
     def draw(self, context):
@@ -10611,7 +13334,9 @@ class MOWAS2_OT_HumanRestConvert(bpy.types.Operator):
         try:
             _restore_mowas2_settings(context.scene, force=False)
             props = context.scene.mowas2_props
-            _apply_export_route(props)
+            _apply_export_route(props, src=_resolved_route_source())
+            props.human_rest_duplicate_mesh = bool(self.duplicate_mesh)
+            props.human_rest_exact_reverse = bool(self.exact_reverse)
             report = convert_human_rest_scene(
                 context.scene, props.mdl_path,
                 mesh_name=self.mesh_name,
@@ -10750,10 +13475,10 @@ class MOWAS2_OT_BuildTarget(bpy.types.Operator):
     def invoke(self, context, event):
         _restore_mowas2_settings(context.scene, force=False)
         props = context.scene.mowas2_props
-        _apply_export_route(props)
+        _apply_export_route(props, src=_resolved_route_source())
         if props.mdl_path and os.path.isfile(props.mdl_path):
             self.filepath = props.mdl_path
-        if props.export_route != 'CUSTOM':
+        if props.export_route == 'MOWAS2':
             return self.execute(context)
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
@@ -10765,9 +13490,10 @@ class MOWAS2_OT_BuildTarget(bpy.types.Operator):
                 self.report({'ERROR'}, _("mowas2.err.select_mdl"))
                 return {'CANCELLED'}
             props = context.scene.mowas2_props
-            props.export_route = _infer_export_route(self.filepath)
+            if props.export_route != 'GOH':
+                props.export_route = _infer_export_route(self.filepath)
             props.mdl_path = self.filepath
-            _apply_export_route(props)
+            _apply_export_route(props, src=_resolved_route_source())
             tgt = build_target_from_mdl(props.mdl_path)
             props.report = _("mowas2.info.target_built",
                              name=tgt.name, bones=len(tgt.data.bones))
@@ -10812,7 +13538,8 @@ class MOWAS2_OT_FullPipeline(bpy.types.Operator):
 
     def invoke(self, context, event):
         _restore_mowas2_settings(context.scene, force=False)
-        _apply_export_route(context.scene.mowas2_props)
+        _apply_export_route(
+            context.scene.mowas2_props, src=_resolved_route_source())
         return context.window_manager.invoke_props_dialog(self, width=760)
 
     def draw(self, context):
@@ -10822,7 +13549,7 @@ class MOWAS2_OT_FullPipeline(bpy.types.Operator):
         try:
             _restore_mowas2_settings(context.scene, force=False)
             props = context.scene.mowas2_props
-            _apply_export_route(props)
+            _apply_export_route(props, src=_resolved_route_source())
             out = run_full(props.output_dir, props.ground_z,
                            protect_face=props.protect_face,
                            protect_tight=props.protect_tight,
@@ -10917,10 +13644,12 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         box.label(text=_("mowas2.step2.label"), icon='ARMATURE_DATA')
         box.prop(props, "export_route", expand=True)
         target_row = box.row()
-        target_row.enabled = props.export_route == 'CUSTOM'
+        target_row.enabled = props.export_route != 'MOWAS2'
         target_row.prop(props, "mdl_path", text="")
-        if props.export_route != 'CUSTOM':
-            box.label(text=os.path.basename(props.mdl_path), icon='FILE_TICK')
+        if props.export_route == 'MOWAS2':
+            box.label(text=os.path.basename(props.mdl_path), icon='LOCKED')
+        else:
+            box.label(text=os.path.basename(props.mdl_path or ''), icon='FILE_TICK')
         row = box.row()
         row.operator("gem2.mowas2_build_target", text=_("mowas2.step2.build"),
                      icon='BONE_DATA')
@@ -11018,8 +13747,27 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         row.enabled = bool(props.goh_ik_updown_scale)
         row.prop(props, "goh_ik_updown_multiplier")
         # foot1 上腿根间距与整臂间距支持冻结后即时、可逆预览。
-        box.prop(props, "goh_foot1_spacing", slider=True)
+        box.label(text=_("mowas2.prop.leg_outward_label"))
+        box.prop(props, "goh_foot1_spacing")
+        box.prop(props, "goh_thigh_width")
+        box.prop(props, "goh_calf_width")
+        box.label(text=_("mowas2.prop.leg_thickness_label"))
+        box.prop(props, "goh_hip_thickness")
+        box.prop(props, "goh_thigh_thickness")
+        box.prop(props, "goh_calf_thickness")
         box.prop(props, "goh_arm_span_scale", slider=True)
+        box.prop(props, "goh_arm_thickness")
+        # 肩宽：默认方案 C。方案 B 的几何内收只在 GEOMETRY 下出现，避免叠两次。
+        box.prop(props, "goh_shoulder_mode")
+        row = box.row()
+        row.enabled = (props.goh_shoulder_mode == 'SKELETON')
+        row.prop(props, "goh_shoulder_narrow_ratio")
+        row2 = box.row()
+        row2.enabled = (props.goh_shoulder_mode == 'SKELETON')
+        row2.prop(props, "goh_shoulder_attach", expand=True)
+        inset_row = box.row()
+        inset_row.enabled = (props.goh_shoulder_mode == 'GEOMETRY')
+        inset_row.prop(props, "goh_shoulder_inset", slider=True)
         # 脚部尺寸可调：>1 放大脚/鞋（贴地不陷），<1 收窄。
         box.prop(props, "goh_foot_scale")
         # 腰腹 IK 合并：缓解大角度弯腰时腰腹被 ik_leftright/ik_updown 拉开。
@@ -11036,12 +13784,13 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         sub = box.box()
         sub.label(text=_("mowas2.advanced.protection"), icon='MOD_DECIM')
         split_row = sub.row()
-        split_row.enabled = (props.export_route in {'GOH', 'MOWAS2'})
+        split_row.enabled = (
+            props.export_route in {'GOH', 'MOWAS2', 'CUSTOM'})
         split_row.prop(props, "auto_split_over_limit")
         limit_row = sub.row()
         limit_row.enabled = bool(
             props.auto_split_over_limit
-            and props.export_route in {'GOH', 'MOWAS2'})
+            and props.export_route in {'GOH', 'MOWAS2', 'CUSTOM'})
         limit_row.prop(props, "split_record_limit")
         sub.prop(props, "enable_decimate")
         sub.prop(props, "protect_face")
@@ -11053,6 +13802,8 @@ class MOWAS2_PT_Panel(bpy.types.Panel):
         box.label(text=_("mowas2.vehicle.desc"), icon='DOT')
         box.operator("gem2.mowas2_import_vehicle_folder",
                      text=_("mowas2.vehicle.import"), icon='FILE_FOLDER')
+        box.operator("gem2.mowas2_export_vehicle_folder",
+                     text=_("mowas2.vehicle.export"), icon='EXPORT')
         box.operator("gem2.export_vehicle_to_mowas2",
                      text=_("mowas2.vehicle.export_mowas2"), icon='EXPORT')
         box.operator("gem2.export_vehicle_to_goh",

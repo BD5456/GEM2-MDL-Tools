@@ -385,6 +385,17 @@ class ExportGEM2Multipart(bpy.types.Operator, ExportHelper):
                 parts=len(summary['parts']),
                 records=summary['total_records'],
                 dir=summary['output_dir']))
+            selfcheck = summary.get('selfcheck') or {}
+            warnings = selfcheck.get('warnings') or []
+            if warnings:
+                message = " | ".join(warnings[:3])
+                extra = len(warnings) - 3
+                if extra > 0:
+                    message += " " + _(
+                        "operator.export_multipart.selfcheck.more",
+                        count=extra)
+                print('[multipart-selfcheck]', message)
+                self.report({'WARNING'}, message[:1024])
             return {'FINISHED'}
         except Exception as exc:
             traceback.print_exc()

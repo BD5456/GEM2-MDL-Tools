@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GEM2 Engine Tools",
     "author": "BD5456+VegetaBird+Simon",
-    "version": (1, 3, 15),
+    "version": (1, 3, 18),
     "blender": (4, 3, 0),
     "location": "File > Import/Export; 3D View > GEM2 Engine Tools",
     "description": "GEM2 model, animation, FBX export, vehicle conversion, and vanilla GOH DEF tools.",

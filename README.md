@@ -6,11 +6,12 @@
 Blender add-on for importing, editing, converting, and exporting GEM2 Engine assets used by
 **Call to Arms: Gates of Hell** and **Men of War: Assault Squad 2**.
 
-- Current add-on version: **1.3.15**
+- Current add-on version: **1.3.18**
 - Supported Blender version: **5.2 LTS**
 - UI languages: **中文 / English / Русский / Українська**
 - [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3774985290)
 - [GitHub Releases](https://github.com/BD5456/GEM2-MDL-Tools/releases)
+- [Full Tutorial (EN, HTML)](https://bd5456.github.io/GEM2-MDL-Tools/) — 完整移植教程 / полное руководство / повний посібник
 
 中文：用于 GOH/MOWAS2 GEM2 模型、动画、碰撞体、材质和载具文件夹的 Blender
 导入、编辑与导出插件，并提供 PMX/MMD 到 GOH 士兵皮肤的自动转换管线。
@@ -174,6 +175,22 @@ rendered completely and followed animation. Each file stays at or below 65,535 r
 when possible and may span files only when necessary; local indices are remapped without changing
 record bytes, topology, UVs, normals, weights, textures, or triangles. Automatic splitting takes
 priority over decimation.
+
+## Version 1.3.18 highlights
+
+- Fix File > Import / Complete Model Folder for vehicles and weapons: collision `{Bone "body"}` references no longer collide with skeleton bones.
+- Restore direct vehicle-folder export (PLY/VOL/MDL/ANM/textures) without dialect conversion; GOH ↔ MOWAS2 remain optional.
+- Nest vehicle whole-package exports under `<entity>/`, matching the other entity exporters.
+- Complete four-language strings for the restored vehicle export entry.
+
+## Version 1.3.17 highlights
+
+- Improve MMD/KK shoulder and chest handling: narrow-shoulder modes (skeleton or geometry inset), collar/bust follow, and typed arm-thickness control.
+- Add independent hip/thigh/calf outward and thickness controls that stay continuous at segment junctions.
+- Stop GFA long-arm from replacing the selected target skeleton; it now only scales arm segments.
+- Enable lossless record splitting on the CUSTOM route, and warn after multipart export if materials collapse or triangles are duplicated.
+- Remember the last vehicle-folder import directory.
+- Complete Russian and Ukrainian strings for multipart export, record-limit, and lower-body thickness controls.
 
 ## Version 1.3.15 highlights
 
